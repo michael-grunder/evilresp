@@ -29,6 +29,10 @@ Current top-level shape:
   readable.
 - Keep public behavior and internal contracts documented close to the code that
   owns them.
+- Prefer smaller `rs` files with similar responsibilities and/or structures to
+  one large source file with everything.
+- Make heavy use of Rust's strengths, including generics, traits, and the type
+  system. That said, avoid excessive use of generics when it's overkill.
 
 ## Rust Conventions
 

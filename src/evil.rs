@@ -16,6 +16,7 @@ use crate::resp::Frame;
 pub const DEFAULT_EXCLUDED_COMMANDS: &[&str] = &[
     "AUTH",
     "HELLO",
+    "COMMAND",
     "CLIENT",
     "SELECT",
     "ASKING",
@@ -645,6 +646,7 @@ mod tests {
     fn default_excludes_skip_fragile_commands() {
         let config = EvilConfig::default();
         assert!(!config.should_mutate_command(Some("HELLO")));
+        assert!(!config.should_mutate_command(Some("COMMAND")));
         assert!(config.should_mutate_command(Some("GET")));
     }
 

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Excluded `COMMAND` from default reply mutation so redis-cli can introspect
+  server capabilities on connect.
+
 ### Added
 
 - Added project-specific contributor and agent guidance in `AGENTS.md`.

@@ -78,4 +78,5 @@ strings such as `^GET.*` match command names, and attributes such as `@read`,
 
 The default exclude list avoids mutating commands that commonly break client
 setup too early: `AUTH`, `HELLO`, `CLIENT`, `SELECT`, `ASKING`, `MULTI`,
-`DISCARD`, `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE`, `UNSUBSCRIBE`, and `QUIT`.
+`COMMAND`, `DISCARD`, `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE`, `UNSUBSCRIBE`,
+and `QUIT`.

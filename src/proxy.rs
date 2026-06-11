@@ -90,6 +90,7 @@ struct SharedState {
     evil: Arc<RwLock<EvilConfig>>,
     repro: Option<ReproWriter>,
     connection_ids: Arc<AtomicU64>,
+    command_ids: Arc<AtomicU64>,
     local_slots: Option<Frame>,
 }
 
@@ -103,6 +104,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         evil: Arc::new(RwLock::new(EvilConfig::default())),
         repro,
         connection_ids: Arc::new(AtomicU64::new(0)),
+        command_ids: Arc::new(AtomicU64::new(0)),
         local_slots: topology.local_slots_response(),
     };
 
@@ -192,7 +194,6 @@ async fn proxy_connection(
     let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
     let mut client_read = BufReader::new(client_read);
     let mut upstream_read = BufReader::new(upstream_read);
-    let mut command_index = 0_u64;
     let mut fingerprints = ProtocolFingerprints::new();
 
     loop {
@@ -220,15 +221,10 @@ async fn proxy_connection(
             let response = result.frame.encode();
             client_write.write_all(&response).await?;
             if result.action == DebugAction::ResetIncrementingState {
-                reset_incrementing_state(
-                    &state,
-                    &mut connection_id,
-                    &mut command_index,
-                );
+                reset_incrementing_state(&state, &mut connection_id);
                 fingerprints.reset();
             } else {
                 fingerprints.update(ProtocolDirection::Out, &response);
-                command_index += 1;
             }
             continue;
         }
@@ -238,28 +234,24 @@ async fn proxy_connection(
         {
             write_client_frame(&mut client_write, &mut fingerprints, response)
                 .await?;
-            command_index += 1;
             continue;
         }
 
+        let command_id = state.command_ids.fetch_add(1, Ordering::Relaxed);
         let config = state.evil.read().await.clone();
         let should_mutate =
             config.should_mutate_command(command_name.as_deref());
         let command_hash = deterministic_hash(&command_bytes);
 
         if config.mode == EvilMode::Random && should_mutate {
-            let mutated = random_reply(
-                &config,
-                connection_id,
-                command_index,
-                &command_hash,
-            );
+            let mutated =
+                random_reply(&config, connection_id, command_id, &command_hash);
             write_repro(
                 &state,
                 ReproRecord::new(
                     config.seed,
                     connection_id,
-                    command_index,
+                    command_id,
                     &command_bytes,
                     None,
                     &mutated.bytes,
@@ -274,7 +266,6 @@ async fn proxy_connection(
                 &mutated.bytes,
             )
             .await?;
-            command_index += 1;
             continue;
         }
 
@@ -290,7 +281,7 @@ async fn proxy_connection(
             let mutated = mutate_reply(
                 &config,
                 connection_id,
-                command_index,
+                command_id,
                 &command_hash,
                 &upstream_hash,
                 &upstream_frame,
@@ -301,7 +292,7 @@ async fn proxy_connection(
                     ReproRecord::new(
                         config.seed,
                         connection_id,
-                        command_index,
+                        command_id,
                         &command_bytes,
                         Some(&upstream_bytes),
                         &mutated.bytes,
@@ -322,7 +313,6 @@ async fn proxy_connection(
             &response_bytes,
         )
         .await?;
-        command_index += 1;
     }
 }
 
@@ -399,14 +389,10 @@ where
     Ok(())
 }
 
-fn reset_incrementing_state(
-    state: &SharedState,
-    connection_id: &mut u64,
-    command_index: &mut u64,
-) {
+fn reset_incrementing_state(state: &SharedState, connection_id: &mut u64) {
     *connection_id = 0;
     state.connection_ids.store(1, Ordering::Relaxed);
-    *command_index = 0;
+    state.command_ids.store(0, Ordering::Relaxed);
 }
 
 fn is_debug_evil(argv: &[String]) -> bool {
@@ -485,6 +471,7 @@ mod tests {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
             connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
         };
         let proxy =
@@ -582,6 +569,7 @@ mod tests {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
             connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
         };
         let proxy =
@@ -631,6 +619,7 @@ mod tests {
             evil: Arc::new(RwLock::new(config)),
             repro: None,
             connection_ids: Arc::new(AtomicU64::new(17)),
+            command_ids: Arc::new(AtomicU64::new(23)),
             local_slots: None,
         };
 
@@ -647,18 +636,13 @@ mod tests {
 
         if result.action == DebugAction::ResetIncrementingState {
             let mut connection_id = 19;
-            let mut command_index = 23;
-            reset_incrementing_state(
-                &state,
-                &mut connection_id,
-                &mut command_index,
-            );
+            reset_incrementing_state(&state, &mut connection_id);
             assert_eq!(connection_id, 0);
-            assert_eq!(command_index, 0);
         }
 
         assert_eq!(result.action, DebugAction::ResetIncrementingState);
         assert_eq!(state.connection_ids.load(Ordering::Relaxed), 1);
+        assert_eq!(state.command_ids.load(Ordering::Relaxed), 0);
         let config = state.evil.read().await;
         assert_eq!(config.mode, EvilMode::Off);
         assert_eq!(config.probability, 0.0);
@@ -693,6 +677,14 @@ mod tests {
             assert!(!first.out_blake3.is_empty(), "mode {mode}");
             assert!(!first.out_tlsh.is_empty(), "mode {mode}");
         }
+    }
+
+    #[tokio::test]
+    async fn reconnect_keeps_mutation_sequence_on_global_command_ids() {
+        let single = run_two_command_sequence(false).await;
+        let reconnected = run_two_command_sequence(true).await;
+
+        assert_eq!(single, reconnected);
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -742,6 +734,7 @@ mod tests {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
+            command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
         };
         let proxy = tokio::spawn(proxy_connection(
@@ -817,6 +810,136 @@ mod tests {
         Frame::BulkString(Some(body.into_bytes())).encode()
     }
 
+    async fn run_two_command_sequence(reconnect: bool) -> Vec<Vec<u8>> {
+        let path = unique_socket_path("upstream-reconnect-sequence");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (read, mut write) = tokio::io::split(stream);
+                    let mut read = BufReader::new(read);
+                    loop {
+                        match read_raw_frame(&mut read).await {
+                            Ok(command) => {
+                                write
+                                    .write_all(
+                                        &deterministic_upstream_response(
+                                            &command,
+                                        ),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                            Err(error)
+                                if error.kind() == ErrorKind::UnexpectedEof =>
+                            {
+                                break;
+                            }
+                            Err(error) => {
+                                panic!(
+                                    "failed to read upstream command: {error}"
+                                )
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(EvilConfig::default())),
+            repro: None,
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+
+        let mut first = spawn_proxy_client(target.clone(), state.clone(), 0);
+        write_evil_setup(first.get_mut()).await;
+        let mut responses = Vec::new();
+        responses.push(read_raw_frame(&mut first).await.unwrap());
+        responses.push(read_raw_frame(&mut first).await.unwrap());
+        responses.push(read_raw_frame(&mut first).await.unwrap());
+
+        first
+            .get_mut()
+            .write_all(&resp_command(&["GET", "key:00"]))
+            .await
+            .unwrap();
+        responses.push(read_available_response_bytes(&mut first).await);
+
+        if reconnect {
+            drop(first);
+            let mut second = spawn_proxy_client(target, state, 1);
+            second
+                .get_mut()
+                .write_all(&resp_command(&["GET", "key:01"]))
+                .await
+                .unwrap();
+            responses.push(read_available_response_bytes(&mut second).await);
+            drop(second);
+        } else {
+            first
+                .get_mut()
+                .write_all(&resp_command(&["GET", "key:01"]))
+                .await
+                .unwrap();
+            responses.push(read_available_response_bytes(&mut first).await);
+            drop(first);
+        }
+
+        upstream.abort();
+        let _ = upstream.await;
+        std::fs::remove_file(path).unwrap();
+
+        responses
+    }
+
+    fn spawn_proxy_client(
+        target: ProxyTarget,
+        state: SharedState,
+        connection_id: u64,
+    ) -> BufReader<UnixStream> {
+        let (client, server) = UnixStream::pair().unwrap();
+        tokio::spawn(proxy_connection(
+            Box::new(server),
+            target,
+            state,
+            connection_id,
+        ));
+
+        BufReader::new(client)
+    }
+
+    async fn write_evil_setup(client: &mut UnixStream) {
+        client
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RESET"]))
+            .await
+            .unwrap();
+        client
+            .write_all(&resp_command(&["DEBUG", "EVIL", "SEED", "98765"]))
+            .await
+            .unwrap();
+        client
+            .write_all(&resp_command(&[
+                "DEBUG",
+                "EVIL",
+                "MODE",
+                "MUTATE",
+                "PROBABILITY",
+                "100.0",
+            ]))
+            .await
+            .unwrap();
+    }
+
     fn resp_command(args: &[&str]) -> Vec<u8> {
         Frame::Array(Some(
             args.iter()
@@ -854,6 +977,7 @@ mod tests {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
+            command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
         };
         let proxy = tokio::spawn(proxy_connection(

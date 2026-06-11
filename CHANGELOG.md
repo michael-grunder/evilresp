@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Removed client connection identity from mutation RNG and switched mutation
+  command indexes to resettable global command ids so reconnects do not change
+  later mutations for the same command stream.
 - Fixed `DEBUG EVIL MODE RESET` so the active connection also resets to
   connection id zero, making repeated same-seed client runs produce identical
   mutations.

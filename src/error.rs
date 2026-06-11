@@ -22,6 +22,9 @@ pub enum AppError {
     #[error("invalid proxy response: {0}")]
     Proxy(String),
 
+    #[error("invalid protocol fingerprint request: {0}")]
+    ProtocolFingerprint(String),
+
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }

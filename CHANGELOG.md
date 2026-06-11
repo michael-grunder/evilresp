@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added per-connection input and output RESP protocol fingerprints exposed via
+  `DEBUG PROTOCOL <IN|OUT> <BLAKE3|TLSH>`.
 - Added `unix:/path/to/socket` endpoint support for proxying upstream AF_UNIX
   sockets and listening on local AF_UNIX sockets in standalone mode.
 - Added `DEBUG EVIL MODE RESET` to disable evil mode and reset deterministic

@@ -16,6 +16,9 @@ use crate::evil::{
     DebugAction, DebugResult, EvilConfig, EvilMode, deterministic_hash,
     mutate_reply, random_reply,
 };
+use crate::protocol_fingerprint::{
+    ProtocolDirection, ProtocolFingerprints, parse_debug_protocol,
+};
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
 
@@ -190,6 +193,7 @@ async fn proxy_connection(
     let mut client_read = BufReader::new(client_read);
     let mut upstream_read = BufReader::new(upstream_read);
     let mut command_index = 0_u64;
+    let mut fingerprints = ProtocolFingerprints::new();
 
     loop {
         let command_bytes = match read_raw_frame(&mut client_read).await {
@@ -203,17 +207,27 @@ async fn proxy_connection(
         let argv = command_frame.argv_lossy();
         let command_name = command_frame.command_name();
 
+        if is_debug_protocol(&argv) {
+            let response = apply_debug_protocol(&fingerprints, &argv);
+            client_write.write_all(&response.encode()).await?;
+            continue;
+        }
+
+        fingerprints.update(ProtocolDirection::In, &command_bytes);
+
         if is_debug_evil(&argv) {
             let result = apply_debug_evil(&state, &argv).await;
-            let response = result.frame;
-            client_write.write_all(&response.encode()).await?;
+            let response = result.frame.encode();
+            client_write.write_all(&response).await?;
             if result.action == DebugAction::ResetIncrementingState {
                 reset_incrementing_state(
                     &state,
                     &mut connection_id,
                     &mut command_index,
                 );
+                fingerprints.reset();
             } else {
+                fingerprints.update(ProtocolDirection::Out, &response);
                 command_index += 1;
             }
             continue;
@@ -222,7 +236,8 @@ async fn proxy_connection(
         if is_cluster_slots(&argv)
             && let Some(response) = &state.local_slots
         {
-            client_write.write_all(&response.encode()).await?;
+            write_client_frame(&mut client_write, &mut fingerprints, response)
+                .await?;
             command_index += 1;
             continue;
         }
@@ -253,7 +268,12 @@ async fn proxy_connection(
                 ),
             )
             .await;
-            client_write.write_all(&mutated.bytes).await?;
+            write_client_bytes(
+                &mut client_write,
+                &mut fingerprints,
+                &mutated.bytes,
+            )
+            .await?;
             command_index += 1;
             continue;
         }
@@ -296,7 +316,12 @@ async fn proxy_connection(
             upstream_bytes
         };
 
-        client_write.write_all(&response_bytes).await?;
+        write_client_bytes(
+            &mut client_write,
+            &mut fingerprints,
+            &response_bytes,
+        )
+        .await?;
         command_index += 1;
     }
 }
@@ -327,12 +352,51 @@ async fn apply_debug_evil(state: &SharedState, argv: &[String]) -> DebugResult {
     }
 }
 
+fn apply_debug_protocol(
+    fingerprints: &ProtocolFingerprints,
+    argv: &[String],
+) -> Frame {
+    match parse_debug_protocol(argv) {
+        Ok((direction, algorithm)) => Frame::BulkString(Some(
+            fingerprints.get(direction, algorithm).into_bytes(),
+        )),
+        Err(error) => {
+            warn!(%error, "rejected DEBUG PROTOCOL command");
+            Frame::SimpleError(format!("ERR {error}"))
+        }
+    }
+}
+
 async fn write_repro(state: &SharedState, record: ReproRecord) {
     if let Some(writer) = &state.repro
         && let Err(error) = writer.append(record).await
     {
         error!(%error, "failed to append repro record");
     }
+}
+
+async fn write_client_frame<W>(
+    writer: &mut W,
+    fingerprints: &mut ProtocolFingerprints,
+    frame: &Frame,
+) -> AppResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_client_bytes(writer, fingerprints, &frame.encode()).await
+}
+
+async fn write_client_bytes<W>(
+    writer: &mut W,
+    fingerprints: &mut ProtocolFingerprints,
+    bytes: &[u8],
+) -> AppResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(bytes).await?;
+    fingerprints.update(ProtocolDirection::Out, bytes);
+    Ok(())
 }
 
 fn reset_incrementing_state(
@@ -349,6 +413,12 @@ fn is_debug_evil(argv: &[String]) -> bool {
     argv.len() >= 2
         && argv[0].eq_ignore_ascii_case("DEBUG")
         && argv[1].eq_ignore_ascii_case("EVIL")
+}
+
+fn is_debug_protocol(argv: &[String]) -> bool {
+    argv.len() >= 2
+        && argv[0].eq_ignore_ascii_case("DEBUG")
+        && argv[1].eq_ignore_ascii_case("PROTOCOL")
 }
 
 fn is_cluster_slots(argv: &[String]) -> bool {
@@ -429,6 +499,120 @@ mod tests {
         proxy.await.unwrap().unwrap();
         upstream.await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn debug_protocol_reports_per_connection_blake3_fingerprints() {
+        let command = b"*1\r\n$4\r\nPING\r\n";
+        let response = b"+PONG\r\n";
+        let debug_in =
+            b"*4\r\n$5\r\nDEBUG\r\n$8\r\nPROTOCOL\r\n$2\r\nIN\r\n$6\r\nBLAKE3\r\n";
+        let debug_out =
+            b"*4\r\n$5\r\nDEBUG\r\n$8\r\nPROTOCOL\r\n$3\r\nOUT\r\n$6\r\nBLAKE3\r\n";
+
+        let mut read =
+            run_proxy_client_with_single_upstream_response(command, response)
+                .await;
+
+        read.get_mut().write_all(debug_in).await.unwrap();
+        read.get_mut().write_all(debug_out).await.unwrap();
+
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), response);
+        assert_eq!(
+            read_bulk_string(&mut read).await,
+            blake3_hex(command).into_bytes()
+        );
+        assert_eq!(
+            read_bulk_string(&mut read).await,
+            blake3_hex(response).into_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_evil_reset_zeroes_protocol_fingerprints() {
+        let command = b"*1\r\n$4\r\nPING\r\n";
+        let response = b"+PONG\r\n";
+        let reset =
+            b"*4\r\n$5\r\nDEBUG\r\n$4\r\nEVIL\r\n$4\r\nMODE\r\n$5\r\nRESET\r\n";
+        let debug_in =
+            b"*4\r\n$5\r\nDEBUG\r\n$8\r\nPROTOCOL\r\n$2\r\nIN\r\n$6\r\nBLAKE3\r\n";
+        let debug_out =
+            b"*4\r\n$5\r\nDEBUG\r\n$8\r\nPROTOCOL\r\n$3\r\nOUT\r\n$6\r\nBLAKE3\r\n";
+
+        let mut read =
+            run_proxy_client_with_single_upstream_response(command, response)
+                .await;
+
+        read.get_mut().write_all(reset).await.unwrap();
+        read.get_mut().write_all(debug_in).await.unwrap();
+        read.get_mut().write_all(debug_out).await.unwrap();
+
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), response);
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), b"+OK\r\n");
+        assert_eq!(
+            read_bulk_string(&mut read).await,
+            blake3_hex(b"").into_bytes()
+        );
+        assert_eq!(
+            read_bulk_string(&mut read).await,
+            blake3_hex(b"").into_bytes()
+        );
+    }
+
+    async fn run_proxy_client_with_single_upstream_response(
+        command: &'static [u8],
+        response: &'static [u8],
+    ) -> BufReader<UnixStream> {
+        let path = unique_socket_path("upstream-fingerprint");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            assert_eq!(read_raw_frame(&mut read).await.unwrap(), command);
+            write.write_all(response).await.unwrap();
+        });
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(EvilConfig::default())),
+            repro: None,
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+        let proxy =
+            tokio::spawn(proxy_connection(Box::new(server), target, state, 0));
+
+        client.write_all(command).await.unwrap();
+
+        tokio::spawn(async move {
+            proxy.await.unwrap().unwrap();
+            upstream.await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        });
+
+        BufReader::new(client)
+    }
+
+    async fn read_bulk_string<R>(read: &mut R) -> Vec<u8>
+    where
+        R: tokio::io::AsyncBufRead + Unpin + Send,
+    {
+        let bytes = read_raw_frame(read).await.unwrap();
+        match parse_frame(&bytes).unwrap() {
+            Frame::BulkString(Some(bytes)) => bytes,
+            other => panic!("expected bulk string, got {other:?}"),
+        }
+    }
+
+    fn blake3_hex(bytes: &[u8]) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(bytes);
+        hasher.finalize().to_hex().to_string()
     }
 
     fn unique_socket_path(name: &str) -> PathBuf {

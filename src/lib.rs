@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod error;
 pub mod evil;
 pub mod logging;
+pub mod protocol_fingerprint;
 pub mod proxy;
 pub mod repro;
 pub mod resp;

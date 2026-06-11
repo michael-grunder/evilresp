@@ -84,7 +84,8 @@ Modes:
 
 `DEBUG EVIL MODE RESET` disables evil mode, sets mutation probability to zero,
 and resets incrementing values used for deterministic reproduction, including
-the next connection id and the current connection's command index.
+the next connection id, the current connection's command index, and the current
+connection's protocol fingerprints.
 
 Filters are case-insensitive. Plain strings match literal command names, regex
 strings such as `^GET.*` match command names, and attributes such as `@read`,
@@ -94,3 +95,18 @@ The default exclude list avoids mutating commands that commonly break client
 setup too early: `AUTH`, `HELLO`, `CLIENT`, `SELECT`, `ASKING`, `MULTI`,
 `COMMAND`, `DISCARD`, `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE`, `UNSUBSCRIBE`,
 and `QUIT`.
+
+## DEBUG PROTOCOL
+
+`DEBUG PROTOCOL` commands are handled by `evilresp` and are not sent upstream.
+They return per-connection fingerprints for RESP bytes received from the client
+or written back to the client:
+
+```text
+DEBUG PROTOCOL <IN|OUT> <BLAKE3|TLSH>
+```
+
+`BLAKE3` returns a hex digest for exact uniqueness checks. `TLSH` returns a TLSH
+similarity hash, or `TNULL` until the observed byte stream is large and varied
+enough for TLSH. `DEBUG PROTOCOL` requests and replies do not update the
+fingerprints they read.

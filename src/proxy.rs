@@ -680,6 +680,152 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    #[tokio::test]
+    async fn repeated_clients_with_same_evil_config_have_identical_protocol_output()
+     {
+        for mode in ["RANDOM", "MUTATE", "OVERFLOW"] {
+            let first =
+                run_protocol_fingerprint_client_after_reset(17, mode).await;
+            let second =
+                run_protocol_fingerprint_client_after_reset(42, mode).await;
+
+            assert_eq!(first, second, "mode {mode}");
+            assert!(!first.out_blake3.is_empty(), "mode {mode}");
+            assert!(!first.out_tlsh.is_empty(), "mode {mode}");
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ProtocolOutputRun {
+        output: Vec<u8>,
+        out_blake3: Vec<u8>,
+        out_tlsh: Vec<u8>,
+    }
+
+    async fn run_protocol_fingerprint_client_after_reset(
+        initial_connection_id: u64,
+        mode: &str,
+    ) -> ProtocolOutputRun {
+        let path = unique_socket_path("upstream-protocol-determinism");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+
+            loop {
+                match read_raw_frame(&mut read).await {
+                    Ok(command) => {
+                        write
+                            .write_all(&deterministic_upstream_response(
+                                &command,
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(error) => {
+                        panic!("failed to read upstream command: {error}")
+                    }
+                }
+            }
+        });
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(EvilConfig::default())),
+            repro: None,
+            connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
+            local_slots: None,
+        };
+        let proxy = tokio::spawn(proxy_connection(
+            Box::new(server),
+            target,
+            state,
+            initial_connection_id,
+        ));
+
+        client
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RESET"]))
+            .await
+            .unwrap();
+        client
+            .write_all(&resp_command(&["DEBUG", "EVIL", "SEED", "98765"]))
+            .await
+            .unwrap();
+        client
+            .write_all(&resp_command(&[
+                "DEBUG",
+                "EVIL",
+                "MODE",
+                mode,
+                "PROBABILITY",
+                "100.0",
+            ]))
+            .await
+            .unwrap();
+
+        let mut read = BufReader::new(client);
+        let mut output = Vec::new();
+        for _ in 0..3 {
+            output.extend(read_raw_frame(&mut read).await.unwrap());
+        }
+
+        for command in deterministic_protocol_commands() {
+            read.get_mut().write_all(&command).await.unwrap();
+            output.extend(read_available_response_bytes(&mut read).await);
+        }
+
+        read.get_mut()
+            .write_all(&resp_command(&["DEBUG", "PROTOCOL", "OUT", "BLAKE3"]))
+            .await
+            .unwrap();
+        let out_blake3 = read_bulk_string(&mut read).await;
+
+        read.get_mut()
+            .write_all(&resp_command(&["DEBUG", "PROTOCOL", "OUT", "TLSH"]))
+            .await
+            .unwrap();
+        let out_tlsh = read_bulk_string(&mut read).await;
+
+        drop(read);
+        proxy.await.unwrap().unwrap();
+        upstream.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        ProtocolOutputRun {
+            output,
+            out_blake3,
+            out_tlsh,
+        }
+    }
+
+    fn deterministic_protocol_commands() -> Vec<Vec<u8>> {
+        (0..12)
+            .map(|index| resp_command(&["GET", &format!("key:{index:02}")]))
+            .collect()
+    }
+
+    fn deterministic_upstream_response(command: &[u8]) -> Vec<u8> {
+        let body = format!("value:{}", blake3_hex(command));
+        Frame::BulkString(Some(body.into_bytes())).encode()
+    }
+
+    fn resp_command(args: &[&str]) -> Vec<u8> {
+        Frame::Array(Some(
+            args.iter()
+                .map(|arg| Frame::BulkString(Some(arg.as_bytes().to_vec())))
+                .collect(),
+        ))
+        .encode()
+    }
+
     async fn run_mutating_client_after_reset(
         initial_connection_id: u64,
         command: &'static [u8],

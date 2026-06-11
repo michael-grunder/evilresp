@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -16,13 +15,15 @@ pub enum LogMode {
 #[command(author, version, about)]
 pub struct Cli {
     /// Upstream Redis, Valkey, or DragonflyDB endpoint to proxy.
+    ///
+    /// Use host:port for TCP or unix:/path/to/socket for AF_UNIX.
     #[arg(long)]
     pub proxy: Endpoint,
 
-    /// Local address to listen on. Cluster mode uses this port as the first
-    /// local node port.
+    /// Local endpoint to listen on. Cluster mode supports TCP only and uses
+    /// this port as the first local node port.
     #[arg(long, default_value = "127.0.0.1:6380")]
-    pub listen: SocketAddr,
+    pub listen: Endpoint,
 
     /// Append deterministic mutation records as JSON lines.
     #[arg(long)]
@@ -38,12 +39,53 @@ pub struct Cli {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Endpoint {
+pub enum Endpoint {
+    Tcp(TcpEndpoint),
+    Unix(PathBuf),
+}
+
+impl Endpoint {
+    pub fn as_tcp(&self) -> Option<&TcpEndpoint> {
+        match self {
+            Self::Tcp(endpoint) => Some(endpoint),
+            Self::Unix(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(endpoint) => endpoint.fmt(formatter),
+            Self::Unix(path) => write!(formatter, "unix:{}", path.display()),
+        }
+    }
+}
+
+impl FromStr for Endpoint {
+    type Err = AppError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some(path) = value.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err(AppError::Proxy(
+                    "unix endpoint path must not be empty".to_owned(),
+                ));
+            }
+            return Ok(Self::Unix(PathBuf::from(path)));
+        }
+
+        Ok(Self::Tcp(value.parse()?))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TcpEndpoint {
     pub host: String,
     pub port: u16,
 }
 
-impl Endpoint {
+impl TcpEndpoint {
     pub fn connect_addr(&self) -> String {
         if self.host.contains(':') && !self.host.starts_with('[') {
             format!("[{}]:{}", self.host, self.port)
@@ -53,13 +95,13 @@ impl Endpoint {
     }
 }
 
-impl std::fmt::Display for Endpoint {
+impl std::fmt::Display for TcpEndpoint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.connect_addr())
     }
 }
 
-impl FromStr for Endpoint {
+impl FromStr for TcpEndpoint {
     type Err = AppError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -93,4 +135,29 @@ fn parse_port(value: &str) -> Result<u16, AppError> {
     value.parse::<u16>().map_err(|error| {
         AppError::Proxy(format!("invalid endpoint port: {error}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_tcp_endpoint() {
+        let endpoint: Endpoint = "127.0.0.1:6379".parse().unwrap();
+
+        assert_eq!(
+            endpoint,
+            Endpoint::Tcp(TcpEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 6379
+            })
+        );
+    }
+
+    #[test]
+    fn parses_unix_endpoint() {
+        let endpoint: Endpoint = "unix:/tmp/redis.sock".parse().unwrap();
+
+        assert_eq!(endpoint, Endpoint::Unix(PathBuf::from("/tmp/redis.sock")));
+    }
 }

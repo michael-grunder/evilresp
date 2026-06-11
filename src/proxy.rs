@@ -1,14 +1,15 @@
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Endpoint};
 use crate::cluster::{ProxyTarget, Topology, discover};
 use crate::error::{AppError, AppResult};
 use crate::evil::{
@@ -16,6 +17,69 @@ use crate::evil::{
 };
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
+
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type ProxyStream = Box<dyn AsyncReadWrite>;
+
+enum ProxyListener {
+    Tcp(TcpListener),
+    Unix {
+        listener: UnixListener,
+        path: PathBuf,
+    },
+}
+
+impl ProxyListener {
+    async fn bind(endpoint: &Endpoint) -> AppResult<Self> {
+        match endpoint {
+            Endpoint::Tcp(endpoint) => {
+                Ok(Self::Tcp(TcpListener::bind(endpoint.connect_addr()).await?))
+            }
+            Endpoint::Unix(path) => Ok(Self::Unix {
+                listener: UnixListener::bind(path)?,
+                path: path.clone(),
+            }),
+        }
+    }
+
+    fn local_endpoint(&self) -> AppResult<String> {
+        match self {
+            Self::Tcp(listener) => Ok(listener.local_addr()?.to_string()),
+            Self::Unix { path, .. } => Ok(format!("unix:{}", path.display())),
+        }
+    }
+
+    async fn accept(&self) -> AppResult<(ProxyStream, String)> {
+        match self {
+            Self::Tcp(listener) => {
+                let (stream, peer) = listener.accept().await?;
+                Ok((Box::new(stream), peer.to_string()))
+            }
+            Self::Unix { listener, .. } => {
+                let (stream, peer) = listener.accept().await?;
+                let peer = peer
+                    .as_pathname()
+                    .map(|path| format!("unix:{}", path.display()))
+                    .unwrap_or_else(|| "unix:<unnamed>".to_owned());
+                Ok((Box::new(stream), peer))
+            }
+        }
+    }
+}
+
+impl Drop for ProxyListener {
+    fn drop(&mut self) {
+        if let Self::Unix { path, .. } = self
+            && let Err(error) = std::fs::remove_file(&*path)
+            && error.kind() != ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), %error, "failed to remove Unix listener socket");
+        }
+    }
+}
 
 #[derive(Clone)]
 struct SharedState {
@@ -47,10 +111,10 @@ async fn serve_topology(
 ) -> AppResult<()> {
     let mut listeners = JoinSet::new();
     for target in topology.targets() {
-        let listener = TcpListener::bind(target.listen).await?;
-        let local_addr = listener.local_addr()?;
+        let listener = ProxyListener::bind(&target.listen).await?;
+        let local_endpoint = listener.local_endpoint()?;
         info!(
-            listen = %local_addr,
+            listen = %local_endpoint,
             upstream = %target.upstream,
             "listening for RESP clients"
         );
@@ -81,7 +145,7 @@ async fn serve_topology(
 }
 
 async fn serve_listener(
-    listener: TcpListener,
+    listener: ProxyListener,
     target: ProxyTarget,
     state: SharedState,
 ) -> AppResult<()> {
@@ -101,7 +165,7 @@ async fn serve_listener(
 }
 
 async fn handle_connection(
-    client: TcpStream,
+    client: ProxyStream,
     target: ProxyTarget,
     state: SharedState,
     connection_id: u64,
@@ -114,14 +178,14 @@ async fn handle_connection(
 }
 
 async fn proxy_connection(
-    client: TcpStream,
+    client: ProxyStream,
     target: ProxyTarget,
     state: SharedState,
     connection_id: u64,
 ) -> AppResult<()> {
-    let upstream = TcpStream::connect(target.upstream.connect_addr()).await?;
-    let (client_read, mut client_write) = client.into_split();
-    let (upstream_read, mut upstream_write) = upstream.into_split();
+    let upstream = connect_upstream(&target.upstream).await?;
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
     let mut client_read = BufReader::new(client_read);
     let mut upstream_read = BufReader::new(upstream_read);
     let mut command_index = 0_u64;
@@ -227,6 +291,15 @@ async fn proxy_connection(
     }
 }
 
+async fn connect_upstream(endpoint: &Endpoint) -> AppResult<ProxyStream> {
+    match endpoint {
+        Endpoint::Tcp(endpoint) => {
+            Ok(Box::new(TcpStream::connect(endpoint.connect_addr()).await?))
+        }
+        Endpoint::Unix(path) => Ok(Box::new(UnixStream::connect(path).await?)),
+    }
+}
+
 async fn apply_debug_evil(state: &SharedState, argv: &[String]) -> Frame {
     let mut config = state.evil.write().await;
     match config.apply_debug_command(argv) {
@@ -264,6 +337,9 @@ fn is_cluster_slots(argv: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    static SOCKET_ID: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn detects_local_commands_case_insensitively() {
@@ -272,5 +348,68 @@ mod tests {
             "cluster".to_owned(),
             "slots".to_owned()
         ]));
+    }
+
+    #[tokio::test]
+    async fn accepts_client_on_unix_listener() {
+        let path = unique_socket_path("listen");
+        let endpoint = Endpoint::Unix(path.clone());
+        let listener = ProxyListener::bind(&endpoint).await.unwrap();
+
+        let client = UnixStream::connect(&path).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+
+        assert_eq!(peer, "unix:<unnamed>");
+        drop(client);
+        drop(server);
+        drop(listener);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn proxies_commands_to_unix_upstream() {
+        let path = unique_socket_path("upstream");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            let command = read_raw_frame(&mut read).await.unwrap();
+            assert_eq!(command, b"*1\r\n$4\r\nPING\r\n");
+            write
+                .write_all(&Frame::SimpleString("PONG".to_owned()).encode())
+                .await
+                .unwrap();
+        });
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(EvilConfig::default())),
+            repro: None,
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+        let proxy =
+            tokio::spawn(proxy_connection(Box::new(server), target, state, 0));
+
+        client.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+        let mut read = BufReader::new(client);
+        let response = read_raw_frame(&mut read).await.unwrap();
+
+        assert_eq!(response, b"+PONG\r\n");
+        drop(read);
+        proxy.await.unwrap().unwrap();
+        upstream.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn unique_socket_path(name: &str) -> PathBuf {
+        let id = SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("evilresp-{name}-{}-{id}.sock", std::process::id()))
     }
 }

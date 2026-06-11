@@ -5,7 +5,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
 
-use crate::cli::Endpoint;
+use crate::cli::{Endpoint, TcpEndpoint};
 use crate::error::{AppError, AppResult};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
 
@@ -41,14 +41,14 @@ impl Topology {
 #[derive(Clone, Debug)]
 pub struct ProxyTarget {
     pub upstream: Endpoint,
-    pub listen: SocketAddr,
+    pub listen: Endpoint,
 }
 
 #[derive(Clone, Debug)]
 pub struct LocalSlotRange {
     pub start: u16,
     pub end: u16,
-    pub upstream: Endpoint,
+    pub upstream: TcpEndpoint,
     pub local: SocketAddr,
     pub node_id: Option<Vec<u8>>,
 }
@@ -74,23 +74,16 @@ impl LocalSlotRange {
 
 pub async fn discover(
     proxy: Endpoint,
-    listen: SocketAddr,
+    listen: Endpoint,
 ) -> AppResult<Topology> {
-    let slots = match fetch_cluster_slots(&proxy).await {
-        Ok(slots) if slots.is_empty() => {
-            debug!(
-                "CLUSTER SLOTS returned an empty topology; using standalone proxy mode"
-            );
-            return Ok(Topology::Standalone {
-                target: ProxyTarget {
-                    upstream: proxy,
-                    listen,
-                },
-            });
+    let (tcp_proxy, tcp_listen) = match (proxy.as_tcp(), listen.as_tcp()) {
+        (Some(proxy), Some(listen)) => {
+            (proxy.clone(), listen.connect_addr().parse::<SocketAddr>()?)
         }
-        Ok(slots) => slots,
-        Err(error) => {
-            debug!(%error, "cluster probe failed; using standalone proxy mode");
+        _ => {
+            debug!(
+                "AF_UNIX endpoint configured; using standalone proxy mode without cluster discovery"
+            );
             return Ok(Topology::Standalone {
                 target: ProxyTarget {
                     upstream: proxy,
@@ -100,7 +93,31 @@ pub async fn discover(
         }
     };
 
-    if listen.port() == 0 {
+    let slots = match fetch_cluster_slots(&tcp_proxy).await {
+        Ok(slots) if slots.is_empty() => {
+            debug!(
+                "CLUSTER SLOTS returned an empty topology; using standalone proxy mode"
+            );
+            return Ok(Topology::Standalone {
+                target: ProxyTarget {
+                    upstream: Endpoint::Tcp(tcp_proxy),
+                    listen,
+                },
+            });
+        }
+        Ok(slots) => slots,
+        Err(error) => {
+            debug!(%error, "cluster probe failed; using standalone proxy mode");
+            return Ok(Topology::Standalone {
+                target: ProxyTarget {
+                    upstream: Endpoint::Tcp(tcp_proxy),
+                    listen,
+                },
+            });
+        }
+    };
+
+    if tcp_listen.port() == 0 {
         return Err(AppError::Proxy(
             "cluster proxy mode requires a non-zero --listen port".to_owned(),
         ));
@@ -119,18 +136,18 @@ pub async fn discover(
                 "cluster has more local nodes than u16 ports".to_owned(),
             )
         })?;
-        let port = listen.port().checked_add(offset).ok_or_else(|| {
+        let port = tcp_listen.port().checked_add(offset).ok_or_else(|| {
             AppError::Proxy(format!(
                 "cluster local port mapping from {} overflows u16",
-                listen.port()
+                tcp_listen.port()
             ))
         })?;
-        let mut local = listen;
+        let mut local = tcp_listen;
         local.set_port(port);
         local_by_upstream.insert(key, local);
         targets.push(ProxyTarget {
-            upstream: slot.upstream.clone(),
-            listen: local,
+            upstream: Endpoint::Tcp(slot.upstream.clone()),
+            listen: Endpoint::Tcp(socket_addr_to_endpoint(local)),
         });
     }
 
@@ -155,7 +172,7 @@ pub async fn discover(
 }
 
 async fn fetch_cluster_slots(
-    proxy: &Endpoint,
+    proxy: &TcpEndpoint,
 ) -> AppResult<Vec<LocalSlotRange>> {
     let stream = TcpStream::connect(proxy.connect_addr()).await?;
     let (read, mut write) = stream.into_split();
@@ -186,7 +203,7 @@ fn cluster_slots_command() -> Frame {
 
 fn parse_cluster_slots(
     items: Vec<Frame>,
-    bootstrap: &Endpoint,
+    bootstrap: &TcpEndpoint,
 ) -> AppResult<Vec<LocalSlotRange>> {
     items
         .into_iter()
@@ -196,7 +213,7 @@ fn parse_cluster_slots(
 
 fn parse_slot_range(
     item: Frame,
-    bootstrap: &Endpoint,
+    bootstrap: &TcpEndpoint,
 ) -> AppResult<LocalSlotRange> {
     let Frame::Array(Some(parts)) = item else {
         return Err(AppError::Proxy(
@@ -226,8 +243,8 @@ fn parse_slot_range(
 
 fn parse_node(
     node: Option<&Frame>,
-    bootstrap: &Endpoint,
-) -> AppResult<(Endpoint, Option<Vec<u8>>)> {
+    bootstrap: &TcpEndpoint,
+) -> AppResult<(TcpEndpoint, Option<Vec<u8>>)> {
     let Some(Frame::Array(Some(parts))) = node else {
         return Err(AppError::Proxy(
             "cluster slot primary node is not an array".to_owned(),
@@ -274,7 +291,7 @@ fn parse_node(
         _ => None,
     };
 
-    Ok((Endpoint { host, port }, node_id))
+    Ok((TcpEndpoint { host, port }, node_id))
 }
 
 fn as_slot(frame: Option<&Frame>, name: &str) -> AppResult<u16> {
@@ -283,6 +300,13 @@ fn as_slot(frame: Option<&Frame>, name: &str) -> AppResult<u16> {
             AppError::Proxy(format!("{name} {value} is outside u16 range"))
         }),
         _ => Err(AppError::Proxy(format!("{name} is not an integer"))),
+    }
+}
+
+fn socket_addr_to_endpoint(addr: SocketAddr) -> TcpEndpoint {
+    TcpEndpoint {
+        host: addr.ip().to_string(),
+        port: addr.port(),
     }
 }
 
@@ -303,7 +327,7 @@ mod tests {
 
         let slots = parse_cluster_slots(
             items,
-            &Endpoint {
+            &TcpEndpoint {
                 host: "127.0.0.1".to_owned(),
                 port: 6379,
             },
@@ -314,5 +338,19 @@ mod tests {
         assert_eq!(slots[0].start, 0);
         assert_eq!(slots[0].end, 16383);
         assert_eq!(slots[0].upstream.port, 7000);
+    }
+
+    #[tokio::test]
+    async fn unix_endpoints_use_standalone_topology_without_cluster_probe() {
+        let proxy = Endpoint::Unix("/tmp/upstream.sock".into());
+        let listen = Endpoint::Unix("/tmp/listen.sock".into());
+
+        let topology = discover(proxy.clone(), listen.clone()).await.unwrap();
+
+        let Topology::Standalone { target } = topology else {
+            panic!("expected standalone topology");
+        };
+        assert_eq!(target.upstream, proxy);
+        assert_eq!(target.listen, listen);
     }
 }

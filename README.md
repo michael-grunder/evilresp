@@ -20,9 +20,18 @@ different local address:
 cargo run -- --proxy localhost:6379 --listen 127.0.0.1:6381
 ```
 
+Use `unix:/path/to/socket` to proxy an upstream AF_UNIX socket, listen on an
+AF_UNIX socket, or both:
+
+```bash
+cargo run -- --proxy unix:/tmp/redis.sock --listen unix:/tmp/evilresp.sock
+```
+
 At startup, `evilresp` probes `CLUSTER SLOTS`. If the upstream is a cluster, it
 maps each primary node to a local listening port and rewrites `CLUSTER SLOTS`
-responses so cluster-aware clients connect back through `evilresp`.
+responses so cluster-aware clients connect back through `evilresp`. Cluster
+proxy mode requires TCP endpoints; configuring either endpoint as AF_UNIX uses
+standalone proxy mode.
 
 ## Logging
 

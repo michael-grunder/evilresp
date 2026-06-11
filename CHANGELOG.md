@@ -9,6 +9,12 @@ All notable changes to this project will be documented in this file.
 - Excluded `COMMAND` from default reply mutation so redis-cli can introspect
   server capabilities on connect.
 
+### Fixed
+
+- Fixed `DEBUG EVIL MODE RESET` so the active connection also resets to
+  connection id zero, making repeated same-seed client runs produce identical
+  mutations.
+
 ### Added
 
 - Added `unix:/path/to/socket` endpoint support for proxying upstream AF_UNIX

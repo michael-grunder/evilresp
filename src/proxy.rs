@@ -182,7 +182,7 @@ async fn proxy_connection(
     client: ProxyStream,
     target: ProxyTarget,
     state: SharedState,
-    connection_id: u64,
+    mut connection_id: u64,
 ) -> AppResult<()> {
     let upstream = connect_upstream(&target.upstream).await?;
     let (client_read, mut client_write) = tokio::io::split(client);
@@ -208,7 +208,11 @@ async fn proxy_connection(
             let response = result.frame;
             client_write.write_all(&response.encode()).await?;
             if result.action == DebugAction::ResetIncrementingState {
-                reset_incrementing_state(&state, &mut command_index);
+                reset_incrementing_state(
+                    &state,
+                    &mut connection_id,
+                    &mut command_index,
+                );
             } else {
                 command_index += 1;
             }
@@ -331,8 +335,13 @@ async fn write_repro(state: &SharedState, record: ReproRecord) {
     }
 }
 
-fn reset_incrementing_state(state: &SharedState, command_index: &mut u64) {
-    state.connection_ids.store(0, Ordering::Relaxed);
+fn reset_incrementing_state(
+    state: &SharedState,
+    connection_id: &mut u64,
+    command_index: &mut u64,
+) {
+    *connection_id = 0;
+    state.connection_ids.store(1, Ordering::Relaxed);
     *command_index = 0;
 }
 
@@ -352,6 +361,7 @@ fn is_cluster_slots(argv: &[String]) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
 
     static SOCKET_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -452,15 +462,142 @@ mod tests {
         .await;
 
         if result.action == DebugAction::ResetIncrementingState {
+            let mut connection_id = 19;
             let mut command_index = 23;
-            reset_incrementing_state(&state, &mut command_index);
+            reset_incrementing_state(
+                &state,
+                &mut connection_id,
+                &mut command_index,
+            );
+            assert_eq!(connection_id, 0);
             assert_eq!(command_index, 0);
         }
 
         assert_eq!(result.action, DebugAction::ResetIncrementingState);
-        assert_eq!(state.connection_ids.load(Ordering::Relaxed), 0);
+        assert_eq!(state.connection_ids.load(Ordering::Relaxed), 1);
         let config = state.evil.read().await;
         assert_eq!(config.mode, EvilMode::Off);
         assert_eq!(config.probability, 0.0);
+    }
+
+    #[tokio::test]
+    async fn debug_evil_reset_makes_repeated_client_runs_identical() {
+        let first = run_mutating_client_after_reset(
+            17,
+            b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n",
+        )
+        .await;
+        let second = run_mutating_client_after_reset(
+            42,
+            b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n",
+        )
+        .await;
+
+        assert_eq!(first, second);
+    }
+
+    async fn run_mutating_client_after_reset(
+        initial_connection_id: u64,
+        command: &'static [u8],
+    ) -> Vec<u8> {
+        let path = unique_socket_path("upstream-reset");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream_command = command.to_vec();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+
+            let command = read_raw_frame(&mut read).await.unwrap();
+            write
+                .write_all(upstream_response_for(&upstream_command, &command))
+                .await
+                .unwrap();
+        });
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(EvilConfig::default())),
+            repro: None,
+            connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
+            local_slots: None,
+        };
+        let proxy = tokio::spawn(proxy_connection(
+            Box::new(server),
+            target,
+            state,
+            initial_connection_id,
+        ));
+
+        client
+            .write_all(
+                b"*4\r\n$5\r\nDEBUG\r\n$4\r\nEVIL\r\n$4\r\nMODE\r\n$5\r\nRESET\r\n",
+            )
+            .await
+            .unwrap();
+        client
+            .write_all(b"*4\r\n$5\r\nDEBUG\r\n$4\r\nEVIL\r\n$4\r\nSEED\r\n$4\r\n1234\r\n")
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"*6\r\n$5\r\nDEBUG\r\n$4\r\nEVIL\r\n$4\r\nMODE\r\n$6\r\nMUTATE\r\n$11\r\nPROBABILITY\r\n$5\r\n100.0\r\n",
+            )
+            .await
+            .unwrap();
+        client.write_all(command).await.unwrap();
+
+        let mut read = BufReader::new(client);
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), b"+OK\r\n");
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), b"+OK\r\n");
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), b"+OK\r\n");
+        let response = read_available_response_bytes(&mut read).await;
+
+        drop(read);
+        proxy.await.unwrap().unwrap();
+        upstream.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        response
+    }
+
+    async fn read_available_response_bytes<R>(read: &mut R) -> Vec<u8>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            match tokio::time::timeout(
+                Duration::from_millis(25),
+                tokio::io::AsyncReadExt::read(read, &mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(count)) => response.extend_from_slice(&chunk[..count]),
+                Ok(Err(error)) => panic!("failed to read response: {error}"),
+                Err(_) if !response.is_empty() => break,
+                Err(_) => panic!("timed out waiting for response"),
+            }
+        }
+
+        response
+    }
+
+    fn upstream_response_for<'a>(
+        fuzz_command: &[u8],
+        command: &'a [u8],
+    ) -> &'a [u8] {
+        if command == fuzz_command {
+            b"$5\r\nvalue\r\n"
+        } else {
+            b"+OK\r\n"
+        }
     }
 }

@@ -13,7 +13,8 @@ use crate::cli::{Cli, Endpoint};
 use crate::cluster::{ProxyTarget, Topology, discover};
 use crate::error::{AppError, AppResult};
 use crate::evil::{
-    EvilConfig, EvilMode, deterministic_hash, mutate_reply, random_reply,
+    DebugAction, DebugResult, EvilConfig, EvilMode, deterministic_hash,
+    mutate_reply, random_reply,
 };
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
@@ -203,9 +204,14 @@ async fn proxy_connection(
         let command_name = command_frame.command_name();
 
         if is_debug_evil(&argv) {
-            let response = apply_debug_evil(&state, &argv).await;
+            let result = apply_debug_evil(&state, &argv).await;
+            let response = result.frame;
             client_write.write_all(&response.encode()).await?;
-            command_index += 1;
+            if result.action == DebugAction::ResetIncrementingState {
+                reset_incrementing_state(&state, &mut command_index);
+            } else {
+                command_index += 1;
+            }
             continue;
         }
 
@@ -300,16 +306,19 @@ async fn connect_upstream(endpoint: &Endpoint) -> AppResult<ProxyStream> {
     }
 }
 
-async fn apply_debug_evil(state: &SharedState, argv: &[String]) -> Frame {
+async fn apply_debug_evil(state: &SharedState, argv: &[String]) -> DebugResult {
     let mut config = state.evil.write().await;
     match config.apply_debug_command(argv) {
-        Ok(frame) => {
+        Ok(result) => {
             info!(status = %config.status(), "updated evil configuration");
-            frame
+            result
         }
         Err(error) => {
             warn!(%error, "rejected DEBUG EVIL command");
-            Frame::SimpleError(format!("ERR {error}"))
+            DebugResult {
+                frame: Frame::SimpleError(format!("ERR {error}")),
+                action: DebugAction::None,
+            }
         }
     }
 }
@@ -320,6 +329,11 @@ async fn write_repro(state: &SharedState, record: ReproRecord) {
     {
         error!(%error, "failed to append repro record");
     }
+}
+
+fn reset_incrementing_state(state: &SharedState, command_index: &mut u64) {
+    state.connection_ids.store(0, Ordering::Relaxed);
+    *command_index = 0;
 }
 
 fn is_debug_evil(argv: &[String]) -> bool {
@@ -411,5 +425,42 @@ mod tests {
         let id = SOCKET_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
             .join(format!("evilresp-{name}-{}-{id}.sock", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn debug_evil_reset_zeroes_incrementing_state() {
+        let mut config = EvilConfig::default();
+        config.mode = EvilMode::Mutate;
+        config.probability = 100.0;
+
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(config)),
+            repro: None,
+            connection_ids: Arc::new(AtomicU64::new(17)),
+            local_slots: None,
+        };
+
+        let result = apply_debug_evil(
+            &state,
+            &[
+                "DEBUG".to_owned(),
+                "EVIL".to_owned(),
+                "MODE".to_owned(),
+                "RESET".to_owned(),
+            ],
+        )
+        .await;
+
+        if result.action == DebugAction::ResetIncrementingState {
+            let mut command_index = 23;
+            reset_incrementing_state(&state, &mut command_index);
+            assert_eq!(command_index, 0);
+        }
+
+        assert_eq!(result.action, DebugAction::ResetIncrementingState);
+        assert_eq!(state.connection_ids.load(Ordering::Relaxed), 0);
+        let config = state.evil.read().await;
+        assert_eq!(config.mode, EvilMode::Off);
+        assert_eq!(config.probability, 0.0);
     }
 }

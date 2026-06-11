@@ -67,6 +67,7 @@ response bytes/hash, selected evil mode, and applied mutation list.
 ```text
 DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
+DEBUG EVIL MODE RESET
 DEBUG EVIL STATUS
 DEBUG EVIL INCLUDE <arg1> ... <argN>
 DEBUG EVIL EXCLUDE <arg1> ... <argN>
@@ -80,6 +81,10 @@ Modes:
 - `MUTATE`: proxy the command, parse the upstream reply, and recursively mutate
   typed RESP frames.
 - `OVERFLOW`: mutate toward overflow-prone values and lengths.
+
+`DEBUG EVIL MODE RESET` disables evil mode, sets mutation probability to zero,
+and resets incrementing values used for deterministic reproduction, including
+the next connection id and the current connection's command index.
 
 Filters are case-insensitive. Plain strings match literal command names, regex
 strings such as `^GET.*` match command names, and attributes such as `@read`,

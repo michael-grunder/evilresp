@@ -97,8 +97,23 @@ impl Default for EvilConfig {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DebugAction {
+    None,
+    ResetIncrementingState,
+}
+
+#[derive(Clone, Debug)]
+pub struct DebugResult {
+    pub frame: Frame,
+    pub action: DebugAction,
+}
+
 impl EvilConfig {
-    pub fn apply_debug_command(&mut self, argv: &[String]) -> AppResult<Frame> {
+    pub fn apply_debug_command(
+        &mut self,
+        argv: &[String],
+    ) -> AppResult<DebugResult> {
         if argv.len() < 3
             || !argv[0].eq_ignore_ascii_case("DEBUG")
             || !argv[1].eq_ignore_ascii_case("EVIL")
@@ -118,7 +133,7 @@ impl EvilConfig {
                 self.seed = seed.parse::<u64>().map_err(|error| {
                     AppError::EvilConfig(format!("invalid seed: {error}"))
                 })?;
-                Ok(Frame::SimpleString("OK".to_owned()))
+                Ok(DebugResult::ok())
             }
             "MODE" => {
                 let Some(mode) = argv.get(3) else {
@@ -126,6 +141,21 @@ impl EvilConfig {
                         "DEBUG EVIL MODE requires a mode".to_owned(),
                     ));
                 };
+                if mode.eq_ignore_ascii_case("RESET") {
+                    if argv.len() != 4 {
+                        return Err(AppError::EvilConfig(
+                            "DEBUG EVIL MODE RESET does not accept options"
+                                .to_owned(),
+                        ));
+                    }
+                    self.mode = EvilMode::Off;
+                    self.probability = 0.0;
+                    return Ok(DebugResult {
+                        frame: Frame::SimpleString("OK".to_owned()),
+                        action: DebugAction::ResetIncrementingState,
+                    });
+                }
+
                 self.mode = EvilMode::from_str(mode)?;
                 self.probability = if self.mode == EvilMode::Off {
                     0.0
@@ -145,16 +175,19 @@ impl EvilConfig {
                     self.probability = parse_probability(&argv[5])?;
                 }
 
-                Ok(Frame::SimpleString("OK".to_owned()))
+                Ok(DebugResult::ok())
             }
-            "STATUS" => Ok(Frame::BulkString(Some(self.status().into_bytes()))),
+            "STATUS" => Ok(DebugResult {
+                frame: Frame::BulkString(Some(self.status().into_bytes())),
+                action: DebugAction::None,
+            }),
             "INCLUDE" => {
                 self.include = compile_filters(&argv[3..])?;
-                Ok(Frame::SimpleString("OK".to_owned()))
+                Ok(DebugResult::ok())
             }
             "EXCLUDE" => {
                 self.exclude = compile_filters(&argv[3..])?;
-                Ok(Frame::SimpleString("OK".to_owned()))
+                Ok(DebugResult::ok())
             }
             other => Err(AppError::EvilConfig(format!(
                 "unknown DEBUG EVIL subcommand {other:?}"
@@ -199,6 +232,15 @@ impl EvilConfig {
             self.include_filters().join(","),
             self.exclude_filters().join(","),
         )
+    }
+}
+
+impl DebugResult {
+    fn ok() -> Self {
+        Self {
+            frame: Frame::SimpleString("OK".to_owned()),
+            action: DebugAction::None,
+        }
     }
 }
 
@@ -686,6 +728,43 @@ mod tests {
 
         assert_eq!(config.mode, EvilMode::Mutate);
         assert_eq!(config.probability, 12.5);
+    }
+
+    #[test]
+    fn debug_mode_reset_turns_mode_off_and_requests_counter_reset() {
+        let mut config = EvilConfig {
+            seed: 1234,
+            mode: EvilMode::Mutate,
+            probability: 50.0,
+            ..EvilConfig::default()
+        };
+
+        let result = config
+            .apply_debug_command(&strings(["DEBUG", "EVIL", "MODE", "RESET"]))
+            .unwrap();
+
+        assert_eq!(config.seed, 1234);
+        assert_eq!(config.mode, EvilMode::Off);
+        assert_eq!(config.probability, 0.0);
+        assert_eq!(result.action, DebugAction::ResetIncrementingState);
+    }
+
+    #[test]
+    fn debug_mode_reset_rejects_probability() {
+        let mut config = EvilConfig::default();
+
+        let error = config
+            .apply_debug_command(&strings([
+                "DEBUG",
+                "EVIL",
+                "MODE",
+                "RESET",
+                "PROBABILITY",
+                "100",
+            ]))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("does not accept options"));
     }
 
     #[test]

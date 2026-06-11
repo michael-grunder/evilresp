@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 
 - Added `unix:/path/to/socket` endpoint support for proxying upstream AF_UNIX
   sockets and listening on local AF_UNIX sockets in standalone mode.
+- Added `DEBUG EVIL MODE RESET` to disable evil mode and reset deterministic
+  incrementing state such as connection ids.
 - Added project-specific contributor and agent guidance in `AGENTS.md`.
 - Added the initial RESP proxy server with standalone/cluster discovery,
   configurable human or JSON logging, deterministic evil modes, DEBUG EVIL

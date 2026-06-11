@@ -89,6 +89,8 @@ impl Drop for ProxyListener {
 struct SharedState {
     evil: Arc<RwLock<EvilConfig>>,
     repro: Option<ReproWriter>,
+    reset_barrier: Arc<RwLock<()>>,
+    reset_epoch: Arc<AtomicU64>,
     connection_ids: Arc<AtomicU64>,
     command_ids: Arc<AtomicU64>,
     local_slots: Option<Frame>,
@@ -103,6 +105,8 @@ pub async fn run(cli: Cli) -> AppResult<()> {
     let state = SharedState {
         evil: Arc::new(RwLock::new(EvilConfig::default())),
         repro,
+        reset_barrier: Arc::new(RwLock::new(())),
+        reset_epoch: Arc::new(AtomicU64::new(0)),
         connection_ids: Arc::new(AtomicU64::new(0)),
         command_ids: Arc::new(AtomicU64::new(0)),
         local_slots: topology.local_slots_response(),
@@ -157,15 +161,16 @@ async fn serve_listener(
 ) -> AppResult<()> {
     loop {
         let (client, peer) = listener.accept().await?;
-        let connection_id =
-            state.connection_ids.fetch_add(1, Ordering::Relaxed);
-        debug!(%peer, connection_id, upstream = %target.upstream, "accepted client");
+        let reset_epoch = state.reset_epoch.load(Ordering::SeqCst);
+        let connection_id = state.connection_ids.fetch_add(1, Ordering::SeqCst);
+        debug!(%peer, reset_epoch, connection_id, upstream = %target.upstream, "accepted client");
 
         tokio::spawn(handle_connection(
             client,
             target.clone(),
             state.clone(),
             connection_id,
+            reset_epoch,
         ));
     }
 }
@@ -175,9 +180,11 @@ async fn handle_connection(
     target: ProxyTarget,
     state: SharedState,
     connection_id: u64,
+    reset_epoch: u64,
 ) {
     if let Err(error) =
-        proxy_connection(client, target, state, connection_id).await
+        proxy_connection(client, target, state, connection_id, reset_epoch)
+            .await
     {
         debug!(connection_id, %error, "client connection closed");
     }
@@ -188,6 +195,7 @@ async fn proxy_connection(
     target: ProxyTarget,
     state: SharedState,
     mut connection_id: u64,
+    mut reset_epoch: u64,
 ) -> AppResult<()> {
     let upstream = connect_upstream(&target.upstream).await?;
     let (client_read, mut client_write) = tokio::io::split(client);
@@ -208,6 +216,14 @@ async fn proxy_connection(
         let argv = command_frame.argv_lossy();
         let command_name = command_frame.command_name();
 
+        if reset_epoch != state.reset_epoch.load(Ordering::SeqCst) {
+            debug!(
+                connection_id,
+                reset_epoch, "closing stale client connection after evil reset"
+            );
+            return Ok(());
+        }
+
         if is_debug_protocol(&argv) {
             let response = apply_debug_protocol(&fingerprints, &argv);
             client_write.write_all(&response.encode()).await?;
@@ -219,11 +235,17 @@ async fn proxy_connection(
         if is_debug_evil(&argv) {
             let result = apply_debug_evil(&state, &argv).await;
             let response = result.frame.encode();
-            client_write.write_all(&response).await?;
             if result.action == DebugAction::ResetIncrementingState {
-                reset_incrementing_state(&state, &mut connection_id);
+                reset_incrementing_state(
+                    &state,
+                    &mut connection_id,
+                    &mut reset_epoch,
+                )
+                .await;
+                client_write.write_all(&response).await?;
                 fingerprints.reset();
             } else {
+                client_write.write_all(&response).await?;
                 fingerprints.update(ProtocolDirection::Out, &response);
             }
             continue;
@@ -237,7 +259,17 @@ async fn proxy_connection(
             continue;
         }
 
-        let command_id = state.command_ids.fetch_add(1, Ordering::Relaxed);
+        let _reset_guard = state.reset_barrier.read().await;
+        if reset_epoch != state.reset_epoch.load(Ordering::SeqCst) {
+            debug!(
+                connection_id,
+                reset_epoch,
+                "closing stale client connection after waiting for evil reset"
+            );
+            return Ok(());
+        }
+
+        let command_id = state.command_ids.fetch_add(1, Ordering::SeqCst);
         let config = state.evil.read().await.clone();
         let should_mutate =
             config.should_mutate_command(command_name.as_deref());
@@ -389,10 +421,16 @@ where
     Ok(())
 }
 
-fn reset_incrementing_state(state: &SharedState, connection_id: &mut u64) {
+async fn reset_incrementing_state(
+    state: &SharedState,
+    connection_id: &mut u64,
+    reset_epoch: &mut u64,
+) {
+    let _reset_guard = state.reset_barrier.write().await;
+    *reset_epoch = state.reset_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     *connection_id = 0;
-    state.connection_ids.store(1, Ordering::Relaxed);
-    state.command_ids.store(0, Ordering::Relaxed);
+    state.connection_ids.store(1, Ordering::SeqCst);
+    state.command_ids.store(0, Ordering::SeqCst);
 }
 
 fn is_debug_evil(argv: &[String]) -> bool {
@@ -470,12 +508,19 @@ mod tests {
         let state = SharedState {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
         };
-        let proxy =
-            tokio::spawn(proxy_connection(Box::new(server), target, state, 0));
+        let proxy = tokio::spawn(proxy_connection(
+            Box::new(server),
+            target,
+            state,
+            0,
+            0,
+        ));
 
         client.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
         let mut read = BufReader::new(client);
@@ -568,12 +613,19 @@ mod tests {
         let state = SharedState {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
         };
-        let proxy =
-            tokio::spawn(proxy_connection(Box::new(server), target, state, 0));
+        let proxy = tokio::spawn(proxy_connection(
+            Box::new(server),
+            target,
+            state,
+            0,
+            0,
+        ));
 
         client.write_all(command).await.unwrap();
 
@@ -618,6 +670,8 @@ mod tests {
         let state = SharedState {
             evil: Arc::new(RwLock::new(config)),
             repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(3)),
             connection_ids: Arc::new(AtomicU64::new(17)),
             command_ids: Arc::new(AtomicU64::new(23)),
             local_slots: None,
@@ -636,13 +690,21 @@ mod tests {
 
         if result.action == DebugAction::ResetIncrementingState {
             let mut connection_id = 19;
-            reset_incrementing_state(&state, &mut connection_id);
+            let mut reset_epoch = 3;
+            reset_incrementing_state(
+                &state,
+                &mut connection_id,
+                &mut reset_epoch,
+            )
+            .await;
             assert_eq!(connection_id, 0);
+            assert_eq!(reset_epoch, 4);
         }
 
         assert_eq!(result.action, DebugAction::ResetIncrementingState);
-        assert_eq!(state.connection_ids.load(Ordering::Relaxed), 1);
-        assert_eq!(state.command_ids.load(Ordering::Relaxed), 0);
+        assert_eq!(state.reset_epoch.load(Ordering::SeqCst), 4);
+        assert_eq!(state.connection_ids.load(Ordering::SeqCst), 1);
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
         let config = state.evil.read().await;
         assert_eq!(config.mode, EvilMode::Off);
         assert_eq!(config.probability, 0.0);
@@ -685,6 +747,90 @@ mod tests {
         let reconnected = run_two_command_sequence(true).await;
 
         assert_eq!(single, reconnected);
+    }
+
+    #[tokio::test]
+    async fn stale_connections_after_reset_do_not_consume_command_ids() {
+        let path = unique_socket_path("upstream-stale-reset");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (read, mut write) = tokio::io::split(stream);
+                    let mut read = BufReader::new(read);
+                    loop {
+                        match read_raw_frame(&mut read).await {
+                            Ok(command) => {
+                                write
+                                    .write_all(
+                                        &deterministic_upstream_response(
+                                            &command,
+                                        ),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                            Err(error)
+                                if error.kind() == ErrorKind::UnexpectedEof =>
+                            {
+                                break;
+                            }
+                            Err(error) => {
+                                panic!(
+                                    "failed to read upstream command: {error}"
+                                )
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(EvilConfig::default())),
+            repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(2)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+
+        let mut stale = spawn_proxy_client(target.clone(), state.clone(), 0);
+        let mut current = spawn_proxy_client(target, state.clone(), 1);
+
+        current
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RESET"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut current).await.unwrap(), b"+OK\r\n");
+
+        stale
+            .get_mut()
+            .write_all(&resp_command(&["GET", "key:00"]))
+            .await
+            .unwrap();
+        let stale_read = read_raw_frame(&mut stale).await;
+
+        assert!(matches!(
+            stale_read,
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
+
+        drop(stale);
+        drop(current);
+        upstream.abort();
+        let _ = upstream.await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -733,6 +879,8 @@ mod tests {
         let state = SharedState {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
@@ -742,6 +890,7 @@ mod tests {
             target,
             state,
             initial_connection_id,
+            0,
         ));
 
         client
@@ -856,6 +1005,8 @@ mod tests {
         let state = SharedState {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
@@ -908,11 +1059,13 @@ mod tests {
         connection_id: u64,
     ) -> BufReader<UnixStream> {
         let (client, server) = UnixStream::pair().unwrap();
+        let reset_epoch = state.reset_epoch.load(Ordering::SeqCst);
         tokio::spawn(proxy_connection(
             Box::new(server),
             target,
             state,
             connection_id,
+            reset_epoch,
         ));
 
         BufReader::new(client)
@@ -976,6 +1129,8 @@ mod tests {
         let state = SharedState {
             evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
@@ -985,6 +1140,7 @@ mod tests {
             target,
             state,
             initial_connection_id,
+            0,
         ));
 
         client

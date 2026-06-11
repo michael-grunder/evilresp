@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Fixed same-proxy repeated reproducer runs by invalidating client connections
+  from older reset epochs before they can consume deterministic command ids.
 - Removed client connection identity from mutation RNG and switched mutation
   command indexes to resettable global command ids so reconnects do not change
   later mutations for the same command stream.

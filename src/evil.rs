@@ -401,8 +401,9 @@ fn command_attributes(command: &str) -> BTreeSet<&'static str> {
 
     match command.as_str() {
         "GET" | "MGET" | "EXISTS" | "TTL" | "PTTL" | "HGET" | "HGETALL"
-        | "HMGET" | "HEXISTS" | "LRANGE" | "LLEN" | "SCARD" | "SMEMBERS"
-        | "SISMEMBER" | "ZCARD" | "ZRANGE" => {
+        | "HMGET" | "HEXISTS" | "LRANGE" | "LLEN" | "SCARD" | "SDIFF"
+        | "SINTER" | "SISMEMBER" | "SMEMBERS" | "SUNION" | "ZCARD"
+        | "ZRANGE" => {
             attributes.insert("read");
         }
         "SET" | "MSET" | "DEL" | "EXPIRE" | "PEXPIRE" | "HSET" | "HMSET"
@@ -424,7 +425,8 @@ fn command_attributes(command: &str) -> BTreeSet<&'static str> {
         "LRANGE" | "LLEN" | "LPUSH" | "RPUSH" | "LPOP" | "RPOP" => {
             attributes.insert("list");
         }
-        "SCARD" | "SMEMBERS" | "SISMEMBER" | "SADD" | "SREM" => {
+        "SCARD" | "SDIFF" | "SINTER" | "SISMEMBER" | "SMEMBERS" | "SUNION"
+        | "SADD" | "SREM" => {
             attributes.insert("set");
         }
         "ZCARD" | "ZRANGE" | "ZADD" | "ZREM" => {
@@ -468,14 +470,39 @@ pub fn canonicalize_reply(
     frame: &Frame,
 ) -> Frame {
     let mut frame = frame.clone();
+    canonicalize_reply_in_place(mode, command, &mut frame);
+    frame
+}
+
+pub fn canonicalize_transaction_reply(
+    mode: CanonicalizationMode,
+    commands: &[String],
+    frame: &Frame,
+) -> Frame {
+    let mut frame = frame.clone();
+    let Frame::Array(Some(items)) = &mut frame else {
+        return frame;
+    };
+
+    for (item, command) in items.iter_mut().zip(commands) {
+        canonicalize_reply_in_place(mode, Some(command), item);
+    }
+
+    frame
+}
+
+fn canonicalize_reply_in_place(
+    mode: CanonicalizationMode,
+    command: Option<&str>,
+    frame: &mut Frame,
+) {
     match mode {
-        CanonicalizationMode::All => canonicalize_all_containers(&mut frame),
+        CanonicalizationMode::All => canonicalize_all_containers(frame),
         CanonicalizationMode::Unordered => {
-            canonicalize_unordered_reply(command, &mut frame);
+            canonicalize_unordered_reply(command, frame);
         }
         CanonicalizationMode::None => {}
     }
-    frame
 }
 
 pub fn random_reply(
@@ -548,7 +575,9 @@ fn canonicalize_unordered_reply(command: Option<&str>, frame: &mut Frame) {
 
     match command.to_ascii_uppercase().as_str() {
         "HGETALL" => canonicalize_array_pairs(frame),
-        "HKEYS" | "HVALS" | "SMEMBERS" => canonicalize_array_items(frame),
+        "HKEYS" | "HVALS" | "SDIFF" | "SINTER" | "SMEMBERS" | "SUNION" => {
+            canonicalize_array_items(frame)
+        }
         _ => {}
     }
 }

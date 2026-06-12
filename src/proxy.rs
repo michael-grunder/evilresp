@@ -14,7 +14,8 @@ use crate::cluster::{ProxyTarget, Topology, discover};
 use crate::error::{AppError, AppResult};
 use crate::evil::{
     DebugAction, DebugResult, EvilConfig, EvilMode, canonicalize_reply,
-    deterministic_hash, mutate_reply, random_reply,
+    canonicalize_transaction_reply, deterministic_hash, mutate_reply,
+    random_reply,
 };
 use crate::protocol_fingerprint::{
     ProtocolDirection, ProtocolFingerprints, parse_debug_protocol,
@@ -203,6 +204,7 @@ async fn proxy_connection(
     let mut client_read = BufReader::new(client_read);
     let mut upstream_read = BufReader::new(upstream_read);
     let mut fingerprints = ProtocolFingerprints::new();
+    let mut transaction_commands = Option::<Vec<String>>::None;
 
     loop {
         let command_bytes = match read_raw_frame(&mut client_read).await {
@@ -269,6 +271,11 @@ async fn proxy_connection(
         let should_mutate =
             config.should_mutate_command(command_name.as_deref());
         let command_hash = deterministic_hash(&command_bytes);
+        let exec_transaction_commands = if is_exec(command_name.as_deref()) {
+            transaction_commands.take()
+        } else {
+            None
+        };
 
         if config.mode == EvilMode::Random && should_mutate {
             let mutated = random_reply(&config, command_id, &command_hash);
@@ -299,15 +306,26 @@ async fn proxy_connection(
         upstream_write.flush().await?;
 
         let upstream_bytes = read_raw_frame(&mut upstream_read).await?;
+        update_transaction_commands(
+            &mut transaction_commands,
+            command_name.as_deref(),
+        );
         let response_bytes = if should_mutate
             && matches!(config.mode, EvilMode::Mutate | EvilMode::Overflow)
         {
             let upstream_frame = parse_frame(&upstream_bytes)?;
-            let mutation_frame = canonicalize_reply(
-                config.canonicalization,
-                command_name.as_deref(),
-                &upstream_frame,
-            );
+            let mutation_frame = match exec_transaction_commands {
+                Some(commands) => canonicalize_transaction_reply(
+                    config.canonicalization,
+                    &commands,
+                    &upstream_frame,
+                ),
+                None => canonicalize_reply(
+                    config.canonicalization,
+                    command_name.as_deref(),
+                    &upstream_frame,
+                ),
+            };
             let upstream_hash = deterministic_hash(&mutation_frame.encode());
             let mutated = mutate_reply(
                 &config,
@@ -441,6 +459,32 @@ fn is_cluster_slots(argv: &[String]) -> bool {
     argv.len() >= 2
         && argv[0].eq_ignore_ascii_case("CLUSTER")
         && argv[1].eq_ignore_ascii_case("SLOTS")
+}
+
+fn is_exec(command: Option<&str>) -> bool {
+    command.is_some_and(|command| command.eq_ignore_ascii_case("EXEC"))
+}
+
+fn update_transaction_commands(
+    transaction_commands: &mut Option<Vec<String>>,
+    command: Option<&str>,
+) {
+    let Some(command) = command else {
+        return;
+    };
+    let command = command.to_ascii_uppercase();
+
+    match command.as_str() {
+        "EXEC" | "DISCARD" => *transaction_commands = None,
+        "MULTI" if transaction_commands.is_none() => {
+            *transaction_commands = Some(Vec::new());
+        }
+        _ => {
+            if let Some(commands) = transaction_commands {
+                commands.push(command);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -724,6 +768,29 @@ mod tests {
             assert!(!first.out_blake3.is_empty(), "mode {mode}");
             assert!(!first.out_tlsh.is_empty(), "mode {mode}");
         }
+    }
+
+    #[tokio::test]
+    async fn unordered_redis_replies_mutate_identically_across_upstreams() {
+        let canonical =
+            run_unordered_reply_proxy_session(ReplyOrder::Canonical).await;
+        let scrambled =
+            run_unordered_reply_proxy_session(ReplyOrder::Scrambled).await;
+
+        assert_eq!(canonical, scrambled);
+        assert_eq!(canonical.len(), unordered_redis_commands().len());
+    }
+
+    #[tokio::test]
+    async fn transaction_unordered_replies_mutate_identically_across_upstreams()
+    {
+        let canonical =
+            run_transaction_reply_proxy_session(ReplyOrder::Canonical).await;
+        let scrambled =
+            run_transaction_reply_proxy_session(ReplyOrder::Scrambled).await;
+
+        assert_eq!(canonical, scrambled);
+        assert_eq!(canonical.len(), transaction_redis_commands().len());
     }
 
     #[tokio::test]
@@ -1036,6 +1103,257 @@ mod tests {
         std::fs::remove_file(path).unwrap();
 
         responses
+    }
+
+    async fn run_transaction_reply_proxy_session(
+        order: ReplyOrder,
+    ) -> Vec<Vec<u8>> {
+        let path = unique_socket_path("upstream-transaction-replies");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            let mut queued_commands = Vec::<String>::new();
+
+            loop {
+                match read_raw_frame(&mut read).await {
+                    Ok(command) => {
+                        let command = parse_frame(&command).unwrap();
+                        let argv = command.argv_lossy();
+                        let response = transaction_upstream_reply(
+                            &argv,
+                            &mut queued_commands,
+                            order,
+                        );
+                        write.write_all(&response.encode()).await.unwrap();
+                    }
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(error) => {
+                        panic!("failed to read upstream command: {error}")
+                    }
+                }
+            }
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(EvilConfig::default())),
+            repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(1)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+        let mut client = spawn_proxy_client(target, state, 0);
+        write_evil_setup(client.get_mut()).await;
+
+        for _ in 0..3 {
+            assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+        }
+
+        let mut responses = Vec::new();
+        for command in transaction_redis_commands() {
+            client.get_mut().write_all(&command).await.unwrap();
+            responses.push(read_available_response_bytes(&mut client).await);
+        }
+
+        drop(client);
+        upstream.abort();
+        let _ = upstream.await;
+        std::fs::remove_file(path).unwrap();
+
+        responses
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReplyOrder {
+        Canonical,
+        Scrambled,
+    }
+
+    async fn run_unordered_reply_proxy_session(
+        order: ReplyOrder,
+    ) -> Vec<Vec<u8>> {
+        let path = unique_socket_path("upstream-unordered-replies");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+
+            loop {
+                match read_raw_frame(&mut read).await {
+                    Ok(command) => {
+                        let command = parse_frame(&command).unwrap();
+                        let argv = command.argv_lossy();
+                        write
+                            .write_all(
+                                &unordered_redis_reply(&argv, order).encode(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                        break;
+                    }
+                    Err(error) => {
+                        panic!("failed to read upstream command: {error}")
+                    }
+                }
+            }
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            evil: Arc::new(RwLock::new(EvilConfig::default())),
+            repro: None,
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(1)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+        let mut client = spawn_proxy_client(target, state, 0);
+        write_evil_setup(client.get_mut()).await;
+
+        for _ in 0..3 {
+            assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+        }
+
+        let mut responses = Vec::new();
+        for command in unordered_redis_commands() {
+            client.get_mut().write_all(&command).await.unwrap();
+            responses.push(read_available_response_bytes(&mut client).await);
+        }
+
+        drop(client);
+        upstream.abort();
+        let _ = upstream.await;
+        std::fs::remove_file(path).unwrap();
+
+        responses
+    }
+
+    fn unordered_redis_commands() -> Vec<Vec<u8>> {
+        vec![
+            resp_command(&["HGETALL", "hash:key"]),
+            resp_command(&["HKEYS", "hash:key"]),
+            resp_command(&["HVALS", "hash:key"]),
+            resp_command(&["HGET", "hash:key", "field:alpha"]),
+            resp_command(&["HEXISTS", "hash:key", "field:beta"]),
+            resp_command(&["SMEMBERS", "set:key"]),
+            resp_command(&["SINTER", "set:left", "set:right"]),
+            resp_command(&["SUNION", "set:left", "set:right"]),
+            resp_command(&["SDIFF", "set:left", "set:right"]),
+            resp_command(&["SCARD", "set:key"]),
+        ]
+    }
+
+    fn transaction_redis_commands() -> Vec<Vec<u8>> {
+        vec![
+            resp_command(&["MULTI"]),
+            resp_command(&["SMEMBERS", "set:key"]),
+            resp_command(&["HGETALL", "hash:key"]),
+            resp_command(&["HKEYS", "hash:key"]),
+            resp_command(&["HVALS", "hash:key"]),
+            resp_command(&["SINTER", "set:left", "set:right"]),
+            resp_command(&["EXEC"]),
+        ]
+    }
+
+    fn transaction_upstream_reply(
+        argv: &[String],
+        queued_commands: &mut Vec<String>,
+        order: ReplyOrder,
+    ) -> Frame {
+        match argv[0].to_ascii_uppercase().as_str() {
+            "MULTI" => {
+                queued_commands.clear();
+                Frame::SimpleString("OK".to_owned())
+            }
+            "EXEC" => {
+                let replies = queued_commands
+                    .iter()
+                    .map(|command| {
+                        unordered_redis_reply(
+                            std::slice::from_ref(command),
+                            order,
+                        )
+                    })
+                    .collect();
+                queued_commands.clear();
+                Frame::Array(Some(replies))
+            }
+            command => {
+                queued_commands.push(command.to_owned());
+                Frame::SimpleString("QUEUED".to_owned())
+            }
+        }
+    }
+
+    fn unordered_redis_reply(argv: &[String], order: ReplyOrder) -> Frame {
+        match argv[0].to_ascii_uppercase().as_str() {
+            "HGETALL" => {
+                let pairs = ordered_values(
+                    order,
+                    &[
+                        ("field:alpha", "value:one"),
+                        ("field:beta", "value:two"),
+                        ("field:gamma", "value:three"),
+                    ],
+                );
+                let items = pairs
+                    .into_iter()
+                    .flat_map(|(key, value)| {
+                        [bulk_string(key), bulk_string(value)]
+                    })
+                    .collect();
+                Frame::Array(Some(items))
+            }
+            "HKEYS" => array_reply(ordered_values(
+                order,
+                &["field:alpha", "field:beta", "field:gamma"],
+            )),
+            "HVALS" => array_reply(ordered_values(
+                order,
+                &["value:one", "value:two", "value:three"],
+            )),
+            "HGET" => bulk_string("value:one"),
+            "HEXISTS" => Frame::Integer(1),
+            "SMEMBERS" | "SINTER" | "SUNION" | "SDIFF" => {
+                array_reply(ordered_values(
+                    order,
+                    &["member:alpha", "member:beta", "member:gamma"],
+                ))
+            }
+            "SCARD" => Frame::Integer(3),
+            command => panic!("unexpected command {command}"),
+        }
+    }
+
+    fn ordered_values<T: Copy>(order: ReplyOrder, values: &[T; 3]) -> Vec<T> {
+        match order {
+            ReplyOrder::Canonical => values.to_vec(),
+            ReplyOrder::Scrambled => vec![values[2], values[0], values[1]],
+        }
+    }
+
+    fn array_reply(values: Vec<&str>) -> Frame {
+        Frame::Array(Some(values.into_iter().map(bulk_string).collect()))
+    }
+
+    fn bulk_string(value: &str) -> Frame {
+        Frame::BulkString(Some(value.as_bytes().to_vec()))
     }
 
     fn spawn_proxy_client(

@@ -8,11 +8,15 @@ All notable changes to this project will be documented in this file.
 
 - Canonicalized known unordered Redis replies before mutation by default, with
   `DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>` to control the behavior.
+- Canonicalized unordered Redis set-operation replies from `SDIFF`, `SINTER`,
+  and `SUNION` before mutation.
 - Excluded `COMMAND` from default reply mutation so redis-cli can introspect
   server capabilities on connect.
 
 ### Fixed
 
+- Canonicalized unordered `EXEC` subreplies using the commands queued inside
+  the transaction before deriving mutation hashes.
 - Fixed same-proxy repeated reproducer runs by invalidating client connections
   from older reset epochs before they can consume deterministic command ids.
 - Removed client connection identity from mutation RNG inputs so identical

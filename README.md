@@ -93,9 +93,12 @@ and resets the current connection's protocol fingerprints.
 Canonicalization controls whether upstream replies are normalized before they
 seed and enter the mutation pipeline. The default is `UNORDERED`, which
 canonicalizes replies whose order Redis may vary between runs, such as
-`HGETALL`, `HKEYS`, `HVALS`, and `SMEMBERS`, plus RESP3 map and set
-containers. `ALL` recursively sorts all RESP containers. `NONE` preserves the
-raw upstream reply shape.
+`HGETALL`, `HKEYS`, `HVALS`, `SMEMBERS`, `SINTER`, `SUNION`, and `SDIFF`,
+plus RESP3 map and set containers. `ALL` recursively sorts all RESP
+containers. `EXEC` replies are canonicalized element-by-element using the
+commands queued since `MULTI`, so unordered replies inside transactions seed
+mutation the same way as standalone replies. `NONE` preserves the raw upstream
+reply shape.
 
 Filters are case-insensitive. Plain strings match literal command names, regex
 strings such as `^GET.*` match command names, and attributes such as `@read`,

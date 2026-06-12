@@ -194,7 +194,7 @@ async fn proxy_connection(
     client: ProxyStream,
     target: ProxyTarget,
     state: SharedState,
-    mut connection_id: u64,
+    connection_id: u64,
     mut reset_epoch: u64,
 ) -> AppResult<()> {
     let upstream = connect_upstream(&target.upstream).await?;
@@ -236,12 +236,7 @@ async fn proxy_connection(
             let result = apply_debug_evil(&state, &argv).await;
             let response = result.frame.encode();
             if result.action == DebugAction::ResetIncrementingState {
-                reset_incrementing_state(
-                    &state,
-                    &mut connection_id,
-                    &mut reset_epoch,
-                )
-                .await;
+                reset_incrementing_state(&state, &mut reset_epoch).await;
                 client_write.write_all(&response).await?;
                 fingerprints.reset();
             } else {
@@ -276,8 +271,7 @@ async fn proxy_connection(
         let command_hash = deterministic_hash(&command_bytes);
 
         if config.mode == EvilMode::Random && should_mutate {
-            let mutated =
-                random_reply(&config, connection_id, command_id, &command_hash);
+            let mutated = random_reply(&config, command_id, &command_hash);
             write_repro(
                 &state,
                 ReproRecord::new(
@@ -312,7 +306,6 @@ async fn proxy_connection(
             let upstream_hash = deterministic_hash(&upstream_bytes);
             let mutated = mutate_reply(
                 &config,
-                connection_id,
                 command_id,
                 &command_hash,
                 &upstream_hash,
@@ -421,15 +414,9 @@ where
     Ok(())
 }
 
-async fn reset_incrementing_state(
-    state: &SharedState,
-    connection_id: &mut u64,
-    reset_epoch: &mut u64,
-) {
+async fn reset_incrementing_state(state: &SharedState, reset_epoch: &mut u64) {
     let _reset_guard = state.reset_barrier.write().await;
     *reset_epoch = state.reset_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-    *connection_id = 0;
-    state.connection_ids.store(1, Ordering::SeqCst);
     state.command_ids.store(0, Ordering::SeqCst);
 }
 
@@ -689,21 +676,14 @@ mod tests {
         .await;
 
         if result.action == DebugAction::ResetIncrementingState {
-            let mut connection_id = 19;
             let mut reset_epoch = 3;
-            reset_incrementing_state(
-                &state,
-                &mut connection_id,
-                &mut reset_epoch,
-            )
-            .await;
-            assert_eq!(connection_id, 0);
+            reset_incrementing_state(&state, &mut reset_epoch).await;
             assert_eq!(reset_epoch, 4);
         }
 
         assert_eq!(result.action, DebugAction::ResetIncrementingState);
         assert_eq!(state.reset_epoch.load(Ordering::SeqCst), 4);
-        assert_eq!(state.connection_ids.load(Ordering::SeqCst), 1);
+        assert_eq!(state.connection_ids.load(Ordering::SeqCst), 17);
         assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
         let config = state.evil.read().await;
         assert_eq!(config.mode, EvilMode::Off);

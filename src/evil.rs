@@ -406,7 +406,6 @@ pub fn deterministic_hash(bytes: &[u8]) -> String {
 
 pub fn random_reply(
     config: &EvilConfig,
-    _connection_id: u64,
     command_index: u64,
     command_hash: &str,
 ) -> MutatedReply {
@@ -423,7 +422,6 @@ pub fn random_reply(
 
 pub fn mutate_reply(
     config: &EvilConfig,
-    _connection_id: u64,
     command_index: u64,
     command_hash: &str,
     upstream_hash: &str,
@@ -769,15 +767,31 @@ mod tests {
         };
 
         let frame = parse_frame(b"*2\r\n$3\r\nfoo\r\n:1\r\n").unwrap();
-        let first = mutate_reply(&config, 7, 9, "command", "upstream", &frame);
-        let second = mutate_reply(&config, 7, 9, "command", "upstream", &frame);
+        let first = mutate_reply(&config, 9, "command", "upstream", &frame);
+        let second = mutate_reply(&config, 9, "command", "upstream", &frame);
 
         assert_eq!(first.bytes, second.bytes);
         assert!(!first.mutations.is_empty());
     }
 
     #[test]
-    fn mutations_do_not_depend_on_connection_id() {
+    fn random_replies_are_deterministic_for_repro_tuple() {
+        let config = EvilConfig {
+            seed: 1234,
+            mode: EvilMode::Random,
+            probability: 100.0,
+            ..EvilConfig::default()
+        };
+
+        let first = random_reply(&config, 9, "command");
+        let second = random_reply(&config, 9, "command");
+
+        assert_eq!(first.bytes, second.bytes);
+        assert!(!first.mutations.is_empty());
+    }
+
+    #[test]
+    fn mutations_change_with_command_index() {
         let config = EvilConfig {
             seed: 1234,
             mode: EvilMode::Mutate,
@@ -786,12 +800,10 @@ mod tests {
         };
 
         let frame = parse_frame(b"*2\r\n$3\r\nfoo\r\n:1\r\n").unwrap();
-        let first = mutate_reply(&config, 7, 9, "command", "upstream", &frame);
-        let second =
-            mutate_reply(&config, 42, 9, "command", "upstream", &frame);
+        let first = mutate_reply(&config, 9, "command", "upstream", &frame);
+        let second = mutate_reply(&config, 10, "command", "upstream", &frame);
 
-        assert_eq!(first.bytes, second.bytes);
-        assert_eq!(first.mutations.len(), second.mutations.len());
+        assert_ne!(first.bytes, second.bytes);
     }
 
     fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {

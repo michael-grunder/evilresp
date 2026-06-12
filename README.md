@@ -56,9 +56,11 @@ Use `--repro-file <path>` to append one JSON object per mutated reply:
 cargo run -- --proxy localhost:6379 --repro-file repro.jsonl
 ```
 
-Each record includes the global seed, connection id, deterministic command
-index, command bytes/hash, upstream response bytes/hash when applicable, mutated
-response bytes/hash, selected evil mode, and applied mutation list.
+Each record includes the global seed, connection id for observability,
+deterministic command index, command bytes/hash, upstream response bytes/hash
+when applicable, mutated response bytes/hash, selected evil mode, and applied
+mutation list. Mutated RESP output is determined by the seed, command index,
+command bytes, and upstream response bytes, not by the client connection id.
 
 ## DEBUG EVIL
 
@@ -83,9 +85,8 @@ Modes:
 - `OVERFLOW`: mutate toward overflow-prone values and lengths.
 
 `DEBUG EVIL MODE RESET` disables evil mode, sets mutation probability to zero,
-resets incrementing values used for deterministic reproduction, invalidates
-older client connections, and resets the current connection's protocol
-fingerprints.
+resets the deterministic command index, invalidates older client connections,
+and resets the current connection's protocol fingerprints.
 
 Filters are case-insensitive. Plain strings match literal command names, regex
 strings such as `^GET.*` match command names, and attributes such as `@read`,

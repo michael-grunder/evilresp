@@ -13,12 +13,11 @@ All notable changes to this project will be documented in this file.
 
 - Fixed same-proxy repeated reproducer runs by invalidating client connections
   from older reset epochs before they can consume deterministic command ids.
-- Removed client connection identity from mutation RNG and switched mutation
-  command indexes to resettable global command ids so reconnects do not change
-  later mutations for the same command stream.
-- Fixed `DEBUG EVIL MODE RESET` so the active connection also resets to
-  connection id zero, making repeated same-seed client runs produce identical
-  mutations.
+- Removed client connection identity from mutation RNG inputs so identical
+  seeds, command indexes, commands, and upstream replies produce identical RESP
+  mutations on every connection.
+- Changed `DEBUG EVIL MODE RESET` to reset deterministic command ids without
+  resetting connection ids.
 
 ### Added
 
@@ -29,7 +28,7 @@ All notable changes to this project will be documented in this file.
 - Added `unix:/path/to/socket` endpoint support for proxying upstream AF_UNIX
   sockets and listening on local AF_UNIX sockets in standalone mode.
 - Added `DEBUG EVIL MODE RESET` to disable evil mode and reset deterministic
-  incrementing state such as connection ids.
+  command ids.
 - Added project-specific contributor and agent guidance in `AGENTS.md`.
 - Added the initial RESP proxy server with standalone/cluster discovery,
   configurable human or JSON logging, deterministic evil modes, DEBUG EVIL

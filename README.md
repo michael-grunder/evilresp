@@ -60,7 +60,8 @@ Each record includes the global seed, connection id for observability,
 deterministic command index, command bytes/hash, upstream response bytes/hash
 when applicable, mutated response bytes/hash, selected evil mode, and applied
 mutation list. Mutated RESP output is determined by the seed, command index,
-command bytes, and upstream response bytes, not by the client connection id.
+command bytes, and canonicalized upstream response bytes when applicable, not
+by the client connection id.
 
 ## DEBUG EVIL
 
@@ -70,6 +71,7 @@ command bytes, and upstream response bytes, not by the client connection id.
 DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL MODE RESET
+DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>
 DEBUG EVIL STATUS
 DEBUG EVIL INCLUDE <arg1> ... <argN>
 DEBUG EVIL EXCLUDE <arg1> ... <argN>
@@ -87,6 +89,13 @@ Modes:
 `DEBUG EVIL MODE RESET` disables evil mode, sets mutation probability to zero,
 resets the deterministic command index, invalidates older client connections,
 and resets the current connection's protocol fingerprints.
+
+Canonicalization controls whether upstream replies are normalized before they
+seed and enter the mutation pipeline. The default is `UNORDERED`, which
+canonicalizes replies whose order Redis may vary between runs, such as
+`HGETALL`, `HKEYS`, `HVALS`, and `SMEMBERS`, plus RESP3 map and set
+containers. `ALL` recursively sorts all RESP containers. `NONE` preserves the
+raw upstream reply shape.
 
 Filters are case-insensitive. Plain strings match literal command names, regex
 strings such as `^GET.*` match command names, and attributes such as `@read`,

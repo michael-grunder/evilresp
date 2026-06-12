@@ -13,8 +13,8 @@ use crate::cli::{Cli, Endpoint};
 use crate::cluster::{ProxyTarget, Topology, discover};
 use crate::error::{AppError, AppResult};
 use crate::evil::{
-    DebugAction, DebugResult, EvilConfig, EvilMode, deterministic_hash,
-    mutate_reply, random_reply,
+    DebugAction, DebugResult, EvilConfig, EvilMode, canonicalize_reply,
+    deterministic_hash, mutate_reply, random_reply,
 };
 use crate::protocol_fingerprint::{
     ProtocolDirection, ProtocolFingerprints, parse_debug_protocol,
@@ -303,13 +303,18 @@ async fn proxy_connection(
             && matches!(config.mode, EvilMode::Mutate | EvilMode::Overflow)
         {
             let upstream_frame = parse_frame(&upstream_bytes)?;
-            let upstream_hash = deterministic_hash(&upstream_bytes);
+            let mutation_frame = canonicalize_reply(
+                config.canonicalization,
+                command_name.as_deref(),
+                &upstream_frame,
+            );
+            let upstream_hash = deterministic_hash(&mutation_frame.encode());
             let mutated = mutate_reply(
                 &config,
                 command_id,
                 &command_hash,
                 &upstream_hash,
-                &upstream_frame,
+                &mutation_frame,
             );
             if !mutated.mutations.is_empty() {
                 write_repro(

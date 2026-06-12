@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Canonicalized known unordered Redis replies before mutation by default, with
+  `DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>` to control the behavior.
 - Excluded `COMMAND` from default reply mutation so redis-cli can introspect
   server capabilities on connect.
 

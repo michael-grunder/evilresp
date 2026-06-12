@@ -71,11 +71,51 @@ impl FromStr for EvilMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CanonicalizationMode {
+    All,
+    Unordered,
+    None,
+}
+
+impl CanonicalizationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CanonicalizationMode::All => "ALL",
+            CanonicalizationMode::Unordered => "UNORDERED",
+            CanonicalizationMode::None => "NONE",
+        }
+    }
+}
+
+impl fmt::Display for CanonicalizationMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CanonicalizationMode {
+    type Err = AppError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_uppercase().as_str() {
+            "ALL" => Ok(CanonicalizationMode::All),
+            "UNORDERED" => Ok(CanonicalizationMode::Unordered),
+            "NONE" => Ok(CanonicalizationMode::None),
+            _ => Err(AppError::EvilConfig(format!(
+                "unknown canonicalization mode {value:?}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EvilConfig {
     pub seed: u64,
     pub mode: EvilMode,
     pub probability: f64,
+    pub canonicalization: CanonicalizationMode,
     include: Vec<FilterSpec>,
     exclude: Vec<FilterSpec>,
 }
@@ -91,6 +131,7 @@ impl Default for EvilConfig {
             seed: 0,
             mode: EvilMode::Off,
             probability: 0.0,
+            canonicalization: CanonicalizationMode::Unordered,
             include: Vec::new(),
             exclude,
         }
@@ -177,6 +218,22 @@ impl EvilConfig {
 
                 Ok(DebugResult::ok())
             }
+            "CANONICALIZE" => {
+                let Some(mode) = argv.get(3) else {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL CANONICALIZE requires ALL, UNORDERED, or NONE"
+                            .to_owned(),
+                    ));
+                };
+                if argv.len() != 4 {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL CANONICALIZE does not accept options"
+                            .to_owned(),
+                    ));
+                }
+                self.canonicalization = CanonicalizationMode::from_str(mode)?;
+                Ok(DebugResult::ok())
+            }
             "STATUS" => Ok(DebugResult {
                 frame: Frame::BulkString(Some(self.status().into_bytes())),
                 action: DebugAction::None,
@@ -225,10 +282,11 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} include=[{}] exclude=[{}]",
+            "mode={} seed={} probability={:.2} canonicalize={} include=[{}] exclude=[{}]",
             self.mode,
             self.seed,
             self.probability,
+            self.canonicalization,
             self.include_filters().join(","),
             self.exclude_filters().join(","),
         )
@@ -404,6 +462,22 @@ pub fn deterministic_hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+pub fn canonicalize_reply(
+    mode: CanonicalizationMode,
+    command: Option<&str>,
+    frame: &Frame,
+) -> Frame {
+    let mut frame = frame.clone();
+    match mode {
+        CanonicalizationMode::All => canonicalize_all_containers(&mut frame),
+        CanonicalizationMode::Unordered => {
+            canonicalize_unordered_reply(command, &mut frame);
+        }
+        CanonicalizationMode::None => {}
+    }
+    frame
+}
+
 pub fn random_reply(
     config: &EvilConfig,
     command_index: u64,
@@ -451,6 +525,123 @@ pub fn mutate_reply(
     }
 
     MutatedReply { bytes, mutations }
+}
+
+fn canonicalize_all_containers(frame: &mut Frame) {
+    match frame {
+        Frame::Array(Some(items)) | Frame::Set(items) | Frame::Push(items) => {
+            canonicalize_frame_items(items);
+        }
+        Frame::Map(items) | Frame::Attribute(items) => {
+            canonicalize_frame_pairs(items);
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_unordered_reply(command: Option<&str>, frame: &mut Frame) {
+    canonicalize_unordered_containers(frame);
+
+    let Some(command) = command else {
+        return;
+    };
+
+    match command.to_ascii_uppercase().as_str() {
+        "HGETALL" => canonicalize_array_pairs(frame),
+        "HKEYS" | "HVALS" | "SMEMBERS" => canonicalize_array_items(frame),
+        _ => {}
+    }
+}
+
+fn canonicalize_unordered_containers(frame: &mut Frame) {
+    match frame {
+        Frame::Array(Some(items)) | Frame::Push(items) => {
+            for item in items {
+                canonicalize_unordered_containers(item);
+            }
+        }
+        Frame::Map(items) | Frame::Attribute(items) => {
+            canonicalize_unordered_frame_pairs(items);
+        }
+        Frame::Set(items) => {
+            for item in items.iter_mut() {
+                canonicalize_unordered_containers(item);
+            }
+            items.sort_by_key(sort_key);
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_array_items(frame: &mut Frame) {
+    if let Frame::Array(Some(items)) = frame {
+        for item in items.iter_mut() {
+            canonicalize_unordered_containers(item);
+        }
+        items.sort_by_key(sort_key);
+    }
+}
+
+fn canonicalize_array_pairs(frame: &mut Frame) {
+    let Frame::Array(Some(items)) = frame else {
+        return;
+    };
+    for item in items.iter_mut() {
+        canonicalize_unordered_containers(item);
+    }
+
+    let mut pairs = items
+        .chunks_exact(2)
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| {
+        sort_key(&left.0)
+            .cmp(&sort_key(&right.0))
+            .then_with(|| sort_key(&left.1).cmp(&sort_key(&right.1)))
+    });
+
+    let remainder = items.chunks_exact(2).remainder().to_vec();
+    items.clear();
+    for (key, value) in pairs {
+        items.push(key);
+        items.push(value);
+    }
+    items.extend(remainder);
+}
+
+fn canonicalize_frame_items(items: &mut [Frame]) {
+    for item in items.iter_mut() {
+        canonicalize_all_containers(item);
+    }
+    items.sort_by_key(sort_key);
+}
+
+fn canonicalize_frame_pairs(items: &mut [(Frame, Frame)]) {
+    for (key, value) in items.iter_mut() {
+        canonicalize_all_containers(key);
+        canonicalize_all_containers(value);
+    }
+    items.sort_by(|left, right| {
+        sort_key(&left.0)
+            .cmp(&sort_key(&right.0))
+            .then_with(|| sort_key(&left.1).cmp(&sort_key(&right.1)))
+    });
+}
+
+fn canonicalize_unordered_frame_pairs(items: &mut [(Frame, Frame)]) {
+    for (key, value) in items.iter_mut() {
+        canonicalize_unordered_containers(key);
+        canonicalize_unordered_containers(value);
+    }
+    items.sort_by(|left, right| {
+        sort_key(&left.0)
+            .cmp(&sort_key(&right.0))
+            .then_with(|| sort_key(&left.1).cmp(&sort_key(&right.1)))
+    });
+}
+
+fn sort_key(frame: &Frame) -> Vec<u8> {
+    frame.encode()
 }
 
 fn rng_for(
@@ -721,6 +912,41 @@ mod tests {
     }
 
     #[test]
+    fn debug_canonicalize_sets_mode() {
+        let mut config = EvilConfig::default();
+
+        assert_eq!(config.canonicalization, CanonicalizationMode::Unordered);
+
+        config
+            .apply_debug_command(&strings([
+                "DEBUG",
+                "EVIL",
+                "CANONICALIZE",
+                "ALL",
+            ]))
+            .unwrap();
+
+        assert_eq!(config.canonicalization, CanonicalizationMode::All);
+        assert!(config.status().contains("canonicalize=ALL"));
+    }
+
+    #[test]
+    fn debug_canonicalize_rejects_unknown_mode() {
+        let mut config = EvilConfig::default();
+
+        let error = config
+            .apply_debug_command(&strings([
+                "DEBUG",
+                "EVIL",
+                "CANONICALIZE",
+                "SOMETIMES",
+            ]))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown canonicalization mode"));
+    }
+
+    #[test]
     fn debug_mode_reset_turns_mode_off_and_requests_counter_reset() {
         let mut config = EvilConfig {
             seed: 1234,
@@ -772,6 +998,119 @@ mod tests {
 
         assert_eq!(first.bytes, second.bytes);
         assert!(!first.mutations.is_empty());
+    }
+
+    #[test]
+    fn unordered_canonicalization_sorts_hgetall_pairs_by_field() {
+        let frame = parse_frame(
+            b"*4\r\n$2\r\nk2\r\n$2\r\nv2\r\n$2\r\nk1\r\n$2\r\nv1\r\n",
+        )
+        .unwrap();
+
+        let canonical = canonicalize_reply(
+            CanonicalizationMode::Unordered,
+            Some("HGETALL"),
+            &frame,
+        );
+
+        assert_eq!(
+            canonical.encode(),
+            b"*4\r\n$2\r\nk1\r\n$2\r\nv1\r\n$2\r\nk2\r\n$2\r\nv2\r\n"
+        );
+    }
+
+    #[test]
+    fn unordered_canonicalization_sorts_smembers_items() {
+        let frame =
+            parse_frame(b"*3\r\n$1\r\nc\r\n$1\r\na\r\n$1\r\nb\r\n").unwrap();
+
+        let canonical = canonicalize_reply(
+            CanonicalizationMode::Unordered,
+            Some("SMEMBERS"),
+            &frame,
+        );
+
+        assert_eq!(
+            canonical.encode(),
+            b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+    }
+
+    #[test]
+    fn unordered_canonicalization_leaves_ordered_array_commands_alone() {
+        let frame =
+            parse_frame(b"*3\r\n$1\r\nc\r\n$1\r\na\r\n$1\r\nb\r\n").unwrap();
+
+        let canonical = canonicalize_reply(
+            CanonicalizationMode::Unordered,
+            Some("LRANGE"),
+            &frame,
+        );
+
+        assert_eq!(canonical, frame);
+    }
+
+    #[test]
+    fn unordered_canonicalization_leaves_nested_ordered_arrays_alone() {
+        let frame = parse_frame(
+            b"*2\r\n*2\r\n$1\r\nb\r\n$1\r\na\r\n*2\r\n$1\r\nd\r\n$1\r\nc\r\n",
+        )
+        .unwrap();
+
+        let canonical = canonicalize_reply(
+            CanonicalizationMode::Unordered,
+            Some("LRANGE"),
+            &frame,
+        );
+
+        assert_eq!(canonical, frame);
+    }
+
+    #[test]
+    fn all_canonicalization_sorts_nested_containers_recursively() {
+        let frame = parse_frame(
+            b"*2\r\n*2\r\n$1\r\nb\r\n$1\r\na\r\n*2\r\n$1\r\nd\r\n$1\r\nc\r\n",
+        )
+        .unwrap();
+
+        let canonical = canonicalize_reply(
+            CanonicalizationMode::All,
+            Some("LRANGE"),
+            &frame,
+        );
+
+        assert_eq!(
+            canonical.encode(),
+            b"*2\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n*2\r\n$1\r\nc\r\n$1\r\nd\r\n"
+        );
+    }
+
+    #[test]
+    fn canonicalized_unordered_replies_drive_same_mutation_output() {
+        let config = EvilConfig {
+            seed: 1234,
+            mode: EvilMode::Mutate,
+            probability: 100.0,
+            ..EvilConfig::default()
+        };
+        let first = canonicalize_reply(
+            config.canonicalization,
+            Some("SMEMBERS"),
+            &parse_frame(b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n").unwrap(),
+        );
+        let second = canonicalize_reply(
+            config.canonicalization,
+            Some("SMEMBERS"),
+            &parse_frame(b"*3\r\n$1\r\nc\r\n$1\r\na\r\n$1\r\nb\r\n").unwrap(),
+        );
+        let first_hash = deterministic_hash(&first.encode());
+        let second_hash = deterministic_hash(&second.encode());
+
+        assert_eq!(first_hash, second_hash);
+        assert_eq!(
+            mutate_reply(&config, 9, "command", &first_hash, &first).bytes,
+            mutate_reply(&config, 9, "command", &second_hash, &second).bytes
+        );
     }
 
     #[test]

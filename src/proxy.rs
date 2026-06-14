@@ -1,11 +1,13 @@
+use std::fmt::Write as _;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -26,6 +28,8 @@ use crate::resp::{Frame, parse_frame, read_raw_frame};
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+const MONITOR_BUFFER: usize = 1024;
 
 type ProxyStream = Box<dyn AsyncReadWrite>;
 
@@ -88,8 +92,8 @@ impl Drop for ProxyListener {
 
 #[derive(Clone)]
 struct SharedState {
-    evil: Arc<RwLock<EvilConfig>>,
     repro: Option<ReproWriter>,
+    monitor: broadcast::Sender<String>,
     reset_barrier: Arc<RwLock<()>>,
     reset_epoch: Arc<AtomicU64>,
     connection_ids: Arc<AtomicU64>,
@@ -102,10 +106,11 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         Some(path) => Some(ReproWriter::open(path).await?),
         None => None,
     };
+    let (monitor, _) = broadcast::channel(MONITOR_BUFFER);
     let topology = discover(cli.proxy.clone(), cli.listen).await?;
     let state = SharedState {
-        evil: Arc::new(RwLock::new(EvilConfig::default())),
         repro,
+        monitor,
         reset_barrier: Arc::new(RwLock::new(())),
         reset_epoch: Arc::new(AtomicU64::new(0)),
         connection_ids: Arc::new(AtomicU64::new(0)),
@@ -205,6 +210,7 @@ async fn proxy_connection(
     let mut upstream_read = BufReader::new(upstream_read);
     let mut fingerprints = ProtocolFingerprints::new();
     let mut transaction_commands = Option::<Vec<String>>::None;
+    let mut config = EvilConfig::default();
 
     loop {
         let command_bytes = match read_raw_frame(&mut client_read).await {
@@ -234,8 +240,33 @@ async fn proxy_connection(
 
         fingerprints.update(ProtocolDirection::In, &command_bytes);
 
+        if is_monitor(command_name.as_deref()) {
+            if argv.len() != 1 {
+                write_client_frame(
+                    &mut client_write,
+                    &mut fingerprints,
+                    &Frame::SimpleError(
+                        "ERR wrong number of arguments for 'monitor' command"
+                            .to_owned(),
+                    ),
+                )
+                .await?;
+                continue;
+            }
+
+            stream_monitor(
+                &mut client_write,
+                &mut fingerprints,
+                state.monitor.subscribe(),
+                connection_id,
+            )
+            .await?;
+            return Ok(());
+        }
+
         if is_debug_evil(&argv) {
-            let result = apply_debug_evil(&state, &argv).await;
+            publish_monitor_command(&state, connection_id, &command_frame);
+            let result = apply_debug_evil(&mut config, &argv);
             let response = result.frame.encode();
             if result.action == DebugAction::ResetIncrementingState {
                 reset_incrementing_state(&state, &mut reset_epoch).await;
@@ -251,31 +282,48 @@ async fn proxy_connection(
         if is_cluster_slots(&argv)
             && let Some(response) = &state.local_slots
         {
+            publish_monitor_command(&state, connection_id, &command_frame);
             write_client_frame(&mut client_write, &mut fingerprints, response)
                 .await?;
             continue;
         }
 
-        let _reset_guard = state.reset_barrier.read().await;
-        if reset_epoch != state.reset_epoch.load(Ordering::SeqCst) {
-            debug!(
-                connection_id,
-                reset_epoch,
-                "closing stale client connection after waiting for evil reset"
-            );
-            return Ok(());
-        }
+        let (
+            command_id,
+            should_mutate,
+            command_hash,
+            exec_transaction_commands,
+        ) = {
+            let _reset_guard = state.reset_barrier.read().await;
+            if reset_epoch != state.reset_epoch.load(Ordering::SeqCst) {
+                debug!(
+                    connection_id,
+                    reset_epoch,
+                    "closing stale client connection after waiting for evil reset"
+                );
+                return Ok(());
+            }
 
-        let command_id = state.command_ids.fetch_add(1, Ordering::SeqCst);
-        let config = state.evil.read().await.clone();
-        let should_mutate =
-            config.should_mutate_command(command_name.as_deref());
-        let command_hash = deterministic_hash(&command_bytes);
-        let exec_transaction_commands = if is_exec(command_name.as_deref()) {
-            transaction_commands.take()
-        } else {
-            None
+            let command_id = state.command_ids.fetch_add(1, Ordering::SeqCst);
+            let should_mutate =
+                config.should_mutate_command(command_name.as_deref());
+            let command_hash = deterministic_hash(&command_bytes);
+            let exec_transaction_commands = if is_exec(command_name.as_deref())
+            {
+                transaction_commands.take()
+            } else {
+                None
+            };
+
+            (
+                command_id,
+                should_mutate,
+                command_hash,
+                exec_transaction_commands,
+            )
         };
+
+        publish_monitor_command(&state, connection_id, &command_frame);
 
         if config.mode == EvilMode::Random && should_mutate {
             let mutated = random_reply(&config, command_id, &command_hash);
@@ -373,8 +421,7 @@ async fn connect_upstream(endpoint: &Endpoint) -> AppResult<ProxyStream> {
     }
 }
 
-async fn apply_debug_evil(state: &SharedState, argv: &[String]) -> DebugResult {
-    let mut config = state.evil.write().await;
+fn apply_debug_evil(config: &mut EvilConfig, argv: &[String]) -> DebugResult {
     match config.apply_debug_command(argv) {
         Ok(result) => {
             info!(status = %config.status(), "updated evil configuration");
@@ -411,6 +458,61 @@ async fn write_repro(state: &SharedState, record: ReproRecord) {
     {
         error!(%error, "failed to append repro record");
     }
+}
+
+async fn stream_monitor<W>(
+    writer: &mut W,
+    fingerprints: &mut ProtocolFingerprints,
+    mut receiver: broadcast::Receiver<String>,
+    connection_id: u64,
+) -> AppResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_client_frame(
+        writer,
+        fingerprints,
+        &Frame::SimpleString("OK".to_owned()),
+    )
+    .await?;
+
+    loop {
+        match receiver.recv().await {
+            Ok(line) => {
+                write_client_frame(
+                    writer,
+                    fingerprints,
+                    &Frame::SimpleString(line),
+                )
+                .await?;
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    connection_id,
+                    skipped, "monitor client lagged behind command stream"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+fn publish_monitor_command(
+    state: &SharedState,
+    connection_id: u64,
+    command: &Frame,
+) {
+    if state.monitor.receiver_count() == 0 {
+        return;
+    }
+
+    let argv = monitor_argv(command);
+    if argv.is_empty() {
+        return;
+    }
+
+    let line = format_monitor_line(connection_id, &argv);
+    let _ = state.monitor.send(line);
 }
 
 async fn write_client_frame<W>(
@@ -455,6 +557,10 @@ fn is_debug_protocol(argv: &[String]) -> bool {
         && argv[1].eq_ignore_ascii_case("PROTOCOL")
 }
 
+fn is_monitor(command: Option<&str>) -> bool {
+    command.is_some_and(|command| command.eq_ignore_ascii_case("MONITOR"))
+}
+
 fn is_cluster_slots(argv: &[String]) -> bool {
     argv.len() >= 2
         && argv[0].eq_ignore_ascii_case("CLUSTER")
@@ -487,6 +593,59 @@ fn update_transaction_commands(
     }
 }
 
+fn monitor_argv(command: &Frame) -> Vec<Vec<u8>> {
+    match command {
+        Frame::Array(Some(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Frame::BulkString(Some(bytes)) => Some(bytes.clone()),
+                Frame::SimpleString(value) => Some(value.as_bytes().to_vec()),
+                Frame::VerbatimString(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect(),
+        Frame::Inline(parts) => parts.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn format_monitor_line(connection_id: u64, argv: &[Vec<u8>]) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut line = format!(
+        "{}.{:06} [0 unix:evilresp:{}]",
+        now.as_secs(),
+        now.subsec_micros(),
+        connection_id
+    );
+
+    for arg in argv {
+        line.push(' ');
+        push_monitor_arg(&mut line, arg);
+    }
+
+    line
+}
+
+fn push_monitor_arg(line: &mut String, arg: &[u8]) {
+    line.push('"');
+    for byte in arg {
+        match byte {
+            b'\\' => line.push_str("\\\\"),
+            b'"' => line.push_str("\\\""),
+            b'\n' => line.push_str("\\n"),
+            b'\r' => line.push_str("\\r"),
+            b'\t' => line.push_str("\\t"),
+            0x20..=0x7e => line.push(char::from(*byte)),
+            _ => {
+                let _ = write!(line, "\\x{byte:02x}");
+            }
+        }
+    }
+    line.push('"');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +657,7 @@ mod tests {
     #[test]
     fn detects_local_commands_case_insensitively() {
         assert!(is_debug_evil(&["debug".to_owned(), "evil".to_owned()]));
+        assert!(is_monitor(Some("monitor")));
         assert!(is_cluster_slots(&[
             "cluster".to_owned(),
             "slots".to_owned()
@@ -542,8 +702,8 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
-            evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(0)),
@@ -566,6 +726,82 @@ mod tests {
         drop(read);
         proxy.await.unwrap().unwrap();
         upstream.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn monitor_streams_commands_from_connected_clients() {
+        let path = unique_socket_path("upstream-monitor");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (read, mut write) = tokio::io::split(stream);
+                    let mut read = BufReader::new(read);
+                    loop {
+                        match read_raw_frame(&mut read).await {
+                            Ok(_) => {
+                                write.write_all(b"+OK\r\n").await.unwrap();
+                            }
+                            Err(error)
+                                if error.kind() == ErrorKind::UnexpectedEof =>
+                            {
+                                break;
+                            }
+                            Err(error) => {
+                                panic!(
+                                    "failed to read upstream command: {error}"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+
+        let mut monitor = spawn_proxy_client(target.clone(), state.clone(), 0);
+        monitor
+            .get_mut()
+            .write_all(&resp_command(&["MONITOR"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut monitor).await.unwrap(), b"+OK\r\n");
+
+        let mut client = spawn_proxy_client(target, state, 1);
+        client
+            .get_mut()
+            .write_all(&resp_command(&["SET", "watched", "value\n\""]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+
+        let line = read_simple_string(&mut monitor).await;
+        assert!(line.contains("[0 unix:evilresp:1]"));
+        assert!(line.contains("\"SET\""));
+        assert!(line.contains("\"watched\""));
+        assert!(line.contains("\"value\\n\\\"\""));
+
+        drop(monitor);
+        drop(client);
+        upstream.abort();
+        let _ = upstream.await;
         std::fs::remove_file(path).unwrap();
     }
 
@@ -647,8 +883,8 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
-            evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(0)),
@@ -685,6 +921,17 @@ mod tests {
         }
     }
 
+    async fn read_simple_string<R>(read: &mut R) -> String
+    where
+        R: tokio::io::AsyncBufRead + Unpin + Send,
+    {
+        let bytes = read_raw_frame(read).await.unwrap();
+        match parse_frame(&bytes).unwrap() {
+            Frame::SimpleString(value) => value,
+            other => panic!("expected simple string, got {other:?}"),
+        }
+    }
+
     fn blake3_hex(bytes: &[u8]) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(bytes);
@@ -697,6 +944,11 @@ mod tests {
             .join(format!("evilresp-{name}-{}-{id}.sock", std::process::id()))
     }
 
+    fn monitor_sender() -> broadcast::Sender<String> {
+        let (sender, _) = broadcast::channel(MONITOR_BUFFER);
+        sender
+    }
+
     #[tokio::test]
     async fn debug_evil_reset_zeroes_incrementing_state() {
         let mut config = EvilConfig::default();
@@ -704,8 +956,8 @@ mod tests {
         config.probability = 100.0;
 
         let state = SharedState {
-            evil: Arc::new(RwLock::new(config)),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(3)),
             connection_ids: Arc::new(AtomicU64::new(17)),
@@ -714,15 +966,14 @@ mod tests {
         };
 
         let result = apply_debug_evil(
-            &state,
+            &mut config,
             &[
                 "DEBUG".to_owned(),
                 "EVIL".to_owned(),
                 "MODE".to_owned(),
                 "RESET".to_owned(),
             ],
-        )
-        .await;
+        );
 
         if result.action == DebugAction::ResetIncrementingState {
             let mut reset_epoch = 3;
@@ -734,7 +985,6 @@ mod tests {
         assert_eq!(state.reset_epoch.load(Ordering::SeqCst), 4);
         assert_eq!(state.connection_ids.load(Ordering::SeqCst), 17);
         assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
-        let config = state.evil.read().await;
         assert_eq!(config.mode, EvilMode::Off);
         assert_eq!(config.probability, 0.0);
     }
@@ -794,11 +1044,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_keeps_mutation_sequence_on_global_command_ids() {
+    async fn reconnect_starts_with_default_evil_config() {
         let single = run_two_command_sequence(false).await;
         let reconnected = run_two_command_sequence(true).await;
 
-        assert_eq!(single, reconnected);
+        assert_ne!(single, reconnected);
+    }
+
+    #[tokio::test]
+    async fn new_connections_do_not_inherit_evil_config() {
+        let path = unique_socket_path("upstream-per-connection-config");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            loop {
+                if upstream_listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+
+        let mut first = spawn_proxy_client(target.clone(), state.clone(), 0);
+        first
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RANDOM"]))
+            .await
+            .unwrap();
+        first
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "STATUS"]))
+            .await
+            .unwrap();
+
+        assert_eq!(read_raw_frame(&mut first).await.unwrap(), b"+OK\r\n");
+        let first_status =
+            String::from_utf8(read_bulk_string(&mut first).await).unwrap();
+        assert!(first_status.contains("mode=RANDOM"));
+
+        let mut second = spawn_proxy_client(target, state, 1);
+        second
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "STATUS"]))
+            .await
+            .unwrap();
+
+        let second_status =
+            String::from_utf8(read_bulk_string(&mut second).await).unwrap();
+        assert!(second_status.contains("mode=OFF"));
+        assert!(second_status.contains("seed=0"));
+
+        drop(first);
+        drop(second);
+        upstream.abort();
+        let _ = upstream.await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -846,8 +1158,8 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
-            evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(2)),
@@ -880,6 +1192,74 @@ mod tests {
 
         drop(stale);
         drop(current);
+        upstream.abort();
+        let _ = upstream.await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_does_not_wait_for_in_flight_upstream_replies() {
+        let path = unique_socket_path("upstream-reset-blocked-command");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let (command_seen_tx, command_seen_rx) =
+            tokio::sync::oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (read, _write) = tokio::io::split(stream);
+                let mut read = BufReader::new(read);
+                read_raw_frame(&mut read).await.unwrap();
+                let _ = command_seen_tx.send(());
+                std::future::pending::<()>().await;
+            });
+
+            loop {
+                if upstream_listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+        };
+
+        let mut blocked = spawn_proxy_client(target.clone(), state.clone(), 0);
+        blocked
+            .get_mut()
+            .write_all(&resp_command(&["GET", "blocked"]))
+            .await
+            .unwrap();
+        command_seen_rx.await.unwrap();
+
+        let mut reset_client = spawn_proxy_client(target, state, 1);
+        reset_client
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RESET"]))
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_raw_frame(&mut reset_client),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response, b"+OK\r\n");
+
+        drop(blocked);
+        drop(reset_client);
         upstream.abort();
         let _ = upstream.await;
         std::fs::remove_file(path).unwrap();
@@ -929,8 +1309,8 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
-            evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
@@ -1055,8 +1435,8 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
-            evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(0)),
@@ -1143,8 +1523,8 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
-            evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(1)),
@@ -1215,8 +1595,8 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
-            evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(1)),
@@ -1430,8 +1810,8 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
-            evil: Arc::new(RwLock::new(EvilConfig::default())),
             repro: None,
+            monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
             reset_epoch: Arc::new(AtomicU64::new(0)),
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),

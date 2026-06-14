@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Scoped `DEBUG EVIL` configuration to each client connection so repeated
+  reproducer runs against a still-running proxy start in non-evil mode.
 - Canonicalized known unordered Redis replies before mutation by default, with
   `DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>` to control the behavior.
 - Canonicalized unordered Redis set-operation replies from `SDIFF`, `SINTER`,
@@ -15,6 +17,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Changed `MONITOR` output to use a Redis-compatible `unix:evilresp:<id>`
+  client address so monitor parsers accept evilresp command streams.
 - Canonicalized unordered `EXEC` subreplies using the commands queued inside
   the transaction before deriving mutation hashes.
 - Fixed same-proxy repeated reproducer runs by invalidating client connections
@@ -27,6 +31,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added local `MONITOR` support for streaming commands received from connected
+  clients.
 - Added per-connection input and output RESP protocol fingerprints exposed via
   `DEBUG PROTOCOL <IN|OUT> <BLAKE3|TLSH>`.
 - Added deterministic protocol output regression coverage for repeated evil

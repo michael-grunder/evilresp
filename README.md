@@ -33,6 +33,19 @@ responses so cluster-aware clients connect back through `evilresp`. Cluster
 proxy mode requires TCP endpoints; configuring either endpoint as AF_UNIX uses
 standalone proxy mode.
 
+## MONITOR
+
+`MONITOR` is handled by `evilresp` and is not sent upstream. It returns `OK`
+and then streams Redis-style monitor lines for commands received from other
+connected clients:
+
+```bash
+redis-cli -p 6380 MONITOR
+```
+
+Monitor lines include the evilresp connection id as a Redis-compatible
+`unix:evilresp:<id>` client address and quoted command arguments.
+
 ## Logging
 
 Human-readable colored logs are the default. Increase verbosity with `-v` or
@@ -66,6 +79,9 @@ by the client connection id.
 ## DEBUG EVIL
 
 `DEBUG EVIL` commands are handled by `evilresp` and are not sent upstream.
+Evil configuration is scoped to the current client connection. New client
+connections always start with the default non-evil configuration and must send
+their own `DEBUG EVIL` setup commands.
 
 ```text
 DEBUG EVIL SEED <seed>

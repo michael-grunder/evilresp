@@ -36,6 +36,15 @@ impl Topology {
             ))),
         }
     }
+
+    pub fn local_redirection_map(&self) -> ClusterRedirectionMap {
+        match self {
+            Topology::Standalone { .. } => ClusterRedirectionMap::default(),
+            Topology::Cluster { slots, .. } => {
+                ClusterRedirectionMap::from_slot_ranges(slots)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +60,68 @@ pub struct LocalSlotRange {
     pub upstream: TcpEndpoint,
     pub local: SocketAddr,
     pub node_id: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClusterRedirectionMap {
+    local_by_upstream: BTreeMap<String, String>,
+    local_by_unique_upstream_port: BTreeMap<u16, String>,
+}
+
+impl ClusterRedirectionMap {
+    pub fn from_slot_ranges(slots: &[LocalSlotRange]) -> Self {
+        let mappings = slots.iter().map(|slot| {
+            (
+                slot.upstream.clone(),
+                socket_addr_to_endpoint(slot.local).connect_addr(),
+            )
+        });
+        Self::from_mappings(mappings)
+    }
+
+    pub fn from_mappings(
+        mappings: impl IntoIterator<Item = (TcpEndpoint, String)>,
+    ) -> Self {
+        let mut local_by_upstream = BTreeMap::new();
+        let mut local_by_upstream_port = BTreeMap::<u16, Option<String>>::new();
+
+        for (upstream, local) in mappings {
+            local_by_upstream.insert(upstream.connect_addr(), local.clone());
+            local_by_upstream_port
+                .entry(upstream.port)
+                .and_modify(|existing| {
+                    if existing.as_deref() != Some(local.as_str()) {
+                        *existing = None;
+                    }
+                })
+                .or_insert(Some(local));
+        }
+
+        let local_by_unique_upstream_port = local_by_upstream_port
+            .into_iter()
+            .filter_map(|(port, local)| local.map(|local| (port, local)))
+            .collect();
+
+        Self {
+            local_by_upstream,
+            local_by_unique_upstream_port,
+        }
+    }
+
+    pub fn rewrite_server(&self, server: &str) -> Option<String> {
+        if let Ok(endpoint) = server.parse::<TcpEndpoint>() {
+            return self
+                .local_by_upstream
+                .get(&endpoint.connect_addr())
+                .or_else(|| {
+                    self.local_by_unique_upstream_port.get(&endpoint.port)
+                })
+                .cloned();
+        }
+
+        let port = server.rsplit_once(':')?.1.parse::<u16>().ok()?;
+        self.local_by_unique_upstream_port.get(&port).cloned()
+    }
 }
 
 impl LocalSlotRange {
@@ -338,6 +409,39 @@ mod tests {
         assert_eq!(slots[0].start, 0);
         assert_eq!(slots[0].end, 16383);
         assert_eq!(slots[0].upstream.port, 7000);
+    }
+
+    #[test]
+    fn local_slots_response_uses_local_proxy_endpoint() {
+        let topology = Topology::Cluster {
+            targets: vec![ProxyTarget {
+                upstream: Endpoint::Tcp(TcpEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 7000,
+                }),
+                listen: Endpoint::Tcp(TcpEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 6380,
+                }),
+            }],
+            slots: vec![LocalSlotRange {
+                start: 0,
+                end: 16_383,
+                upstream: TcpEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 7000,
+                },
+                local: "127.0.0.1:6380".parse().unwrap(),
+                node_id: Some(b"node".to_vec()),
+            }],
+        };
+
+        let response = topology.local_slots_response().unwrap();
+
+        assert_eq!(
+            response.encode(),
+            b"*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:6380\r\n$4\r\nnode\r\n"
+        );
     }
 
     #[tokio::test]

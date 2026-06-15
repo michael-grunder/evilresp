@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::cli::{Cli, Endpoint};
-use crate::cluster::{ProxyTarget, Topology, discover};
+use crate::cluster::{ClusterRedirectionMap, ProxyTarget, Topology, discover};
 use crate::error::{AppError, AppResult};
 use crate::evil::{
     DebugAction, DebugResult, EvilConfig, EvilMode, canonicalize_reply,
@@ -24,7 +24,7 @@ use crate::protocol_fingerprint::{
 };
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
-use crate::topology_evil::maybe_mutate_topology;
+use crate::topology_evil::{maybe_mutate_topology, normalize_redirection};
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -100,6 +100,7 @@ struct SharedState {
     connection_ids: Arc<AtomicU64>,
     command_ids: Arc<AtomicU64>,
     local_slots: Option<Frame>,
+    redirection_map: ClusterRedirectionMap,
 }
 
 pub async fn run(cli: Cli) -> AppResult<()> {
@@ -117,6 +118,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         connection_ids: Arc::new(AtomicU64::new(0)),
         command_ids: Arc::new(AtomicU64::new(0)),
         local_slots: topology.local_slots_response(),
+        redirection_map: topology.local_redirection_map(),
     };
 
     serve_topology(topology, state).await
@@ -393,6 +395,8 @@ async fn proxy_connection(
             &mut transaction_commands,
             command_name.as_deref(),
         );
+        let relay_upstream_bytes =
+            normalize_cluster_redirection(&upstream_bytes, &state)?;
         let mut applied_mutations = Vec::new();
         let response_frame = if should_mutate
             && let Some(local_slots) = &state.local_slots
@@ -401,7 +405,7 @@ async fn proxy_connection(
                 command_id,
                 &command_hash,
                 &command_frame,
-                Some(&upstream_bytes),
+                Some(&relay_upstream_bytes),
                 local_slots,
             )? {
             applied_mutations = mutated.mutations;
@@ -412,7 +416,7 @@ async fn proxy_connection(
         let base_response_bytes = response_frame
             .as_ref()
             .map(Frame::encode)
-            .unwrap_or_else(|| upstream_bytes.clone());
+            .unwrap_or_else(|| relay_upstream_bytes.clone());
         let response_bytes = if should_mutate
             && matches!(config.mode, EvilMode::Mutate | EvilMode::Overflow)
         {
@@ -485,6 +489,22 @@ async fn proxy_connection(
         )
         .await?;
     }
+}
+
+fn normalize_cluster_redirection(
+    upstream_bytes: &[u8],
+    state: &SharedState,
+) -> AppResult<Vec<u8>> {
+    if !matches!(upstream_bytes.first(), Some(b'-' | b'!')) {
+        return Ok(upstream_bytes.to_vec());
+    }
+
+    let upstream_frame = parse_frame(upstream_bytes)?;
+    Ok(
+        normalize_redirection(&upstream_frame, &state.redirection_map)
+            .map(|frame| frame.encode())
+            .unwrap_or_else(|| upstream_bytes.to_vec()),
+    )
 }
 
 async fn connect_upstream(endpoint: &Endpoint) -> AppResult<ProxyStream> {
@@ -724,6 +744,7 @@ fn push_monitor_arg(line: &mut String, arg: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::TcpEndpoint;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -784,6 +805,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
         let proxy = tokio::spawn(proxy_connection(
             Box::new(server),
@@ -849,6 +871,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
 
         let mut monitor = spawn_proxy_client(target.clone(), state.clone(), 0);
@@ -965,6 +988,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
         let proxy = tokio::spawn(proxy_connection(
             Box::new(server),
@@ -1049,6 +1073,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(17)),
             command_ids: Arc::new(AtomicU64::new(23)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
 
         let result = apply_debug_evil(
@@ -1161,6 +1186,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
 
         let mut first = spawn_proxy_client(target.clone(), state.clone(), 0);
@@ -1229,6 +1255,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: Some(cluster_slots_frame()),
+            redirection_map: ClusterRedirectionMap::default(),
         };
         let mut client = spawn_proxy_client(target, state, 0);
 
@@ -1247,6 +1274,62 @@ mod tests {
         let response = read_simple_error(&mut client).await;
 
         assert!(response.starts_with("MOVED ") || response.starts_with("ASK "));
+
+        drop(client);
+        upstream.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_redirections_are_rewritten_to_proxy_ports() {
+        let path = unique_socket_path("upstream-real-redirection");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            assert_eq!(
+                read_raw_frame(&mut read).await.unwrap(),
+                resp_command(&["GET", "foo"])
+            );
+            write
+                .write_all(b"-MOVED 12182 127.0.0.1:7002\r\n")
+                .await
+                .unwrap();
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(1)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: Some(cluster_slots_frame()),
+            redirection_map: ClusterRedirectionMap::from_mappings([(
+                TcpEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 7002,
+                },
+                "127.0.0.1:6382".to_owned(),
+            )]),
+        };
+        let mut client = spawn_proxy_client(target, state, 0);
+
+        client
+            .get_mut()
+            .write_all(&resp_command(&["GET", "foo"]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_simple_error(&mut client).await,
+            "MOVED 12182 127.0.0.1:6382"
+        );
 
         drop(client);
         upstream.await.unwrap();
@@ -1305,6 +1388,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(2)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
 
         let mut stale = spawn_proxy_client(target.clone(), state.clone(), 0);
@@ -1372,6 +1456,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
 
         let mut blocked = spawn_proxy_client(target.clone(), state.clone(), 0);
@@ -1456,6 +1541,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
         let proxy = tokio::spawn(proxy_connection(
             Box::new(server),
@@ -1582,6 +1668,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
 
         let mut first = spawn_proxy_client(target.clone(), state.clone(), 0);
@@ -1670,6 +1757,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
         let mut client = spawn_proxy_client(target, state, 0);
         write_evil_setup(client.get_mut()).await;
@@ -1742,6 +1830,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
         let mut client = spawn_proxy_client(target, state, 0);
         write_evil_setup(client.get_mut()).await;
@@ -1964,6 +2053,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
         };
         let proxy = tokio::spawn(proxy_connection(
             Box::new(server),

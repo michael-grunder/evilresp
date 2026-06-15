@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Rewrote upstream `MOVED` and `ASK` redirection endpoints to the corresponding
+  local proxy listener before relaying them to clients.
 - Changed `MONITOR` output to use a Redis-compatible `unix:evilresp:<id>`
   client address so monitor parsers accept evilresp command streams.
 - Canonicalized unordered `EXEC` subreplies using the commands queued inside

@@ -29,9 +29,9 @@ cargo run -- --proxy unix:/tmp/redis.sock --listen unix:/tmp/evilresp.sock
 
 At startup, `evilresp` probes `CLUSTER SLOTS`. If the upstream is a cluster, it
 maps each primary node to a local listening port and rewrites `CLUSTER SLOTS`
-responses so cluster-aware clients connect back through `evilresp`. Cluster
-proxy mode requires TCP endpoints; configuring either endpoint as AF_UNIX uses
-standalone proxy mode.
+responses and upstream `MOVED`/`ASK` redirections so cluster-aware clients
+connect back through `evilresp`. Cluster proxy mode requires TCP endpoints;
+configuring either endpoint as AF_UNIX uses standalone proxy mode.
 
 ## MONITOR
 

@@ -2,6 +2,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 
+use crate::cluster::ClusterRedirectionMap;
 use crate::error::AppResult;
 use crate::evil::{AppliedMutation, EvilConfig, MutationKind};
 use crate::resp::{Frame, parse_frame};
@@ -89,6 +90,15 @@ pub fn maybe_mutate_topology(
     }))
 }
 
+pub fn normalize_redirection(
+    frame: &Frame,
+    redirection_map: &ClusterRedirectionMap,
+) -> Option<Frame> {
+    let mut redirection = parse_redirection(frame)?;
+    redirection.server = redirection_map.rewrite_server(&redirection.server)?;
+    Some(redirection.to_matching_frame(frame))
+}
+
 fn parse_redirection(frame: &Frame) -> Option<Redirection> {
     let value = match frame {
         Frame::SimpleError(value) => value.as_str(),
@@ -157,8 +167,10 @@ fn apply_redirection_mutations(
         });
     }
 
-    if should_apply(probability, rng) {
-        redirection.server = wrong_server(&redirection.server, targets, rng);
+    if should_apply(probability, rng)
+        && let Some(server) = wrong_server(&redirection.server, targets, rng)
+    {
+        redirection.server = server;
         mutations.push(AppliedMutation {
             path: "topology.server".to_owned(),
             kind: MutationKind::TopologyWrongServer,
@@ -186,27 +198,42 @@ fn wrong_server(
     current: &str,
     targets: &[String],
     rng: &mut ChaCha20Rng,
-) -> String {
+) -> Option<String> {
     let alternatives = targets
         .iter()
         .filter(|target| target.as_str() != current)
         .collect::<Vec<_>>();
     if !alternatives.is_empty() {
-        return alternatives[rng.gen_range(0..alternatives.len())].clone();
+        return Some(
+            alternatives[rng.gen_range(0..alternatives.len())].clone(),
+        );
     }
 
-    let port = rng.gen_range(1..=u16::MAX);
-    format!("127.0.0.1:{port}")
+    None
 }
 
 impl Redirection {
     fn to_frame(&self) -> Frame {
-        Frame::SimpleError(format!(
+        Frame::SimpleError(self.to_string())
+    }
+
+    fn to_matching_frame(&self, original: &Frame) -> Frame {
+        match original {
+            Frame::BulkError(_) => Frame::BulkError(self.to_string().into()),
+            _ => self.to_frame(),
+        }
+    }
+}
+
+impl std::fmt::Display for Redirection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
             "{} {} {}",
             self.kind.as_str(),
             self.slot,
             self.server
-        ))
+        )
     }
 }
 
@@ -311,6 +338,7 @@ fn topology_rng(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::TcpEndpoint;
     use crate::evil::EvilMode;
 
     #[test]
@@ -370,6 +398,22 @@ mod tests {
                 .iter()
                 .any(|mutation| mutation.kind == MutationKind::TopologyWildSlot)
         );
+    }
+
+    #[test]
+    fn normalizes_upstream_redirection_to_local_proxy_endpoint() {
+        let map = ClusterRedirectionMap::from_mappings([(
+            TcpEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 7002,
+            },
+            "127.0.0.1:6382".to_owned(),
+        )]);
+        let frame = parse_frame(b"-MOVED 12182 127.0.0.1:7002\r\n").unwrap();
+
+        let normalized = normalize_redirection(&frame, &map).unwrap();
+
+        assert_eq!(normalized.encode(), b"-MOVED 12182 127.0.0.1:6382\r\n");
     }
 
     #[test]

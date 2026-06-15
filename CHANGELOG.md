@@ -31,6 +31,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `DEBUG EVIL TOPOLOGY <probability>` for cluster-mode malicious `MOVED`
+  and `ASK` redirection behavior independent from RESP mutation mode.
 - Added local `MONITOR` support for streaming commands received from connected
   clients.
 - Added per-connection input and output RESP protocol fingerprints exposed via

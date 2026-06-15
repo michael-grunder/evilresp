@@ -115,6 +115,7 @@ pub struct EvilConfig {
     pub seed: u64,
     pub mode: EvilMode,
     pub probability: f64,
+    pub topology_probability: f64,
     pub canonicalization: CanonicalizationMode,
     include: Vec<FilterSpec>,
     exclude: Vec<FilterSpec>,
@@ -131,6 +132,7 @@ impl Default for EvilConfig {
             seed: 0,
             mode: EvilMode::Off,
             probability: 0.0,
+            topology_probability: 0.0,
             canonicalization: CanonicalizationMode::Unordered,
             include: Vec::new(),
             exclude,
@@ -234,6 +236,21 @@ impl EvilConfig {
                 self.canonicalization = CanonicalizationMode::from_str(mode)?;
                 Ok(DebugResult::ok())
             }
+            "TOPOLOGY" => {
+                let Some(probability) = argv.get(3) else {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL TOPOLOGY requires a probability".to_owned(),
+                    ));
+                };
+                if argv.len() != 4 {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL TOPOLOGY does not accept options"
+                            .to_owned(),
+                    ));
+                }
+                self.topology_probability = parse_probability(probability)?;
+                Ok(DebugResult::ok())
+            }
             "STATUS" => Ok(DebugResult {
                 frame: Frame::BulkString(Some(self.status().into_bytes())),
                 action: DebugAction::None,
@@ -282,10 +299,11 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} canonicalize={} include=[{}] exclude=[{}]",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}]",
             self.mode,
             self.seed,
             self.probability,
+            self.topology_probability,
             self.canonicalization,
             self.include_filters().join(","),
             self.exclude_filters().join(","),
@@ -452,6 +470,11 @@ pub enum MutationKind {
     WrongType,
     WrongLength,
     OverflowValue,
+    TopologyFakeRedirection,
+    TopologyWrongRedirectionKind,
+    TopologyWrongSlot,
+    TopologyWrongServer,
+    TopologyWildSlot,
 }
 
 #[derive(Clone, Debug)]
@@ -973,6 +996,31 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("unknown canonicalization mode"));
+    }
+
+    #[test]
+    fn debug_topology_parses_probability() {
+        let mut config = EvilConfig::default();
+
+        config
+            .apply_debug_command(&strings([
+                "DEBUG", "EVIL", "TOPOLOGY", "12.5",
+            ]))
+            .unwrap();
+
+        assert_eq!(config.topology_probability, 12.5);
+        assert!(config.status().contains("topology_probability=12.50"));
+    }
+
+    #[test]
+    fn debug_topology_rejects_out_of_range_probability() {
+        let mut config = EvilConfig::default();
+
+        let error = config
+            .apply_debug_command(&strings(["DEBUG", "EVIL", "TOPOLOGY", "101"]))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("outside 0.00-100.00"));
     }
 
     #[test]

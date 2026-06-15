@@ -86,6 +86,7 @@ their own `DEBUG EVIL` setup commands.
 ```text
 DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
+DEBUG EVIL TOPOLOGY <0.00-100.00>
 DEBUG EVIL MODE RESET
 DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>
 DEBUG EVIL STATUS
@@ -102,9 +103,17 @@ Modes:
   typed RESP frames.
 - `OVERFLOW`: mutate toward overflow-prone values and lengths.
 
-`DEBUG EVIL MODE RESET` disables evil mode, sets mutation probability to zero,
-resets the deterministic command index, invalidates older client connections,
-and resets the current connection's protocol fingerprints.
+`DEBUG EVIL TOPOLOGY` controls cluster redirection lies independently from RESP
+reply mutation. In cluster mode, topology mutation can inject fake `MOVED` or
+`ASK` redirections for commands that otherwise succeeded, alter real upstream
+redirections, flip redirection kind, choose the wrong slot or server, and emit
+wild slot numbers outside Redis' normal `0..16383` range. These replies are
+valid RESP errors first, then `MUTATE` or `OVERFLOW` can still corrupt their
+RESP shape when those modes are enabled.
+
+`DEBUG EVIL MODE RESET` disables RESP evil mode, sets RESP mutation probability
+to zero, resets the deterministic command index, invalidates older client
+connections, and resets the current connection's protocol fingerprints.
 
 Canonicalization controls whether upstream replies are normalized before they
 seed and enter the mutation pipeline. The default is `UNORDERED`, which

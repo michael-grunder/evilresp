@@ -24,6 +24,7 @@ use crate::protocol_fingerprint::{
 };
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
+use crate::topology_evil::maybe_mutate_topology;
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -326,6 +327,40 @@ async fn proxy_connection(
         publish_monitor_command(&state, connection_id, &command_frame);
 
         if config.mode == EvilMode::Random && should_mutate {
+            if let Some(local_slots) = &state.local_slots
+                && let Some(mutated) = maybe_mutate_topology(
+                    &config,
+                    command_id,
+                    &command_hash,
+                    &command_frame,
+                    None,
+                    local_slots,
+                )?
+            {
+                let bytes = mutated.frame.encode();
+                write_repro(
+                    &state,
+                    ReproRecord::new(
+                        config.seed,
+                        connection_id,
+                        command_id,
+                        &command_bytes,
+                        None,
+                        &bytes,
+                        config.mode,
+                        mutated.mutations,
+                    ),
+                )
+                .await;
+                write_client_bytes(
+                    &mut client_write,
+                    &mut fingerprints,
+                    &bytes,
+                )
+                .await?;
+                continue;
+            }
+
             let mutated = random_reply(&config, command_id, &command_hash);
             write_repro(
                 &state,
@@ -358,10 +393,33 @@ async fn proxy_connection(
             &mut transaction_commands,
             command_name.as_deref(),
         );
+        let mut applied_mutations = Vec::new();
+        let response_frame = if should_mutate
+            && let Some(local_slots) = &state.local_slots
+            && let Some(mutated) = maybe_mutate_topology(
+                &config,
+                command_id,
+                &command_hash,
+                &command_frame,
+                Some(&upstream_bytes),
+                local_slots,
+            )? {
+            applied_mutations = mutated.mutations;
+            Some(mutated.frame)
+        } else {
+            None
+        };
+        let base_response_bytes = response_frame
+            .as_ref()
+            .map(Frame::encode)
+            .unwrap_or_else(|| upstream_bytes.clone());
         let response_bytes = if should_mutate
             && matches!(config.mode, EvilMode::Mutate | EvilMode::Overflow)
         {
-            let upstream_frame = parse_frame(&upstream_bytes)?;
+            let upstream_frame = match &response_frame {
+                Some(frame) => frame.clone(),
+                None => parse_frame(&upstream_bytes)?,
+            };
             let mutation_frame = match exec_transaction_commands {
                 Some(commands) => canonicalize_transaction_reply(
                     config.canonicalization,
@@ -382,7 +440,8 @@ async fn proxy_connection(
                 &upstream_hash,
                 &mutation_frame,
             );
-            if !mutated.mutations.is_empty() {
+            applied_mutations.extend(mutated.mutations);
+            if !applied_mutations.is_empty() {
                 write_repro(
                     &state,
                     ReproRecord::new(
@@ -393,14 +452,30 @@ async fn proxy_connection(
                         Some(&upstream_bytes),
                         &mutated.bytes,
                         config.mode,
-                        mutated.mutations,
+                        applied_mutations,
                     ),
                 )
                 .await;
             }
             mutated.bytes
         } else {
-            upstream_bytes
+            if !applied_mutations.is_empty() {
+                write_repro(
+                    &state,
+                    ReproRecord::new(
+                        config.seed,
+                        connection_id,
+                        command_id,
+                        &command_bytes,
+                        Some(&upstream_bytes),
+                        &base_response_bytes,
+                        config.mode,
+                        applied_mutations,
+                    ),
+                )
+                .await;
+            }
+            base_response_bytes
         };
 
         write_client_bytes(
@@ -932,6 +1007,17 @@ mod tests {
         }
     }
 
+    async fn read_simple_error<R>(read: &mut R) -> String
+    where
+        R: tokio::io::AsyncBufRead + Unpin + Send,
+    {
+        let bytes = read_raw_frame(read).await.unwrap();
+        match parse_frame(&bytes).unwrap() {
+            Frame::SimpleError(value) => value,
+            other => panic!("expected simple error, got {other:?}"),
+        }
+    }
+
     fn blake3_hex(bytes: &[u8]) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(bytes);
@@ -1110,6 +1196,60 @@ mod tests {
         drop(second);
         upstream.abort();
         let _ = upstream.await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn topology_evil_can_fake_redirection_with_resp_mode_off() {
+        let path = unique_socket_path("upstream-topology-redirection");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            assert_eq!(
+                read_raw_frame(&mut read).await.unwrap(),
+                resp_command(&["GET", "foo"])
+            );
+            write
+                .write_all(&bulk_string("value").encode())
+                .await
+                .unwrap();
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(1)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: Some(cluster_slots_frame()),
+        };
+        let mut client = spawn_proxy_client(target, state, 0);
+
+        client
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "TOPOLOGY", "100"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+
+        client
+            .get_mut()
+            .write_all(&resp_command(&["GET", "foo"]))
+            .await
+            .unwrap();
+        let response = read_simple_error(&mut client).await;
+
+        assert!(response.starts_with("MOVED ") || response.starts_with("ASK "));
+
+        drop(client);
+        upstream.await.unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1734,6 +1874,13 @@ mod tests {
 
     fn bulk_string(value: &str) -> Frame {
         Frame::BulkString(Some(value.as_bytes().to_vec()))
+    }
+
+    fn cluster_slots_frame() -> Frame {
+        parse_frame(
+            b"*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:7000\r\n",
+        )
+        .unwrap()
     }
 
     fn spawn_proxy_client(

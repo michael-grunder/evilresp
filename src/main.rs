@@ -1,3 +1,4 @@
+#![warn(clippy::all, clippy::nursery, clippy::pedantic)]
 use clap::Parser;
 use evilresp::cli::Cli;
 use evilresp::error::AppResult;

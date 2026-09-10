@@ -12,7 +12,27 @@ pub enum LogMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about,
+    after_help = "\
+Examples:
+  Proxy a local Redis server (listen on 127.0.0.1:6380):
+    evilresp --proxy localhost:6379
+
+  Choose a listening address and enable trace logs:
+    evilresp --proxy localhost:6379 --listen 127.0.0.1:6381 -vv
+
+  Proxy between Unix sockets:
+    evilresp --proxy unix:/tmp/redis.sock --listen unix:/tmp/evilresp.sock
+
+  Record mutations and use JSON logs:
+    evilresp --proxy localhost:6379 --repro-file repro.jsonl --log-mode json
+
+Replies are unchanged by default. Enable mutations with DEBUG EVIL on the
+same client connection that sends the commands to fuzz."
+)]
 pub struct Cli {
     /// Upstream Redis, Valkey, or DragonflyDB endpoint to proxy.
     ///

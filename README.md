@@ -9,6 +9,8 @@ at runtime with `DEBUG EVIL` commands.
 
 ## Running
 
+Run `evilresp --help` for available options and usage examples.
+
 Build with a current stable Rust toolchain on a Unix platform:
 
 ```bash

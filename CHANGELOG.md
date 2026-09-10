@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added CLI help examples for TCP and Unix sockets, custom listening addresses,
+  verbose logging, and mutation recording.
 - Rewrote `CLUSTER SHARDS` and `CLUSTER NODES` replies to the local proxy
   listeners so clients that discover the cluster with either command (Relay
   uses `CLUSTER SHARDS`) connect back through evilresp instead of the

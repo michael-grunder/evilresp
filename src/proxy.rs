@@ -29,6 +29,7 @@ use crate::protocol_fingerprint::{
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
 use crate::topology_evil::{maybe_mutate_topology, normalize_redirection};
+use crate::transaction::TransactionCommands;
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -216,7 +217,7 @@ async fn proxy_connection(
     let mut client_read = BufReader::new(client_read);
     let mut upstream_read = BufReader::new(upstream_read);
     let mut fingerprints = ProtocolFingerprints::new();
-    let mut transaction_commands = Option::<Vec<String>>::None;
+    let mut transaction_commands = TransactionCommands::default();
     let mut config = EvilConfig::default();
 
     loop {
@@ -317,12 +318,7 @@ async fn proxy_connection(
             continue;
         }
 
-        let (
-            command_id,
-            should_mutate,
-            command_hash,
-            exec_transaction_commands,
-        ) = {
+        let (command_id, should_mutate, command_hash) = {
             let _reset_guard = state.reset_barrier.read().await;
             if reset_epoch != state.reset_epoch.load(Ordering::SeqCst) {
                 debug!(
@@ -337,19 +333,7 @@ async fn proxy_connection(
             let should_mutate =
                 config.should_mutate_command(command_name.as_deref());
             let command_hash = deterministic_hash(&command_bytes);
-            let exec_transaction_commands = if is_exec(command_name.as_deref())
-            {
-                transaction_commands.take()
-            } else {
-                None
-            };
-
-            (
-                command_id,
-                should_mutate,
-                command_hash,
-                exec_transaction_commands,
-            )
+            (command_id, should_mutate, command_hash)
         };
 
         publish_monitor_command(&state, connection_id, &command_frame);
@@ -417,10 +401,8 @@ async fn proxy_connection(
         upstream_write.flush().await?;
 
         let upstream_bytes = read_raw_frame(&mut upstream_read).await?;
-        update_transaction_commands(
-            &mut transaction_commands,
-            command_name.as_deref(),
-        );
+        let exec_transaction_commands =
+            transaction_commands.observe(&argv, &upstream_bytes);
         let relay_upstream_bytes =
             normalize_cluster_redirection(&upstream_bytes, &state)?;
         let mut applied_mutations = Vec::new();
@@ -448,7 +430,7 @@ async fn proxy_connection(
         {
             let upstream_frame = match &response_frame {
                 Some(frame) => frame.clone(),
-                None => parse_frame(&upstream_bytes)?,
+                None => parse_frame(&relay_upstream_bytes)?,
             };
             let mutation_frame = match exec_transaction_commands {
                 Some(commands) => canonicalize_transaction_reply(
@@ -521,7 +503,9 @@ fn normalize_cluster_redirection(
     upstream_bytes: &[u8],
     state: &SharedState,
 ) -> AppResult<Vec<u8>> {
-    if !matches!(upstream_bytes.first(), Some(b'-' | b'!')) {
+    if state.local_slots.is_none()
+        || !matches!(upstream_bytes.first(), Some(b'-' | b'!'))
+    {
         return Ok(upstream_bytes.to_vec());
     }
 
@@ -686,32 +670,6 @@ fn is_cluster_slots(argv: &[String]) -> bool {
     argv.len() >= 2
         && argv[0].eq_ignore_ascii_case("CLUSTER")
         && argv[1].eq_ignore_ascii_case("SLOTS")
-}
-
-fn is_exec(command: Option<&str>) -> bool {
-    command.is_some_and(|command| command.eq_ignore_ascii_case("EXEC"))
-}
-
-fn update_transaction_commands(
-    transaction_commands: &mut Option<Vec<String>>,
-    command: Option<&str>,
-) {
-    let Some(command) = command else {
-        return;
-    };
-    let command = command.to_ascii_uppercase();
-
-    match command.as_str() {
-        "EXEC" | "DISCARD" => *transaction_commands = None,
-        "MULTI" if transaction_commands.is_none() => {
-            *transaction_commands = Some(Vec::new());
-        }
-        _ => {
-            if let Some(commands) = transaction_commands {
-                commands.push(command);
-            }
-        }
-    }
 }
 
 fn monitor_argv(command: &Frame) -> Vec<Vec<u8>> {
@@ -1308,8 +1266,44 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_redirections_are_rewritten_to_proxy_ports() {
+        assert_redirection_reply(
+            "OFF",
+            "7002",
+            b"-MOVED 12182 127.0.0.1:6382\r\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_probability_mutation_preserves_rewritten_redirections() {
+        for mode in ["MUTATE", "OVERFLOW"] {
+            assert_redirection_reply(
+                mode,
+                "7002",
+                b"-MOVED 12182 127.0.0.1:6382\r\n",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unmapped_redirections_do_not_expose_upstream_endpoints() {
+        assert_redirection_reply(
+            "OFF",
+            "7999",
+            b"-ERR evilresp has no local listener for redirection target\r\n",
+        )
+        .await;
+    }
+
+    async fn assert_redirection_reply(
+        mode: &str,
+        upstream_port: &str,
+        expected: &[u8],
+    ) {
         let path = unique_socket_path("upstream-real-redirection");
         let upstream_listener = UnixListener::bind(&path).unwrap();
+        let reply = format!("-MOVED 12182 127.0.0.1:{upstream_port}\r\n");
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             let (read, mut write) = tokio::io::split(stream);
@@ -1318,10 +1312,7 @@ mod tests {
                 read_raw_frame(&mut read).await.unwrap(),
                 resp_command(&["GET", "foo"])
             );
-            write
-                .write_all(b"-MOVED 12182 127.0.0.1:7002\r\n")
-                .await
-                .unwrap();
+            write.write_all(reply.as_bytes()).await.unwrap();
         });
 
         let target = ProxyTarget {
@@ -1348,14 +1339,24 @@ mod tests {
 
         client
             .get_mut()
+            .write_all(&resp_command(&[
+                "DEBUG",
+                "EVIL",
+                "MODE",
+                mode,
+                "PROBABILITY",
+                "0",
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+        client
+            .get_mut()
             .write_all(&resp_command(&["GET", "foo"]))
             .await
             .unwrap();
 
-        assert_eq!(
-            read_simple_error(&mut client).await,
-            "MOVED 12182 127.0.0.1:6382"
-        );
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), expected);
 
         drop(client);
         upstream.await.unwrap();

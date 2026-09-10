@@ -90,12 +90,21 @@ pub fn maybe_mutate_topology(
     }))
 }
 
+/// Rewrite a cluster redirection, or return a local error if its target has
+/// no listener. Non-redirection replies return `None` and pass through.
 pub fn normalize_redirection(
     frame: &Frame,
     redirection_map: &ClusterRedirectionMap,
 ) -> Option<Frame> {
     let mut redirection = parse_redirection(frame)?;
-    redirection.server = redirection_map.rewrite_server(&redirection.server)?;
+    let Some(server) = redirection_map.rewrite_server(&redirection.server)
+    else {
+        return Some(Frame::SimpleError(
+            "ERR evilresp has no local listener for redirection target"
+                .to_owned(),
+        ));
+    };
+    redirection.server = server;
     Some(redirection.to_matching_frame(frame))
 }
 
@@ -414,6 +423,34 @@ mod tests {
         let normalized = normalize_redirection(&frame, &map).unwrap();
 
         assert_eq!(normalized.encode(), b"-MOVED 12182 127.0.0.1:6382\r\n");
+    }
+
+    #[test]
+    fn normalizes_bulk_ask_and_rejects_unmapped_targets() {
+        let map = ClusterRedirectionMap::from_mappings([(
+            "127.0.0.1:7002".parse().unwrap(),
+            "127.0.0.1:6382".to_owned(),
+        )]);
+        let frame = Frame::BulkError(b"ASK 12182 127.0.0.1:7002".to_vec());
+        assert_eq!(
+            normalize_redirection(&frame, &map),
+            Some(Frame::BulkError(b"ASK 12182 127.0.0.1:6382".to_vec(),))
+        );
+        let frame = Frame::BulkError(b"ASK 12182 127.0.0.1:7999".to_vec());
+        assert_eq!(
+            normalize_redirection(&frame, &map),
+            Some(Frame::SimpleError(
+                "ERR evilresp has no local listener for redirection target"
+                    .to_owned(),
+            ))
+        );
+        assert!(
+            normalize_redirection(
+                &Frame::SimpleError("ERR example".to_owned()),
+                &map
+            )
+            .is_none()
+        );
     }
 
     #[test]

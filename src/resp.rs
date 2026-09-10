@@ -1,10 +1,13 @@
-use std::future::Future;
 use std::io::{self, ErrorKind};
-use std::pin::Pin;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
 use crate::error::{AppError, AppResult};
+
+// Bound incoming data, including aggregate contents. Generated evil output
+// deliberately does not use these limits.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAME_DEPTH: usize = 128;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Frame {
@@ -43,7 +46,7 @@ impl Frame {
         match self {
             Frame::Array(Some(items)) => items
                 .iter()
-                .filter_map(|item| match item {
+                .map(|item| match item {
                     Frame::BulkString(Some(bytes)) => {
                         Some(String::from_utf8_lossy(bytes).into_owned())
                     }
@@ -53,7 +56,10 @@ impl Frame {
                     }
                     _ => None,
                 })
-                .collect(),
+                // Never shift argument positions by dropping invalid items:
+                // that could turn malformed input into a local DEBUG command.
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default(),
             Frame::Inline(parts) => parts
                 .iter()
                 .map(|part| String::from_utf8_lossy(part).into_owned())
@@ -144,7 +150,14 @@ fn push_blob(out: &mut Vec<u8>, prefix: u8, bytes: &[u8]) {
 }
 
 pub fn parse_frame(bytes: &[u8]) -> AppResult<Frame> {
-    let mut parser = Parser { bytes, position: 0 };
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(AppError::Resp("RESP frame exceeds 64 MiB".to_owned()));
+    }
+    let mut parser = Parser {
+        bytes,
+        position: 0,
+        depth: 0,
+    };
     let frame = parser.parse_frame()?;
     if parser.position != bytes.len() {
         return Err(AppError::Resp(format!(
@@ -159,87 +172,74 @@ pub async fn read_raw_frame<R>(reader: &mut R) -> io::Result<Vec<u8>>
 where
     R: AsyncBufRead + Unpin + Send,
 {
-    read_raw_frame_boxed(reader).await
-}
-
-fn read_raw_frame_boxed<'a, R>(
-    reader: &'a mut R,
-) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send + 'a>>
-where
-    R: AsyncBufRead + Unpin + Send + 'a,
-{
-    Box::pin(async move {
+    let mut raw = Vec::new();
+    // Each entry counts the unread children at that nesting level. Reading
+    // into one buffer avoids recursive futures and repeated subtree copies.
+    let mut pending = vec![1_usize];
+    while let Some(remaining) = pending.last_mut() {
+        if *remaining == 0 {
+            pending.pop();
+            continue;
+        }
+        *remaining -= 1;
+        if pending.len() > MAX_FRAME_DEPTH {
+            return Err(invalid_data("RESP nesting exceeds 128 levels"));
+        }
+        if raw.len() == MAX_FRAME_BYTES {
+            return Err(invalid_data("RESP frame exceeds 64 MiB"));
+        }
         let mut prefix = [0_u8; 1];
         reader.read_exact(&mut prefix).await?;
-
-        if !is_resp_prefix(prefix[0]) {
-            let mut raw = vec![prefix[0]];
-            reader.read_until(b'\n', &mut raw).await?;
-            return Ok(raw);
-        }
-
-        let mut raw = vec![prefix[0]];
+        raw.push(prefix[0]);
         let line = read_line_raw(reader, &mut raw).await?;
 
         match prefix[0] {
             b'$' | b'!' | b'=' => {
-                let len = parse_len(&line)?;
-                if len >= 0 {
-                    let byte_len =
-                        usize::try_from(len).map_err(invalid_data)?;
-                    let mut body = vec![0_u8; byte_len + 2];
-                    reader.read_exact(&mut body).await?;
-                    if !body.ends_with(b"\r\n") {
+                if let Some(len) = parse_len(&line, prefix[0] == b'$')? {
+                    let body_len = len.checked_add(2).ok_or_else(|| {
+                        invalid_data("RESP blob length overflow")
+                    })?;
+                    if body_len > MAX_FRAME_BYTES - raw.len() {
+                        return Err(invalid_data("RESP frame exceeds 64 MiB"));
+                    }
+                    // Grow only as bytes arrive, never from an advertised
+                    // length alone.
+                    let mut body = (&mut *reader).take(body_len as u64);
+                    if body.read_to_end(&mut raw).await? != body_len {
                         return Err(io::Error::new(
-                            ErrorKind::InvalidData,
+                            ErrorKind::UnexpectedEof,
+                            "truncated RESP blob",
+                        ));
+                    }
+                    if !raw.ends_with(b"\r\n") {
+                        return Err(invalid_data(
                             "bulk body missing CRLF terminator",
                         ));
                     }
-                    raw.extend_from_slice(&body);
                 }
             }
-            b'*' | b'~' | b'>' => {
-                let len = parse_len(&line)?;
-                if len >= 0 {
-                    for _ in 0..len {
-                        raw.extend(read_raw_frame_boxed(reader).await?);
+            b'*' | b'~' | b'>' | b'%' | b'|' => {
+                if let Some(len) = parse_len(&line, prefix[0] == b'*')? {
+                    let children = if matches!(prefix[0], b'%' | b'|') {
+                        len.checked_mul(2).ok_or_else(|| {
+                            invalid_data("RESP aggregate length overflow")
+                        })?
+                    } else {
+                        len
+                    };
+                    // Even the shortest child needs a prefix and CRLF.
+                    if children > (MAX_FRAME_BYTES - raw.len()) / 3 {
+                        return Err(invalid_data("RESP frame exceeds 64 MiB"));
+                    }
+                    if children > 0 {
+                        pending.push(children);
                     }
                 }
             }
-            b'%' | b'|' => {
-                let len = parse_len(&line)?;
-                if len >= 0 {
-                    for _ in 0..(len * 2) {
-                        raw.extend(read_raw_frame_boxed(reader).await?);
-                    }
-                }
-            }
-            b'+' | b'-' | b':' | b'_' | b'#' | b',' | b'(' => {}
-            _ => unreachable!("checked by is_resp_prefix"),
+            _ => {}
         }
-
-        Ok(raw)
-    })
-}
-
-fn is_resp_prefix(prefix: u8) -> bool {
-    matches!(
-        prefix,
-        b'+' | b'-'
-            | b':'
-            | b'$'
-            | b'*'
-            | b'_'
-            | b'#'
-            | b','
-            | b'('
-            | b'!'
-            | b'='
-            | b'%'
-            | b'~'
-            | b'>'
-            | b'|'
-    )
+    }
+    Ok(raw)
 }
 
 async fn read_line_raw<R>(
@@ -250,7 +250,8 @@ where
     R: AsyncBufRead + Unpin,
 {
     let before = raw.len();
-    let read = reader.read_until(b'\n', raw).await?;
+    let mut limited = reader.take((MAX_FRAME_BYTES - before) as u64);
+    let read = limited.read_until(b'\n', raw).await?;
     if read == 0 {
         return Err(io::Error::new(
             ErrorKind::UnexpectedEof,
@@ -267,9 +268,13 @@ where
     Ok(line[..line.len() - 2].to_vec())
 }
 
-fn parse_len(line: &[u8]) -> io::Result<i64> {
+fn parse_len(line: &[u8], nullable: bool) -> io::Result<Option<usize>> {
     let value = std::str::from_utf8(line).map_err(invalid_data)?;
-    value.parse::<i64>().map_err(invalid_data)
+    let len = value.parse::<i64>().map_err(invalid_data)?;
+    if nullable && len == -1 {
+        return Ok(None);
+    }
+    usize::try_from(len).map(Some).map_err(invalid_data)
 }
 
 fn invalid_data(error: impl ToString) -> io::Error {
@@ -279,10 +284,23 @@ fn invalid_data(error: impl ToString) -> io::Error {
 struct Parser<'a> {
     bytes: &'a [u8],
     position: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
     fn parse_frame(&mut self) -> AppResult<Frame> {
+        if self.depth == MAX_FRAME_DEPTH {
+            return Err(AppError::Resp(
+                "RESP nesting exceeds 128 levels".to_owned(),
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_frame_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_frame_inner(&mut self) -> AppResult<Frame> {
         let Some(prefix) = self.take_byte() else {
             return Err(AppError::Resp("empty input".to_owned()));
         };
@@ -332,7 +350,7 @@ impl<'a> Parser<'a> {
 
     fn parse_optional_blob(&mut self) -> AppResult<Option<Vec<u8>>> {
         let len = self.take_i64_line()?;
-        if len < 0 {
+        if len == -1 {
             return Ok(None);
         }
         self.take_blob(len).map(Some)
@@ -353,7 +371,7 @@ impl<'a> Parser<'a> {
         build: fn(Option<Vec<Frame>>) -> Frame,
     ) -> AppResult<Frame> {
         let len = self.take_i64_line()?;
-        if len < 0 {
+        if len == -1 {
             return Ok(build(None));
         }
         self.read_sequence(len).map(Some).map(build)
@@ -382,7 +400,8 @@ impl<'a> Parser<'a> {
                 "RESP3 map-like type cannot have negative length".to_owned(),
             ));
         }
-        let mut items = Vec::with_capacity(usize_len(len)?);
+        self.validate_sequence_len(len, 6)?;
+        let mut items = Vec::new();
         for _ in 0..len {
             items.push((self.parse_frame()?, self.parse_frame()?));
         }
@@ -390,16 +409,30 @@ impl<'a> Parser<'a> {
     }
 
     fn read_sequence(&mut self, len: i64) -> AppResult<Vec<Frame>> {
-        let mut items = Vec::with_capacity(usize_len(len)?);
+        self.validate_sequence_len(len, 3)?;
+        let mut items = Vec::new();
         for _ in 0..len {
             items.push(self.parse_frame()?);
         }
         Ok(items)
     }
 
+    fn validate_sequence_len(
+        &self,
+        len: i64,
+        minimum_bytes: usize,
+    ) -> AppResult<()> {
+        if usize_len(len)? > (self.bytes.len() - self.position) / minimum_bytes
+        {
+            return Err(AppError::Resp("truncated RESP aggregate".to_owned()));
+        }
+        Ok(())
+    }
+
     fn take_blob(&mut self, len: i64) -> AppResult<Vec<u8>> {
         let len = usize_len(len)?;
-        if self.bytes.len().saturating_sub(self.position) < len + 2 {
+        let available = self.bytes.len() - self.position;
+        if available < 2 || len > available - 2 {
             return Err(AppError::Resp("truncated RESP blob".to_owned()));
         }
         let blob = self.bytes[self.position..self.position + len].to_vec();
@@ -463,6 +496,107 @@ fn shell_words(line: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_invalid_lengths_without_allocating_advertised_sizes() {
+        for bytes in [
+            b"$9223372036854775807\r\n".as_slice(),
+            b"*9223372036854775807\r\n",
+            b"%9223372036854775807\r\n",
+            b"|9223372036854775807\r\n",
+            b"$-2\r\n",
+            b"*-2\r\n",
+            b"!-1\r\n",
+            b"=-1\r\n",
+            b"%-1\r\n",
+            b"~-1\r\n",
+            b">-1\r\n",
+            b"|-1\r\n",
+        ] {
+            assert!(parse_frame(bytes).is_err(), "{bytes:?}");
+            let error = read_raw_frame(&mut &bytes[..]).await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidData, "{bytes:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_fragmented_and_pipelined_frames_without_overreading() {
+        let frames: &[&[u8]] = &[
+            b"$-1\r\n",
+            b"*-1\r\n",
+            b"$0\r\n\r\n",
+            b"*0\r\n",
+            b"%1\r\n+k\r\n*2\r\n$3\r\na\0b\r\n#f\r\n",
+            b"|1\r\n+k\r\n:1\r\n",
+            b">1\r\n+message\r\n",
+            b"!3\r\nERR\r\n",
+            b"=7\r\ntxt:abc\r\n",
+            b"PING\r\n",
+        ];
+        let input = frames.concat();
+        let mut reader =
+            tokio::io::BufReader::with_capacity(1, input.as_slice());
+        for frame in frames {
+            assert_eq!(read_raw_frame(&mut reader).await.unwrap(), *frame);
+            assert_eq!(parse_frame(frame).unwrap().encode(), *frame);
+        }
+        assert_eq!(
+            read_raw_frame(&mut reader).await.unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_frames_and_invalid_terminators() {
+        for bytes in [
+            b"+OK".as_slice(),
+            b"+OK\n",
+            b"PING",
+            b"PING\n",
+            b"$3\r\nab",
+            b"$3\r\nabcxx",
+            b"*1\r\n",
+            b"%1\r\n+k\r\n",
+        ] {
+            assert!(parse_frame(bytes).is_err(), "{bytes:?}");
+            assert!(
+                read_raw_frame(&mut &bytes[..]).await.is_err(),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn enforces_nesting_limit_in_reader_and_parser() {
+        let mut allowed = b"*1\r\n".repeat(MAX_FRAME_DEPTH - 1);
+        allowed.extend_from_slice(b"_\r\n");
+        assert_eq!(parse_frame(&allowed).unwrap().encode(), allowed);
+        assert_eq!(
+            read_raw_frame(&mut allowed.as_slice()).await.unwrap(),
+            allowed
+        );
+
+        let mut too_deep = b"*1\r\n".to_vec();
+        too_deep.extend_from_slice(&allowed);
+        assert!(parse_frame(&too_deep).is_err());
+        assert_eq!(
+            read_raw_frame(&mut too_deep.as_slice())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn malformed_command_arguments_are_not_silently_removed() {
+        let frame = parse_frame(b"*3\r\n:0\r\n+DEBUG\r\n+EVIL\r\n").unwrap();
+        assert!(frame.argv_lossy().is_empty());
+        assert!(frame.command_name().is_none());
+        let frame =
+            parse_frame(b"*4\r\n+DEBUG\r\n_\r\n+EVIL\r\n+STATUS\r\n").unwrap();
+        assert!(frame.argv_lossy().is_empty());
+    }
 
     #[test]
     fn parses_nested_resp3_frame() {

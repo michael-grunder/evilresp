@@ -173,6 +173,11 @@ impl EvilConfig {
                         "DEBUG EVIL SEED requires a seed".to_owned(),
                     ));
                 };
+                if argv.len() != 4 {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL SEED does not accept options".to_owned(),
+                    ));
+                }
                 self.seed = seed.parse::<u64>().map_err(|error| {
                     AppError::EvilConfig(format!("invalid seed: {error}"))
                 })?;
@@ -199,12 +204,9 @@ impl EvilConfig {
                     });
                 }
 
-                self.mode = EvilMode::from_str(mode)?;
-                self.probability = if self.mode == EvilMode::Off {
-                    0.0
-                } else {
-                    100.0
-                };
+                let mode = EvilMode::from_str(mode)?;
+                let mut probability =
+                    if mode == EvilMode::Off { 0.0 } else { 100.0 };
 
                 if argv.len() > 4 {
                     if argv.len() != 6
@@ -215,9 +217,12 @@ impl EvilConfig {
                                 .to_owned(),
                         ));
                     }
-                    self.probability = parse_probability(&argv[5])?;
+                    probability = parse_probability(&argv[5])?;
                 }
 
+                // Commit only after every option has been validated.
+                self.mode = mode;
+                self.probability = probability;
                 Ok(DebugResult::ok())
             }
             "CANONICALIZE" => {
@@ -251,10 +256,17 @@ impl EvilConfig {
                 self.topology_probability = parse_probability(probability)?;
                 Ok(DebugResult::ok())
             }
-            "STATUS" => Ok(DebugResult {
-                frame: Frame::BulkString(Some(self.status().into_bytes())),
-                action: DebugAction::None,
-            }),
+            "STATUS" => {
+                if argv.len() != 3 {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL STATUS does not accept options".to_owned(),
+                    ));
+                }
+                Ok(DebugResult {
+                    frame: Frame::BulkString(Some(self.status().into_bytes())),
+                    action: DebugAction::None,
+                })
+            }
             "INCLUDE" => {
                 self.include = compile_filters(&argv[3..])?;
                 Ok(DebugResult::ok())
@@ -962,6 +974,54 @@ mod tests {
 
         assert_eq!(config.mode, EvilMode::Mutate);
         assert_eq!(config.probability, 12.5);
+    }
+
+    #[test]
+    fn rejected_debug_commands_preserve_configuration() {
+        let mut config = EvilConfig {
+            seed: 42,
+            mode: EvilMode::Overflow,
+            probability: 12.5,
+            topology_probability: 25.0,
+            ..EvilConfig::default()
+        };
+        let before = config.status();
+        for args in [
+            vec!["MODE", "MUTATE", "PROBABILITY", "101"],
+            vec!["MODE", "MUTATE", "PROBABILITY", "NaN"],
+            vec!["MODE", "MUTATE", "PROBABILITY", "inf"],
+            vec!["MODE", "MUTATE", "PROBABILITY", "-1"],
+            vec!["MODE", "OFF", "unexpected"],
+            vec!["MODE", "RANDOM", "PROBABILITY"],
+            vec!["SEED", "7", "unexpected"],
+            vec!["STATUS", "unexpected"],
+            vec!["INCLUDE", "GET", "["],
+            vec!["EXCLUDE", "SET", "["],
+        ] {
+            let argv = ["DEBUG", "EVIL"]
+                .into_iter()
+                .chain(args)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert!(config.apply_debug_command(&argv).is_err(), "{argv:?}");
+            assert_eq!(config.status(), before, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn seed_and_status_accept_exact_arguments() {
+        let mut config = EvilConfig::default();
+        config
+            .apply_debug_command(&strings(["DEBUG", "EVIL", "SEED", "7"]))
+            .unwrap();
+        assert_eq!(config.seed, 7);
+        let result = config
+            .apply_debug_command(&strings(["DEBUG", "EVIL", "STATUS"]))
+            .unwrap();
+        assert_eq!(
+            result.frame,
+            Frame::BulkString(Some(config.status().into_bytes()))
+        );
     }
 
     #[test]

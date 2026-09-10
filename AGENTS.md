@@ -52,6 +52,7 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `cluster_rewrite.rs`      | Rewriting `CLUSTER SLOTS`/`SHARDS`/`NODES` replies and redirections to local listeners.                                        |
 | `protocol_fingerprint.rs` | Per-connection BLAKE3/TLSH fingerprints of client-in and client-out bytes.                                                     |
 | `repro.rs`                | `--repro-file` JSONL writer and `ReproRecord` schema.                                                                         |
+| `transaction.rs`          | Tracking upstream-acknowledged transaction commands for `EXEC` reply canonicalization.                                      |
 
 Add new modules around a responsibility (parsing, model, execution, I/O,
 config), not around an incidental category. Prefer a new focused file over
@@ -64,7 +65,7 @@ them need a test proving they still hold.
 
 - **Mutations are deterministic and connection-independent.** Mutated output is
   a pure function of `(seed, command index, command bytes, canonicalized
-  upstream reply bytes)`. The RNG is `ChaCha20Rng` seeded from a BLAKE3 digest
+  upstream reply bytes)`. The RNG is `ChaCha20Rng` seeded from a SHA-256 digest
   of those inputs (`evil.rs::rng_for`). Never feed connection ids, wall-clock
   time, thread ids, or map iteration order into that path.
 - **Same input, same bytes on the wire.** There is regression coverage for
@@ -72,10 +73,10 @@ them need a test proving they still hold.
 - **Local commands never reach the upstream.** `DEBUG EVIL`, `DEBUG PROTOCOL`,
   and `MONITOR` are answered by evilresp itself.
 - **Clients can always bootstrap.** `CLUSTER SLOTS`, `CLUSTER SHARDS`, and
-  `CLUSTER NODES` bypass reply mutation and do not consume a command index.
-  The default exclude list (`AUTH`, `HELLO`, `CLIENT`, `SELECT`, `ASKING`,
-  `MULTI`, `COMMAND`, `DISCARD`, `*SUBSCRIBE`, `QUIT`) exists for the same
-  reason; extend it deliberately, not casually.
+  `CLUSTER NODES` bypass reply mutation and do not consume a command index
+  in cluster mode. The default exclude list in
+  `evil.rs::DEFAULT_EXCLUDED_COMMANDS` exists for the same reason; extend it
+  deliberately, not casually.
 - **Evil config is per client connection.** New connections start non-evil.
   Shared state is limited to what must be global (command index, reset epoch,
   monitor fan-out, repro writer).

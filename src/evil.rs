@@ -642,17 +642,18 @@ fn canonicalize_array_pairs(frame: &mut Frame) {
         canonicalize_unordered_containers(item);
     }
 
-    let mut pairs = items
-        .chunks_exact(2)
-        .map(|pair| (pair[0].clone(), pair[1].clone()))
+    let (chunks, remainder) = items.as_chunks::<2>();
+    let mut pairs = chunks
+        .iter()
+        .map(|[key, value]| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
+    let remainder = remainder.to_vec();
     pairs.sort_by(|left, right| {
         sort_key(&left.0)
             .cmp(&sort_key(&right.0))
             .then_with(|| sort_key(&left.1).cmp(&sort_key(&right.1)))
     });
 
-    let remainder = items.chunks_exact(2).remainder().to_vec();
     items.clear();
     for (key, value) in pairs {
         items.push(key);

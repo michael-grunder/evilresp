@@ -13,6 +13,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::cli::{Cli, Endpoint};
 use crate::cluster::{ClusterRedirectionMap, ProxyTarget, Topology, discover};
+use crate::cluster_rewrite::{
+    is_cluster_nodes, is_cluster_shards, rewrite_cluster_nodes,
+    rewrite_cluster_shards,
+};
 use crate::error::{AppError, AppResult};
 use crate::evil::{
     DebugAction, DebugResult, EvilConfig, EvilMode, canonicalize_reply,
@@ -287,6 +291,28 @@ async fn proxy_connection(
         {
             publish_monitor_command(&state, connection_id, &command_frame);
             write_client_frame(&mut client_write, &mut fingerprints, response)
+                .await?;
+            continue;
+        }
+
+        /* Like CLUSTER SLOTS, the other topology queries name upstream
+        nodes; they are answered by the upstream and rewritten to the
+        local listeners, outside the mutation pipeline so a client can
+        always bootstrap. */
+        if state.local_slots.is_some()
+            && (is_cluster_shards(&argv) || is_cluster_nodes(&argv))
+        {
+            publish_monitor_command(&state, connection_id, &command_frame);
+            upstream_write.write_all(&command_bytes).await?;
+            upstream_write.flush().await?;
+            let upstream_frame =
+                parse_frame(&read_raw_frame(&mut upstream_read).await?)?;
+            let response = if is_cluster_shards(&argv) {
+                rewrite_cluster_shards(&upstream_frame, &state.redirection_map)
+            } else {
+                rewrite_cluster_nodes(&upstream_frame, &state.redirection_map)
+            };
+            write_client_frame(&mut client_write, &mut fingerprints, &response)
                 .await?;
             continue;
         }
@@ -1329,6 +1355,90 @@ mod tests {
         assert_eq!(
             read_simple_error(&mut client).await,
             "MOVED 12182 127.0.0.1:6382"
+        );
+
+        drop(client);
+        upstream.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_shards_replies_are_rewritten_to_proxy_ports() {
+        let path = unique_socket_path("upstream-cluster-shards");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            assert_eq!(
+                read_raw_frame(&mut read).await.unwrap(),
+                resp_command(&["CLUSTER", "SHARDS"])
+            );
+            /* One shard, RESP3 shape: a primary with a local listener and a
+            replica without one. */
+            write
+                .write_all(
+                    b"*1\r\n%2\r\n$5\r\nslots\r\n*2\r\n:0\r\n:16383\r\n$5\r\nnodes\r\n*2\r\n\
+                      %4\r\n$2\r\nid\r\n$1\r\na\r\n$4\r\nport\r\n:7002\r\n$2\r\nip\r\n$9\r\n127.0.0.1\r\n$4\r\nrole\r\n$6\r\nmaster\r\n\
+                      %4\r\n$2\r\nid\r\n$1\r\nb\r\n$4\r\nport\r\n:7003\r\n$2\r\nip\r\n$9\r\n127.0.0.1\r\n$4\r\nrole\r\n$7\r\nreplica\r\n",
+                )
+                .await
+                .unwrap();
+            /* The command that follows must still reach the upstream: the
+            topology query consumed no command id and left the connection
+            in step. */
+            assert_eq!(
+                read_raw_frame(&mut read).await.unwrap(),
+                resp_command(&["GET", "foo"])
+            );
+            write
+                .write_all(&bulk_string("value").encode())
+                .await
+                .unwrap();
+        });
+
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(1)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: Some(cluster_slots_frame()),
+            redirection_map: ClusterRedirectionMap::from_mappings([(
+                TcpEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 7002,
+                },
+                "127.0.0.1:6382".to_owned(),
+            )]),
+        };
+        let mut client = spawn_proxy_client(target, state.clone(), 0);
+
+        client
+            .get_mut()
+            .write_all(&resp_command(&["CLUSTER", "SHARDS"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_raw_frame(&mut client).await.unwrap(),
+            b"*1\r\n%2\r\n$5\r\nslots\r\n*2\r\n:0\r\n:16383\r\n$5\r\nnodes\r\n*1\r\n\
+              %4\r\n$2\r\nid\r\n$1\r\na\r\n$4\r\nport\r\n:6382\r\n$2\r\nip\r\n$9\r\n127.0.0.1\r\n$4\r\nrole\r\n$6\r\nmaster\r\n"
+        );
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
+
+        client
+            .get_mut()
+            .write_all(&resp_command(&["GET", "foo"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_raw_frame(&mut client).await.unwrap(),
+            bulk_string("value").encode()
         );
 
         drop(client);

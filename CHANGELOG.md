@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Rewrote `CLUSTER SHARDS` and `CLUSTER NODES` replies to the local proxy
+  listeners so clients that discover the cluster with either command (Relay
+  uses `CLUSTER SHARDS`) connect back through evilresp instead of the
+  upstream nodes. Nodes without a local listener are removed from the reply.
+
 ### Changed
 
 - Scoped `DEBUG EVIL` configuration to each client connection so repeated

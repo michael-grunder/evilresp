@@ -5,6 +5,7 @@ mod connection;
 mod connection_fault;
 pub mod error;
 pub mod evil;
+mod exec_mutation;
 mod framing;
 mod generator;
 pub mod logging;

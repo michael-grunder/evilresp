@@ -10,6 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
+use crate::exec_mutation::ExecConfig;
 use crate::framing::FramingConfig;
 use crate::generator::GeneratorConfig;
 use crate::mutation;
@@ -24,6 +25,10 @@ const DEBUG_EVIL_HELP: &[&str] = &[
     "EXCLUDE [<command|regex|@attribute> ...]",
     "    Replace exclusion filters; no arguments clears the list.",
     "    Filters are case-insensitive; exclusions override inclusions.",
+    "EXEC <OFF|RANDOM|REMOVE|DUPLICATE|SWAP> [PROBABILITY <0..100>]",
+    "    Make one correctly framed outer EXEC array edit in MUTATE/OVERFLOW.",
+    "    Selected edits replace generic value/framing mutation; transport still applies.",
+    "    Probability defaults to 100, independently of value probability. OFF accepts no options.",
     "FRAMING <AUTO|OFF>",
     "    Use automatic root length faults or disable length faults.",
     "FRAMING LENGTH [PROBABILITY <0..100>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]",
@@ -216,6 +221,7 @@ pub struct EvilConfig {
     pub mutation_count: MutationCount,
     pub(crate) framing: FramingConfig,
     pub(crate) generator: GeneratorConfig,
+    pub(crate) exec: ExecConfig,
     pub(crate) transport: TransportConfig,
     include: Vec<FilterSpec>,
     exclude: Vec<FilterSpec>,
@@ -239,6 +245,7 @@ impl Default for EvilConfig {
             mutation_count: MutationCount::Many,
             framing: FramingConfig::Auto,
             generator: GeneratorConfig::default(),
+            exec: ExecConfig::default(),
             transport: TransportConfig::default(),
             include: Vec::new(),
             exclude,
@@ -329,6 +336,10 @@ impl EvilConfig {
                 // Commit only after every option has been validated.
                 self.mode = mode;
                 self.probability = probability;
+                Ok(DebugResult::ok())
+            }
+            "EXEC" => {
+                self.exec = ExecConfig::parse(&argv[3..])?;
                 Ok(DebugResult::ok())
             }
             "TRANSPORT" => {
@@ -473,7 +484,7 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {} {} {} {}",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {} {} {} {} {}",
             self.mode,
             self.seed,
             self.probability,
@@ -490,6 +501,7 @@ impl EvilConfig {
                 || "topology=LEGACY".to_owned(),
                 RedirectConfig::status,
             ),
+            self.exec.status(),
         )
     }
 }
@@ -645,6 +657,19 @@ pub struct AppliedMutation {
     pub kind: MutationKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub length: Option<LengthMutation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exec: Option<ExecMutation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExecMutation {
+    pub original_count: usize,
+    pub replacement_count: usize,
+    /// Zero-based source index in the canonicalized EXEC array.
+    pub index: usize,
+    /// Second original index for a swap; duplicates are inserted after index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_index: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -668,6 +693,9 @@ pub enum LengthCorruption {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MutationKind {
+    ExecRemove,
+    ExecDuplicate,
+    ExecSwap,
     RandomFrame,
     RandomValue,
     WrongType,
@@ -746,6 +774,7 @@ pub fn random_reply(
             path: "root".to_owned(),
             kind: MutationKind::RandomFrame,
             length: None,
+            exec: None,
         }],
     }
 }
@@ -760,6 +789,28 @@ pub fn mutate_reply(
     let mut rng =
         rng_for(config.seed, command_index, command_hash, upstream_hash);
     mutation::mutate(upstream, config, &mut rng)
+}
+
+pub(crate) fn mutate_command_reply(
+    config: &EvilConfig,
+    command_index: u64,
+    command: Option<&str>,
+    command_hash: &str,
+    upstream_hash: &str,
+    upstream: &Frame,
+) -> MutatedReply {
+    if command.is_some_and(|name| name.eq_ignore_ascii_case("EXEC"))
+        && let Some(reply) = crate::exec_mutation::mutate_reply(
+            config,
+            command_index,
+            command_hash,
+            upstream_hash,
+            upstream,
+        )
+    {
+        return reply;
+    }
+    mutate_reply(config, command_index, command_hash, upstream_hash, upstream)
 }
 
 fn canonicalize_all_containers(frame: &mut Frame) {
@@ -1175,6 +1226,7 @@ mod tests {
         for command in [
             "CANONICALIZE",
             "EXCLUDE",
+            "EXEC",
             "FRAMING",
             "GENERATOR",
             "HELP",

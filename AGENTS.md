@@ -49,6 +49,7 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `proxy.rs`                | Listener/accept loop, per-connection state, command dispatch, local `DEBUG`/`MONITOR` handling, reset epochs. Largest module. |
 | `evil.rs`                 | `EvilConfig` parsing (`DEBUG EVIL ...`), include/exclude filters, canonicalization, and deterministic mutation seeding.         |
 | `mutation.rs`             | Original-frame selection, mutation execution, frame replacement, and framing coordination. |
+| `exec_mutation.rs`        | Focused EXEC array-edit configuration, deterministic selection, and correctly framed result removal, duplication, and swapping. |
 | `generator.rs`            | Generator configuration, protocol profiles, bounded frame generation, and scalar mutation corpora. |
 | `framing.rs`              | Framing configuration, length-header selection, and corruption metadata; `resp.rs` encodes the selected header override.       |
 | `topology_evil.rs`        | Fake/altered `MOVED`/`ASK` redirections, independent of RESP mutation.                                                        |

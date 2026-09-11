@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added build-time Git SHA (eight characters), a `-dirty` suffix for
+  uncommitted changes, and the UTC build date to `-V` / `--version` output.
+
+- Added opt-in `DEBUG EVIL EXEC OFF|RANDOM|REMOVE|DUPLICATE|SWAP` with independent
+  probability for correctly framed outer transaction-array edits. A selected
+  edit replaces generic value/framing mutation in `MUTATE` and `OVERFLOW`;
+  transport faults still apply. Controls honor filters, remain per connection,
+  survive mode changes/reset, and appear in `HELP` and `STATUS`.
+- Added `exec_remove`, `exec_duplicate`, and `exec_swap` repro mutation kinds
+  with an optional `exec` object recording original/replacement counts and
+  selected original indices. Existing fields and output with focused edits
+  disabled retain their meaning and behavior.
+
 - Added `DEBUG EVIL HELP` with Redis-style subcommand syntax and descriptions,
   without changing configuration or consuming a command index.
 

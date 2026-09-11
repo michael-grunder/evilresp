@@ -118,6 +118,7 @@ fn mutate_selected(
                 path: path.to_owned(),
                 kind: mutate_one(frame, config, rng),
                 length: None,
+                exec: None,
             });
             return true;
         }
@@ -177,6 +178,7 @@ fn mutate_frame(
             path: path.to_owned(),
             kind,
             length: None,
+            exec: None,
         });
         // Do not recursively mutate a replacement's generated descendants.
         return;

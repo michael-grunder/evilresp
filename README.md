@@ -11,6 +11,14 @@ at runtime with `DEBUG EVIL` commands.
 
 Run `evilresp --help` for available options and usage examples.
 
+Run `evilresp -V` or `evilresp --version` to print the package version,
+eight-character Git SHA, and UTC build date, for example:
+`evilresp 0.1.0 (01234567-dirty 2026-09-11)`. The SHA gets a `-dirty` suffix
+when the repository has staged, unstaged, or non-ignored untracked changes
+at build time. Builds without Git metadata show `unknown` in place of the
+SHA; if the Unix `date` command is unavailable, the date is `unknown` too.
+Metadata is refreshed on every Cargo build.
+
 Build with a current stable Rust toolchain on a Unix platform:
 
 ```bash
@@ -168,6 +176,12 @@ Other mutations omit `length`. Paths identify the actual encoded target,
 for example `root.1.0.value` for the value of the first map pair inside the
 second array child. Paths refer to the canonicalized tree; in `MANY`, they
 also reflect preceding value mutation.
+Focused `EXEC` edits use `path: "root"` and kinds `exec_remove`,
+`exec_duplicate`, or `exec_swap`. Their `exec` object records `original_count`,
+`replacement_count`, and the zero-based original `index`; swaps also record
+`other_index`. Duplicates are inserted immediately after `index`. Indices
+refer to the canonicalized outer array before the edit. Other mutations omit
+`exec`; all existing repro fields retain their meaning.
 Repro-file write failures are logged and do not stop proxying.
 
 Records retain `mutated_response_bytes_hex` and its hash as the full response
@@ -244,6 +258,7 @@ DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL STRATEGY <PRESERVE|REPLACE>
 DEBUG EVIL MUTATIONS <ONE|MANY>
+DEBUG EVIL EXEC <OFF|RANDOM|REMOVE|DUPLICATE|SWAP> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLATIONS <OFF|ON>]
 DEBUG EVIL FRAMING <AUTO|OFF>
 DEBUG EVIL FRAMING LENGTH [PROBABILITY <0.00-100.00>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]
@@ -281,9 +296,13 @@ Modes:
 Selecting a mode resets its probability to `100` (`0` for `OFF`) unless an
 explicit probability is supplied. This controls value mutation; explicit
 framing probability is independent. Mode changes preserve the strategy,
-mutation count, framing, generator, and transport settings. `RANDOM` always
+mutation count, framing, generator, EXEC, and transport settings. `RANDOM` always
 generates a reply for eligible commands; its `PROBABILITY` setting currently
 has no effect.
+
+The following value and framing controls describe generic RESP mutation.
+A selected focused `EXEC` edit takes precedence over this entire stage (see
+below).
 
 `STRATEGY` controls value mutation in `MUTATE` and `OVERFLOW`:
 
@@ -362,6 +381,64 @@ and topology rewriting still precede RESP mutation, so `ONE` limits the RESP
 mutation operation count, not every possible difference from upstream bytes.
 The new mutation selection changes seeded `MUTATE` and `OVERFLOW` output
 relative to earlier versions; reproduce with the same build and settings.
+
+`DEBUG EVIL EXEC` deliberately breaks the correspondence between queued
+commands and transaction results while keeping the outer array correctly
+framed. It defaults to `OFF` and applies only to `EXEC` array replies in
+`MODE MUTATE` or `MODE OVERFLOW`, subject to the usual include/exclude filters:
+
+- `REMOVE`: remove one randomly selected result and decrement the array count.
+- `DUPLICATE`: copy one randomly selected result immediately after itself and
+  increment the array count. Nested results are copied as complete subtrees.
+- `SWAP`: exchange two unequal results without changing the count. The first
+  index is chosen uniformly, then the second uniformly among unequal results.
+- `RANDOM`: choose uniformly among the applicable operations above.
+- `OFF`: disable focused transaction edits; accepts no options.
+
+Empty arrays, null transactions, and top-level errors have no eligible edit.
+`SWAP` also skips singleton arrays and arrays whose results are all equal.
+Errors or nulls *inside* a nonempty result array can participate in an edit.
+Reordering heterogeneous replies is particularly useful for exercising
+command-specific client decoders with unexpected result types.
+
+Each command resets omitted probability to `100`. This probability is
+independent of value probability. A selected edit replaces generic value and
+framing mutation for that reply, even with `MUTATIONS MANY`, `STRATEGY REPLACE`,
+or explicit `FRAMING LENGTH`. It consumes one RESP mutation in `ONE` and
+preserves all other canonicalized result contents. If the edit is disabled,
+ineligible, or fails its probability check, the ordinary mutation pipeline
+runs unchanged. To isolate structural edits, use value probability zero and
+`FRAMING OFF`. Transport faults can still apply afterward.
+
+Selections use the existing seed, command index, command bytes, and
+canonicalized reply bytes with a separate deterministic RNG stream. They
+introduce no additional command indexes or transaction counters. The controls
+are per connection, survive mode changes and `MODE RESET`, and appear in
+`STATUS` as `exec` and `exec_probability`. Invalid commands leave configuration
+unchanged. `MODE OFF` and `MODE RANDOM` do not apply focused edits; `EXEC RANDOM`
+selects an edit of a real upstream reply, whereas `MODE RANDOM` skips forwarding
+eligible commands.
+
+For example, configure and issue a transaction on the same connection:
+
+```text
+DEBUG EVIL MODE RESET
+DEBUG EVIL SEED 1234
+DEBUG EVIL INCLUDE EXEC
+DEBUG EVIL MODE MUTATE PROBABILITY 0
+DEBUG EVIL FRAMING OFF
+DEBUG EVIL EXEC RANDOM
+MULTI
+SCARD example:set
+SMEMBERS example:set
+EXEC
+PING
+```
+
+`INCLUDE EXEC` preserves the `QUEUED` acknowledgements so the client reaches
+`EXEC`. Inspect how the client handles the mutated result, the subsequent
+`PING`, and another transaction to check reply alignment and state cleanup.
+Use `EXEC REMOVE`, `EXEC DUPLICATE`, or `EXEC SWAP` to isolate one operation.
 
 `GENERATOR` controls whole replies in `RANDOM`, replacement trees in
 `MUTATE STRATEGY REPLACE`, and scalar contents in `MUTATE`. Defaults are
@@ -691,7 +768,7 @@ options. Topology settings survive RESP mode changes and `MODE RESET`.
 to zero, resets the deterministic command index, invalidates older client
 connections, and resets the current connection's protocol fingerprints.
 It preserves the seed, filters, canonicalization setting, mutation strategy,
-mutation count setting, framing, generator and transport configuration, and
+mutation count setting, framing, generator, EXEC and transport configuration, and
 topology probability.
 To disable the independent faults too, send `DEBUG EVIL TOPOLOGY 0` and
 `DEBUG EVIL TRANSPORT OFF`.

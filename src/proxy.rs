@@ -22,7 +22,7 @@ use crate::error::{AppError, AppResult};
 use crate::evil::{
     DebugAction, DebugResult, EvilConfig, EvilMode, MutatedReply,
     canonicalize_reply, canonicalize_transaction_reply, deterministic_hash,
-    mutate_reply, random_reply,
+    mutate_command_reply, random_reply,
 };
 use crate::protocol_fingerprint::{
     ProtocolDirection, ProtocolFingerprints, parse_debug_protocol,
@@ -492,9 +492,10 @@ async fn proxy_connection(
                 // mutate_values always prepares a canonical frame above.
                 let frame =
                     canonical.as_ref().expect("canonical mutation input");
-                let mutated = mutate_reply(
+                let mutated = mutate_command_reply(
                     &config,
                     command_id,
+                    command_name.as_deref(),
                     &command_hash,
                     &seed_hash,
                     frame,
@@ -1744,6 +1745,196 @@ mod tests {
         proxy.await.unwrap().unwrap();
         upstream.await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_edits_are_reproducible_framed_filtered_and_recorded() {
+        for action in ["REMOVE", "DUPLICATE", "SWAP", "RANDOM"] {
+            let path = unique_socket_path("exec-edits");
+            let repro_path = path.with_extension("jsonl");
+            let listener = UnixListener::bind(&path).unwrap();
+            let canonical = b"*2\r\n:42\r\n*2\r\n+a\r\n+b\r\n";
+            let scrambled = b"*2\r\n:42\r\n*2\r\n+b\r\n+a\r\n";
+            let upstream = tokio::spawn(async move {
+                for reply in [canonical, scrambled] {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    for _ in 0..3 {
+                        for (command, response) in [
+                            (&["MULTI"][..], &b"+OK\r\n"[..]),
+                            (&["SCARD", "set"][..], &b"+QUEUED\r\n"[..]),
+                            (&["SMEMBERS", "set"][..], &b"+QUEUED\r\n"[..]),
+                            (&["EXEC"][..], reply.as_slice()),
+                            (&["PING"][..], &b"+PONG\r\n"[..]),
+                        ] {
+                            // In particular, local EXEC configuration never
+                            // reaches the upstream or shifts this sequence.
+                            assert_eq!(
+                                read_raw_frame(&mut stream).await.unwrap(),
+                                resp_command(command)
+                            );
+                            stream.get_mut().write_all(response).await.unwrap();
+                        }
+                    }
+                }
+            });
+            let mut outputs = Vec::new();
+            for (connection_id, original) in [(7, canonical), (99, scrambled)] {
+                let state = transport_test_state(
+                    ReproWriter::open(&repro_path).await.unwrap(),
+                );
+                state.command_ids.store(123, Ordering::SeqCst);
+                let ids = state.command_ids.clone();
+                let (client, server) = UnixStream::pair().unwrap();
+                let proxy = tokio::spawn(proxy_connection(
+                    Box::new(server),
+                    ProxyTarget {
+                        upstream: Endpoint::Unix(path.clone()),
+                        listen: Endpoint::Unix(unique_socket_path("unused")),
+                    },
+                    state,
+                    connection_id,
+                    0,
+                ));
+                let mut client = BufReader::new(client);
+                client
+                    .get_mut()
+                    .write_all(&resp_command(&["DEBUG", "EVIL", "STATUS"]))
+                    .await
+                    .unwrap();
+                let status = read_raw_frame(&mut client).await.unwrap();
+                assert!(
+                    String::from_utf8(status).unwrap().contains("exec=OFF")
+                );
+                for args in [
+                    &["DEBUG", "EVIL", "EXEC", action][..],
+                    &["DEBUG", "EVIL", "MODE", "RESET"][..],
+                    &["DEBUG", "EVIL", "SEED", "1234"][..],
+                    &["DEBUG", "EVIL", "MODE", "MUTATE", "PROBABILITY", "0"][..],
+                    &["DEBUG", "EVIL", "INCLUDE", "EXEC"][..],
+                    &["DEBUG", "EVIL", "TRANSPORT", "EXTRA", "1"][..],
+                ] {
+                    transport_setup(&mut client, args).await;
+                }
+                assert_eq!(ids.load(Ordering::SeqCst), 0);
+                for transaction in 0..3 {
+                    if transaction == 1 {
+                        transport_setup(
+                            &mut client,
+                            &["DEBUG", "EVIL", "EXCLUDE", "EXEC"],
+                        )
+                        .await;
+                    } else if transaction == 2 {
+                        transport_setup(
+                            &mut client,
+                            &["DEBUG", "EVIL", "EXCLUDE"],
+                        )
+                        .await;
+                        transport_setup(
+                            &mut client,
+                            &["DEBUG", "EVIL", "MODE", "OFF"],
+                        )
+                        .await;
+                    }
+                    let commands = [
+                        resp_command(&["MULTI"]),
+                        resp_command(&["SCARD", "set"]),
+                        resp_command(&["SMEMBERS", "set"]),
+                        resp_command(&["EXEC"]),
+                        resp_command(&["PING"]),
+                    ]
+                    .concat();
+                    client.get_mut().write_all(&commands).await.unwrap();
+                    for expected in
+                        [b"+OK\r\n".as_slice(), b"+QUEUED\r\n", b"+QUEUED\r\n"]
+                    {
+                        assert_eq!(
+                            read_raw_frame(&mut client).await.unwrap(),
+                            expected
+                        );
+                    }
+                    let reply = read_raw_frame(&mut client).await.unwrap();
+                    if transaction == 0 {
+                        assert_ne!(reply, canonical);
+                        let allowed: &[&[u8]] = match action {
+                            "REMOVE" => &[b"*1\r\n:42\r\n", b"*1\r\n*2\r\n+a\r\n+b\r\n"],
+                            "DUPLICATE" => &[b"*3\r\n:42\r\n:42\r\n*2\r\n+a\r\n+b\r\n", b"*3\r\n:42\r\n*2\r\n+a\r\n+b\r\n*2\r\n+a\r\n+b\r\n"],
+                            "SWAP" => &[b"*2\r\n*2\r\n+a\r\n+b\r\n:42\r\n"],
+                            _ => &[b"*1\r\n:42\r\n", b"*1\r\n*2\r\n+a\r\n+b\r\n", b"*3\r\n:42\r\n:42\r\n*2\r\n+a\r\n+b\r\n", b"*3\r\n:42\r\n*2\r\n+a\r\n+b\r\n*2\r\n+a\r\n+b\r\n", b"*2\r\n*2\r\n+a\r\n+b\r\n:42\r\n"],
+                        };
+                        assert!(
+                            allowed.contains(&reply.as_slice()),
+                            "{action}: {reply:?}"
+                        );
+                        outputs.push(reply);
+                        assert_eq!(
+                            read_raw_frame(&mut client).await.unwrap(),
+                            b"+EVILRESP\r\n"
+                        );
+                    } else {
+                        assert_eq!(reply, original);
+                    }
+                    assert_eq!(
+                        read_raw_frame(&mut client).await.unwrap(),
+                        b"+PONG\r\n"
+                    );
+                    if transaction == 0 {
+                        transport_setup(
+                            &mut client,
+                            &["DEBUG", "EVIL", "TRANSPORT", "OFF"],
+                        )
+                        .await;
+                    }
+                }
+                assert_eq!(ids.load(Ordering::SeqCst), 15);
+                drop(client);
+                proxy.await.unwrap().unwrap();
+            }
+            upstream.await.unwrap();
+            assert_eq!(outputs[0], outputs[1], "{action}");
+            let records = std::fs::read_to_string(&repro_path)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0]["mutations"], records[1]["mutations"]);
+            assert_eq!(
+                records[0]["delivery_plan"],
+                records[1]["delivery_plan"]
+            );
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(record["command_index"], 3);
+                assert_eq!(
+                    record["connection_id"],
+                    if index == 0 { 7 } else { 99 }
+                );
+                assert_eq!(record["mutations"].as_array().unwrap().len(), 1);
+                assert_eq!(record["mutations"][0]["exec"]["original_count"], 2);
+                assert_eq!(
+                    record["mutated_response_bytes_hex"],
+                    hex::encode(&outputs[index])
+                );
+                assert_eq!(
+                    record["upstream_response_bytes_hex"],
+                    hex::encode(if index == 0 { canonical } else { scrambled })
+                );
+                let wire =
+                    [outputs[index].as_slice(), b"+EVILRESP\r\n"].concat();
+                assert_eq!(
+                    record["planned_wire_bytes_hex"],
+                    hex::encode(&wire)
+                );
+                assert_eq!(
+                    record["delivery_outcome"]["bytes_written"],
+                    wire.len()
+                );
+            }
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(repro_path).unwrap();
+        }
     }
 
     fn transport_test_state(repro: ReproWriter) -> SharedState {

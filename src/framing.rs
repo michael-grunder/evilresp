@@ -241,6 +241,7 @@ pub(crate) fn mutate_length(
         mutations: vec![AppliedMutation {
             path: header.path,
             kind: MutationKind::WrongLength,
+            exec: None,
             length: Some(LengthMutation {
                 kind,
                 original: header.original.to_string(),

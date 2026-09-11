@@ -75,6 +75,7 @@ pub fn maybe_mutate_topology(
                     path: "topology".to_owned(),
                     kind: MutationKind::TopologyFakeRedirection,
                     length: None,
+                    exec: None,
                 }],
             )
         }
@@ -201,6 +202,7 @@ pub(crate) fn configured_redirection(
                 RedirectPhase::After => MutationKind::TopologyRedirectAfter,
             },
             length: None,
+            exec: None,
         }],
     })
 }
@@ -374,6 +376,7 @@ fn apply_redirection_mutations(
             path: "topology.kind".to_owned(),
             kind: MutationKind::TopologyWrongRedirectionKind,
             length: None,
+            exec: None,
         });
     }
 
@@ -383,6 +386,7 @@ fn apply_redirection_mutations(
             path: "topology.slot".to_owned(),
             kind: MutationKind::TopologyWrongSlot,
             length: None,
+            exec: None,
         });
     }
 
@@ -394,6 +398,7 @@ fn apply_redirection_mutations(
             path: "topology.server".to_owned(),
             kind: MutationKind::TopologyWrongServer,
             length: None,
+            exec: None,
         });
     }
 
@@ -403,6 +408,7 @@ fn apply_redirection_mutations(
             path: "topology.slot".to_owned(),
             kind: MutationKind::TopologyWildSlot,
             length: None,
+            exec: None,
         });
     }
 }

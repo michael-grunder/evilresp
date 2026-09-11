@@ -14,7 +14,7 @@ pub enum LogMode {
 #[derive(Debug, Parser)]
 #[command(
     author,
-    version,
+    version = env!("EVILRESP_VERSION"),
     about,
     after_help = "\
 Examples:
@@ -160,6 +160,22 @@ fn parse_port(value: &str) -> Result<u16, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod build_metadata {
+        include!("../build.rs");
+    }
+
+    #[test]
+    fn version_flags_print_build_metadata_without_proxy() {
+        for flag in ["-V", "--version"] {
+            let error = Cli::try_parse_from(["evilresp", flag]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(
+                error.to_string(),
+                format!("evilresp {}\n", env!("EVILRESP_VERSION"))
+            );
+        }
+    }
 
     #[test]
     fn parses_tcp_endpoint() {

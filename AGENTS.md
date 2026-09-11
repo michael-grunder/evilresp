@@ -9,7 +9,8 @@ fix this file in the same change.
 `evilresp` is an intentionally hostile RESP proxy for deterministically fuzzing
 Redis, Valkey, and DragonflyDB clients (PhpRedis, hiredis, redis-py, ...). It
 sits between a client and a real upstream server, proxies commands unchanged by
-default, and mutates replies or cluster topology on demand via `DEBUG EVIL`.
+default, and mutates replies or cluster topology on demand via `DEBUG EVIL`
+or the `DEBUG CHAOS` temperature preset.
 
 - Rust 2024 edition, async on `tokio`, CLI via `clap`, logging via `tracing`.
 - `README.md` is the source of truth for user-facing behavior and command
@@ -48,6 +49,7 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `resp.rs`                 | RESP2/RESP3 `Frame` type, parsing, encoding, raw frame reads off a stream.                                                    |
 | `proxy.rs`                | Listener/accept loop, per-connection state, command dispatch, local `DEBUG`/`MONITOR` handling, reset epochs. Largest module. |
 | `evil.rs`                 | `EvilConfig` parsing (`DEBUG EVIL ...`), include/exclude filters, canonicalization, and deterministic mutation seeding.         |
+| `chaos.rs`                | Validated `DEBUG CHAOS` temperature expansion into existing evil settings, with no additional RNG or persistent mode. |
 | `mutation.rs`             | Original-frame selection, mutation execution, frame replacement, and framing coordination. |
 | `exec_mutation.rs`        | Focused EXEC array-edit configuration, deterministic selection, and correctly framed result removal, duplication, and swapping. |
 | `generator.rs`            | Generator configuration, protocol profiles, bounded frame generation, and scalar mutation corpora. |
@@ -81,8 +83,8 @@ them need a test proving they still hold.
   listener as explicit inputs, never connection identity or hidden retry state.
 - **Same input, same bytes on the wire.** There is regression coverage for
   identical evil sessions producing identical protocol output; keep it green.
-- **Local commands never reach the upstream.** `DEBUG EVIL`, `DEBUG PROTOCOL`,
-  and `MONITOR` are answered by evilresp itself.
+- **Local commands never reach the upstream.** `DEBUG EVIL`, `DEBUG CHAOS`,
+  `DEBUG PROTOCOL`, and `MONITOR` are answered by evilresp itself.
 - **Clients can always bootstrap.** `CLUSTER SLOTS`, `CLUSTER SHARDS`, and
   `CLUSTER NODES` bypass reply mutation and do not consume a command index
   in cluster mode. The default exclude list in

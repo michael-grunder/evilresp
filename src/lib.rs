@@ -1,3 +1,4 @@
+mod chaos;
 pub mod cli;
 pub mod cluster;
 pub mod cluster_rewrite;

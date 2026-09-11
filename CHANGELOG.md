@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `DEBUG CHAOS <0..100> [SEED <u64>] [HASH <BLAKE3|TLSH>]`, a per-connection
+  temperature preset spanning value, EXEC, framing, topology, and transport
+  faults. It preserves the existing seed unless supplied, plus filters,
+  canonicalization and generator protocol. Zero disables all faults. Returns
+  the current output fingerprint (BLAKE3 by default), excluding its own traffic
+  from fingerprints and consuming no command index. Presets expand into the
+  existing settings shown by `DEBUG EVIL STATUS` and remain individually tunable.
+  Configuration update/rejection totals now include `DEBUG CHAOS`.
+
 - Added build-time Git SHA (eight characters), a `-dirty` suffix for
   uncommitted changes, and the UTC build date to `-V` / `--version` output.
 

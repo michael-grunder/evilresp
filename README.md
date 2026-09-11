@@ -5,7 +5,7 @@ Redis, Valkey, and DragonflyDB clients.
 
 By default it behaves like a normal RESP server: commands are proxied to a real
 upstream server and replies are returned unchanged. Evil behavior is configured
-at runtime with `DEBUG EVIL` commands.
+at runtime with `DEBUG EVIL` commands or the `DEBUG CHAOS` temperature preset.
 
 ## Running
 
@@ -112,14 +112,15 @@ every second, combining all listeners (including cluster nodes). Fields are:
 - `clients_total`: client connections accepted since startup, including those
   whose upstream connection fails; `clients_active`: connections still handled
   by the proxy, including monitor clients.
-- `evil_updates`: successful `DEBUG EVIL` configuration commands, including
+- `evil_updates`: successful `DEBUG EVIL` and `DEBUG CHAOS` configuration commands, including
   repeated settings and `MODE RESET`, excluding `STATUS` and `HELP` reads.
 - `evil_status_reads`, `evil_rejected`, and `evil_resets`: successful status
-  reads, rejected `DEBUG EVIL` commands, and successful reset commands.
+  reads, rejected `DEBUG EVIL`/`DEBUG CHAOS` commands, and successful reset commands.
 - `mode_off`, `mode_random`, `mode_mutate`, and `mode_overflow`: successful
   explicit selections of each mode. Resets are counted separately, and new
   clients starting in `OFF` do not count as mode selections. These count
   configuration commands, not mutated replies or clients currently in a mode.
+  `DEBUG CHAOS` presets do not count as explicit mode selections.
 
 All totals accumulate for the process lifetime and survive `MODE RESET`;
 `clients_active` is a current count. Concurrent updates can make fields reflect
@@ -244,6 +245,74 @@ Local commands and cluster-mode topology queries do not consume indexes.
 Concurrent clients can interleave differently between runs; serialize their
 commands when reproducing a failure. RESP mutation uses ChaCha20 seeded from
 SHA-256 of the seed, command index, command hash, and canonicalized reply hash.
+
+## DEBUG CHAOS
+
+Use one temperature to configure a mix of deterministic faults on the current
+connection:
+
+```text
+DEBUG CHAOS <0..100> [SEED <seed>] [HASH <BLAKE3|TLSH>]
+```
+
+Temperature accepts finite fractional values. A higher value raises configured
+probabilities and enables more disruptive fault families. The preset expands
+into the existing `DEBUG EVIL` controls; inspect them with `DEBUG EVIL STATUS`
+and refine individual controls afterward. Sending `DEBUG CHAOS` again replaces
+the previous fault settings, including manually configured topology targets,
+EXEC edits, framing and transport faults. It preserves include/exclude filters,
+canonicalization, and the generator protocol, and sets the corpus to `BOUNDARY`.
+
+For temperature `t`, the expansion is:
+
+| Temperature | Settings |
+| --- | --- |
+| `0` | Mode `OFF`; value probability zero; framing, EXEC, topology, transport, and generator violations disabled. |
+| `0 < t <= 25` | Mode `MUTATE`, probability `t`%, strategy `PRESERVE`, mutations `ONE`; other faults disabled. |
+| `25 < t <= 50` | Mutations `MANY`; focused `EXEC RANDOM` probability `(t - 25) / 3`%. |
+| `50 < t <= 75` | Also strategy `REPLACE`, `FRAMING LENGTH TARGET ANY KIND RANDOM` probability `2 * (t - 50)`%, and legacy topology probability `(t - 50) / 2`%. |
+| `75 < t <= 100` | Also generator `VIOLATIONS ON`, and transport `TRUNCATE RANDOM CHUNKS RANDOM` probability `t - 75`%. |
+
+Each nonzero band builds on the preceding band, with value probability `t`%.
+All faults retain their existing eligibility and precedence rules: focused
+EXEC edits replace generic RESP mutation when selected, topology operates only
+in cluster mode, and filters and cluster bootstrap bypasses still apply.
+Temperature is not an overall per-reply probability or a guarantee that every
+individual reply gets worse as it rises. Even low temperatures can change
+values to extremes; high temperatures can break framing or close the connection.
+The preset never enables stalls, TCP resets, or external redirect targets.
+
+`SEED` accepts an unsigned 64-bit integer. Omit it to retain the connection's
+current seed (including a prior `DEBUG EVIL SEED`; initially `0`). The command
+does not reset command indexes, invalidate other connections, or reset hashes.
+Repeat with the same build, temperature, preserved settings, seed, command
+indexes/order, upstream data, and mapped topology for identical output. Use
+`DEBUG EVIL MODE RESET` before configuring a repeat run when indexes must
+start over. New connections still start with faults disabled.
+
+The reply is a bulk string containing the **current output protocol
+fingerprint**, before this command. `HASH` defaults to `BLAKE3` on each call;
+choose `TLSH` for the similarity hash (`TNULL` until enough varied output has
+accumulated). This is the same value as `DEBUG PROTOCOL OUT <hash>`, not a hash
+of the configuration or a prediction of future output. Successful and rejected
+`DEBUG CHAOS` requests and replies are excluded from both protocol fingerprints.
+The command is local and consumes no command index. Options are case-insensitive,
+may appear in either order, and must not repeat; invalid input leaves all
+configuration unchanged.
+
+For example, on one persistent connection:
+
+```text
+DEBUG EVIL MODE RESET
+DEBUG CHAOS 20 SEED 1234
+GET example
+DEBUG PROTOCOL OUT BLAKE3
+DEBUG CHAOS 0 HASH TLSH
+```
+
+The final command returns the accumulated output TLSH and disables all faults
+on that connection. After a hot preset closes the connection, use repro records
+to inspect delivery; that connection's fingerprint can no longer be queried.
 
 ## DEBUG EVIL
 

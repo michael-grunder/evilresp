@@ -11,6 +11,7 @@ use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+use crate::chaos;
 use crate::cli::{Cli, Endpoint};
 use crate::cluster::{ClusterRedirectionMap, ProxyTarget, Topology, discover};
 use crate::cluster_rewrite::{
@@ -253,6 +254,20 @@ async fn proxy_connection(
 
         if is_debug_protocol(&argv) {
             let response = apply_debug_protocol(&fingerprints, &argv);
+            client_write.write_all(&response.encode()).await?;
+            continue;
+        }
+
+        if is_debug_chaos(&argv) {
+            publish_monitor_command(&state, connection_id, &command_frame);
+            let response = apply_debug_chaos(
+                &mut config,
+                &fingerprints,
+                &argv,
+                &state.stats,
+            );
+            // Like DEBUG PROTOCOL, exclude the request and reply from both
+            // fingerprints, including rejected requests.
             client_write.write_all(&response.encode()).await?;
             continue;
         }
@@ -645,6 +660,28 @@ fn apply_debug_evil(
     }
 }
 
+fn apply_debug_chaos(
+    config: &mut EvilConfig,
+    fingerprints: &ProtocolFingerprints,
+    argv: &[String],
+    stats: &Stats,
+) -> Frame {
+    match chaos::apply(config, argv) {
+        Ok(hash) => {
+            stats.configuration_updated();
+            debug!(status = %config.status(), "updated chaos configuration");
+            Frame::BulkString(Some(
+                fingerprints.get(ProtocolDirection::Out, hash).into_bytes(),
+            ))
+        }
+        Err(error) => {
+            stats.command_rejected();
+            warn!(%error, "rejected DEBUG CHAOS command");
+            Frame::SimpleError(format!("ERR {error}"))
+        }
+    }
+}
+
 fn apply_debug_protocol(
     fingerprints: &ProtocolFingerprints,
     argv: &[String],
@@ -772,6 +809,12 @@ fn is_debug_evil(argv: &[String]) -> bool {
     argv.len() >= 2
         && argv[0].eq_ignore_ascii_case("DEBUG")
         && argv[1].eq_ignore_ascii_case("EVIL")
+}
+
+fn is_debug_chaos(argv: &[String]) -> bool {
+    argv.len() >= 2
+        && argv[0].eq_ignore_ascii_case("DEBUG")
+        && argv[1].eq_ignore_ascii_case("CHAOS")
 }
 
 fn is_debug_protocol(argv: &[String]) -> bool {
@@ -1279,6 +1322,184 @@ mod tests {
         upstream.abort();
         let _ = upstream.await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn chaos_returns_selected_output_hash_without_hashing_local_traffic()
+    {
+        let command = b"*1\r\n$4\r\nPING\r\n";
+        let response = b"+PONG\r\n";
+        let mut client =
+            run_proxy_client_with_single_upstream_response(command, response)
+                .await;
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), response);
+        for args in [
+            vec!["debug", "chaos", "100", "hash", "tlsh", "seed", "42"],
+            vec!["DEBUG", "CHAOS", "0"],
+            vec!["DEBUG", "CHAOS", "0", "HASH", "BLAKE3"],
+        ] {
+            client
+                .get_mut()
+                .write_all(&resp_command(&args))
+                .await
+                .unwrap();
+            let expected = if args.contains(&"tlsh") {
+                b"TNULL".to_vec()
+            } else {
+                blake3_hex(response).into_bytes()
+            };
+            assert_eq!(read_bulk_string(&mut client).await, expected);
+        }
+        client
+            .get_mut()
+            .write_all(&resp_command(&[
+                "DEBUG", "CHAOS", "75", "SEED", "9", "HASH", "invalid",
+            ]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            parse_frame(&read_raw_frame(&mut client).await.unwrap()).unwrap(),
+            Frame::SimpleError(_)
+        ));
+        for (direction, bytes) in
+            [("IN", command.as_slice()), ("OUT", response.as_slice())]
+        {
+            client
+                .get_mut()
+                .write_all(&resp_command(&[
+                    "DEBUG", "PROTOCOL", direction, "BLAKE3",
+                ]))
+                .await
+                .unwrap();
+            assert_eq!(
+                read_bulk_string(&mut client).await,
+                blake3_hex(bytes).into_bytes()
+            );
+        }
+        client
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "STATUS"]))
+            .await
+            .unwrap();
+        let status =
+            String::from_utf8(read_bulk_string(&mut client).await).unwrap();
+        assert!(status.contains("mode=OFF seed=42 probability=0.00"));
+    }
+
+    #[tokio::test]
+    async fn chaos_sessions_are_local_and_produce_identical_wire_bytes() {
+        use tokio::io::AsyncReadExt;
+
+        let path = unique_socket_path("chaos-determinism");
+        let repro_path = path.with_extension("jsonl");
+        let listener = UnixListener::bind(&path).unwrap();
+        let command = resp_command(&["GET", "example"]);
+        let expected_command = command.clone();
+        let response = b"$3\r\nfoo\r\n";
+        let upstream = tokio::spawn(async move {
+            for _ in 0..10 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    expected_command
+                );
+                stream.get_mut().write_all(response).await.unwrap();
+                assert_eq!(
+                    stream.read_u8().await.unwrap_err().kind(),
+                    ErrorKind::UnexpectedEof
+                );
+            }
+        });
+        let mut state =
+            transport_test_state(ReproWriter::open(&repro_path).await.unwrap());
+        let slots = cluster_slots_frame();
+        state.local_slots = Some(slots.clone());
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused")),
+        };
+        for temperature in ["0", "25", "50", "75", "100"] {
+            let mut outputs = Vec::new();
+            for connection_id in [7, 99] {
+                let (client, server) = UnixStream::pair().unwrap();
+                let proxy = tokio::spawn(proxy_connection(
+                    Box::new(server),
+                    target.clone(),
+                    state.clone(),
+                    connection_id,
+                    state.reset_epoch.load(Ordering::SeqCst),
+                ));
+                let mut client = BufReader::new(client);
+                client
+                    .get_mut()
+                    .write_all(&resp_command(&["DEBUG", "EVIL", "STATUS"]))
+                    .await
+                    .unwrap();
+                let status =
+                    String::from_utf8(read_bulk_string(&mut client).await)
+                        .unwrap();
+                assert!(status.contains("mode=OFF seed=0 probability=0.00"));
+                assert!(status.contains("transport=OFF"));
+                if connection_id == 99 {
+                    transport_setup(
+                        &mut client,
+                        &["DEBUG", "EVIL", "SEED", "42"],
+                    )
+                    .await;
+                }
+                transport_setup(
+                    &mut client,
+                    &["DEBUG", "EVIL", "MODE", "RESET"],
+                )
+                .await;
+                let mut args = vec!["DEBUG", "CHAOS", temperature];
+                if connection_id == 7 {
+                    args.extend(["SEED", "42"]);
+                }
+                client
+                    .get_mut()
+                    .write_all(&resp_command(&args))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_bulk_string(&mut client).await,
+                    blake3_hex(b"").into_bytes()
+                );
+                client
+                    .get_mut()
+                    .write_all(&resp_command(&["CLUSTER", "SLOTS"]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_raw_frame(&mut client).await.unwrap(),
+                    slots.encode()
+                );
+                assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
+                client.get_mut().write_all(&command).await.unwrap();
+                client.get_mut().shutdown().await.unwrap();
+                let mut wire = Vec::new();
+                client.read_to_end(&mut wire).await.unwrap();
+                proxy.await.unwrap().unwrap();
+                assert_eq!(state.command_ids.load(Ordering::SeqCst), 1);
+                outputs.push(wire);
+            }
+            assert_eq!(outputs[0], outputs[1], "temperature={temperature}");
+            if temperature == "0" {
+                assert_eq!(outputs[0], response);
+            }
+        }
+        upstream.await.unwrap();
+        drop(state);
+        let records = std::fs::read_to_string(&repro_path).unwrap();
+        assert!(!records.is_empty());
+        for line in records.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(record["global_seed"], 42);
+            assert_eq!(record["command_index"], 0);
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(repro_path).unwrap();
     }
 
     #[tokio::test]

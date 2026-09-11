@@ -80,6 +80,9 @@ const DEBUG_EVIL_HELP: &[&str] = &[
     "    AT selects before forwarding, before reply bytes, after the full reply, or an offset.",
     "    DURATION is stall milliseconds (default 10000); only FAULT STALL delays.",
     "    FAULT and TRUNCATE cannot both be enabled. RESET requires a TCP client.",
+    "Related command: DEBUG CHAOS <0..100> [SEED <u64>] [HASH <BLAKE3|TLSH>]",
+    "    Expand temperature into fault settings; zero disables all faults.",
+    "    Return the current output fingerprint (default BLAKE3). Inspect settings with STATUS.",
 ];
 
 pub const DEFAULT_EXCLUDED_COMMANDS: &[&str] = &[

@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `DEBUG EVIL GENERATOR` with per-connection `PROTOCOL RESP2|RESP3`,
+  `CORPUS BOUNDARY|RANDOM`, and `VIOLATIONS OFF|ON` controls, reported by
+  `STATUS` and preserved by mode changes and reset. Partial updates retain
+  omitted options; invalid or duplicate options leave configuration unchanged.
+- Expanded generated replies and scalar mutations with numeric extremes,
+  binary payloads through 4097 bytes, empty/singleton aggregates, RESP2 null
+  forms, and all ordinary RESP3 types. Deliberate malformed numeric/verbatim
+  contents and standalone push/attribute frames require violations opt-in.
+
 - Added `DEBUG EVIL FRAMING <AUTO|OFF|LENGTH>` with independent probability,
   root or nested target paths, and shorter, longer, negative, boundary, and
   overflow length faults. Framing-only mutation works at value probability
@@ -53,6 +62,16 @@ All notable changes to this project will be documented in this file.
   replies, and optional repro JSONL output.
 
 ### Changed
+
+- Defaulted generation to RESP2 with a weighted boundary corpus and
+  violations disabled. Generated trees stay within the selected protocol
+  unless violations are enabled; protocol selection does not translate
+  upstream replies. Generated subtrees are limited to three levels, four
+  elements or pairs per aggregate, and 4097 bytes per blob payload.
+- Kept mutated doubles, big numbers, and verbatim formats valid by default,
+  including overflow mutations. Length faults remain independently controlled
+  by `FRAMING`. The expanded generator changes seeded `RANDOM`, `MUTATE`,
+  and `OVERFLOW` output; reproduce with the same build and settings.
 
 - Encoded selected length faults directly from the typed frame tree, keeping
   actual bodies and other headers intact without allocating advertised sizes.

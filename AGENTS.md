@@ -47,7 +47,8 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `resp.rs`                 | RESP2/RESP3 `Frame` type, parsing, encoding, raw frame reads off a stream.                                                    |
 | `proxy.rs`                | Listener/accept loop, per-connection state, command dispatch, local `DEBUG`/`MONITOR` handling, reset epochs. Largest module. |
 | `evil.rs`                 | `EvilConfig` parsing (`DEBUG EVIL ...`), include/exclude filters, canonicalization, and deterministic mutation seeding.         |
-| `mutation.rs`             | Original-frame selection, structure-preserving scalar mutation, frame replacement, random generation, and framing coordination. |
+| `mutation.rs`             | Original-frame selection, mutation execution, frame replacement, and framing coordination. |
+| `generator.rs`            | Generator configuration, protocol profiles, bounded frame generation, and scalar mutation corpora. |
 | `framing.rs`              | Framing configuration, length-header selection, and corruption metadata; `resp.rs` encodes the selected header override.       |
 | `topology_evil.rs`        | Fake/altered `MOVED`/`ASK` redirections, independent of RESP mutation.                                                        |
 | `cluster.rs`              | Startup `CLUSTER SLOTS` probe, `Topology`, mapping upstream nodes to local listeners.                                          |

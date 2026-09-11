@@ -226,142 +226,41 @@ fn mutate_one(
     rng: &mut ChaCha20Rng,
 ) -> MutationKind {
     if config.mode == EvilMode::Overflow {
-        apply_overflow(frame, rng);
+        if matches!(
+            frame,
+            Frame::Integer(_)
+                | Frame::SimpleString(_)
+                | Frame::SimpleError(_)
+                | Frame::Double(_)
+                | Frame::BigNumber(_)
+                | Frame::BulkString(Some(_))
+                | Frame::BulkError(_)
+                | Frame::VerbatimString(_)
+        ) {
+            config.generator.mutate_scalar(frame, rng, true);
+        } else {
+            *frame = Frame::Integer(i64::MAX);
+        }
         return MutationKind::OverflowValue;
     }
 
     match config.strategy {
         MutationStrategy::Preserve => {
-            apply_random_value(frame, rng);
+            config.generator.mutate_scalar(frame, rng, false);
             MutationKind::RandomValue
         }
         MutationStrategy::Replace => {
-            let replacement = random_frame(rng, 0);
+            let replacement = config.generator.frame(rng);
             *frame = if *frame != replacement {
                 replacement
-            } else if matches!(frame, Frame::Null) {
-                Frame::Integer(0)
+            } else if matches!(frame, Frame::Integer(0)) {
+                Frame::Integer(1)
             } else {
-                Frame::Null
+                Frame::Integer(0)
             };
             MutationKind::RandomFrame
         }
     }
-}
-
-fn apply_random_value(frame: &mut Frame, rng: &mut ChaCha20Rng) {
-    match frame {
-        Frame::SimpleString(value)
-        | Frame::SimpleError(value)
-        | Frame::Double(value)
-        | Frame::BigNumber(value) => {
-            let mut replacement = random_ascii(rng, 24);
-            if replacement == *value {
-                replacement.push('!');
-            }
-            *value = replacement;
-        }
-        Frame::Integer(value) => {
-            let replacement = rng.r#gen();
-            *value = if replacement == *value {
-                value.wrapping_add(1)
-            } else {
-                replacement
-            };
-        }
-        Frame::BulkString(Some(bytes))
-        | Frame::BulkError(bytes)
-        | Frame::VerbatimString(bytes) => {
-            let mut replacement = random_bytes(rng, 32);
-            if replacement == *bytes {
-                replacement.push(0);
-            }
-            *bytes = replacement;
-        }
-        Frame::Boolean(value) => *value = !*value,
-        Frame::Inline(parts) => {
-            let mut replacement =
-                vec![random_bytes(rng, 8), random_bytes(rng, 8)];
-            if replacement == *parts {
-                replacement.push(vec![0]);
-            }
-            *parts = replacement;
-        }
-        Frame::Array(_)
-        | Frame::BulkString(None)
-        | Frame::Null
-        | Frame::Map(_)
-        | Frame::Set(_)
-        | Frame::Push(_)
-        | Frame::Attribute(_) => {}
-    }
-}
-
-fn apply_overflow(frame: &mut Frame, rng: &mut ChaCha20Rng) {
-    match frame {
-        Frame::Integer(value) => {
-            let replacement = if rng.r#gen() { i64::MAX } else { i64::MIN };
-            *value = if replacement == *value {
-                !replacement
-            } else {
-                replacement
-            };
-        }
-        Frame::SimpleString(value)
-        | Frame::SimpleError(value)
-        | Frame::Double(value)
-        | Frame::BigNumber(value) => {
-            *value = overflow_text(value.as_bytes(), rng);
-        }
-        Frame::BulkString(Some(bytes))
-        | Frame::BulkError(bytes)
-        | Frame::VerbatimString(bytes) => {
-            *bytes = overflow_text(bytes, rng).into_bytes();
-        }
-        _ => *frame = Frame::Integer(i64::MAX),
-    }
-}
-
-fn overflow_text(current: &[u8], rng: &mut ChaCha20Rng) -> String {
-    let values = [i64::MAX.to_string(), u64::MAX.to_string()];
-    let index = usize::from(rng.r#gen::<bool>());
-    if values[index].as_bytes() == current {
-        values[1 - index].clone()
-    } else {
-        values[index].clone()
-    }
-}
-
-pub(crate) fn random_frame(rng: &mut ChaCha20Rng, depth: u8) -> Frame {
-    let max_kind = if depth >= 2 { 6 } else { 8 };
-    match rng.gen_range(0..max_kind) {
-        0 => Frame::SimpleString(random_ascii(rng, 20)),
-        1 => Frame::SimpleError(random_ascii(rng, 20)),
-        2 => Frame::Integer(rng.r#gen()),
-        3 => Frame::BulkString(Some(random_bytes(rng, 32))),
-        4 => Frame::Null,
-        5 => Frame::Boolean(rng.r#gen()),
-        6 => Frame::Array(Some(vec![
-            random_frame(rng, depth + 1),
-            random_frame(rng, depth + 1),
-        ])),
-        _ => Frame::Map(vec![(
-            random_frame(rng, depth + 1),
-            random_frame(rng, depth + 1),
-        )]),
-    }
-}
-
-fn random_ascii(rng: &mut ChaCha20Rng, max_len: usize) -> String {
-    let len = rng.gen_range(0..=max_len);
-    (0..len)
-        .map(|_| char::from(rng.gen_range(0x21_u8..=0x7e_u8)))
-        .collect()
-}
-
-fn random_bytes(rng: &mut ChaCha20Rng, max_len: usize) -> Vec<u8> {
-    let len = rng.gen_range(0..=max_len);
-    (0..len).map(|_| rng.r#gen()).collect()
 }
 
 #[cfg(test)]

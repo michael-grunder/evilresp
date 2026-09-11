@@ -1280,6 +1280,22 @@ mod tests {
         }
         first
             .get_mut()
+            .write_all(&resp_command(&[
+                "DEBUG",
+                "EVIL",
+                "GENERATOR",
+                "PROTOCOL",
+                "RESP3",
+                "CORPUS",
+                "RANDOM",
+                "VIOLATIONS",
+                "ON",
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut first).await.unwrap(), b"+OK\r\n");
+        first
+            .get_mut()
             .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RANDOM"]))
             .await
             .unwrap();
@@ -1295,6 +1311,7 @@ mod tests {
         assert!(first_status.contains("mode=RANDOM"));
         assert!(first_status.contains("strategy=REPLACE mutations=ONE"));
         assert!(first_status.contains("framing=OFF"));
+        assert!(first_status.contains("generator_protocol=RESP3 generator_corpus=RANDOM generator_violations=ON"));
 
         let mut second = spawn_proxy_client(target, state, 1);
         second
@@ -1309,6 +1326,7 @@ mod tests {
         assert!(second_status.contains("seed=0"));
         assert!(second_status.contains("strategy=PRESERVE mutations=MANY"));
         assert!(second_status.contains("framing=AUTO"));
+        assert!(second_status.contains("generator_protocol=RESP2 generator_corpus=BOUNDARY generator_violations=OFF"));
 
         drop(first);
         drop(second);

@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 use crate::framing::FramingConfig;
+use crate::generator::GeneratorConfig;
 use crate::mutation;
 use crate::resp::Frame;
 
@@ -151,6 +152,7 @@ pub struct EvilConfig {
     pub strategy: MutationStrategy,
     pub mutation_count: MutationCount,
     pub(crate) framing: FramingConfig,
+    pub(crate) generator: GeneratorConfig,
     include: Vec<FilterSpec>,
     exclude: Vec<FilterSpec>,
 }
@@ -171,6 +173,7 @@ impl Default for EvilConfig {
             strategy: MutationStrategy::Preserve,
             mutation_count: MutationCount::Many,
             framing: FramingConfig::Auto,
+            generator: GeneratorConfig::default(),
             include: Vec::new(),
             exclude,
         }
@@ -260,6 +263,10 @@ impl EvilConfig {
                 // Commit only after every option has been validated.
                 self.mode = mode;
                 self.probability = probability;
+                Ok(DebugResult::ok())
+            }
+            "GENERATOR" => {
+                self.generator = self.generator.updated(&argv[3..])?;
                 Ok(DebugResult::ok())
             }
             "FRAMING" => {
@@ -389,7 +396,7 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {}",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {} {}",
             self.mode,
             self.seed,
             self.probability,
@@ -400,6 +407,7 @@ impl EvilConfig {
             self.strategy.as_str(),
             self.mutation_count.as_str(),
             self.framing.status(),
+            self.generator.status(),
         )
     }
 }
@@ -647,7 +655,7 @@ pub fn random_reply(
     command_hash: &str,
 ) -> MutatedReply {
     let mut rng = rng_for(config.seed, command_index, command_hash, "");
-    let frame = mutation::random_frame(&mut rng, 0);
+    let frame = config.generator.frame(&mut rng);
     MutatedReply {
         bytes: frame.encode(),
         mutations: vec![AppliedMutation {
@@ -940,12 +948,12 @@ mod tests {
             ]))
             .unwrap();
         let status = "framing=LENGTH framing_probability=12.50 framing_target=root.1.0.key framing_kind=SHORTER";
-        assert!(config.status().ends_with(status));
+        assert!(config.status().contains(status));
         for mode in ["MUTATE", "OVERFLOW", "OFF", "RESET"] {
             config
                 .apply_debug_command(&strings(["DEBUG", "EVIL", "MODE", mode]))
                 .unwrap();
-            assert!(config.status().ends_with(status));
+            assert!(config.status().contains(status));
         }
         let before = config.status();
         for args in [
@@ -997,6 +1005,57 @@ mod tests {
                 .unwrap();
             assert_eq!(config.framing.status(), format!("framing={setting}"));
         }
+    }
+
+    #[test]
+    fn generator_settings_survive_reset_and_rejected_updates() {
+        let mut config = EvilConfig::default();
+        config
+            .apply_debug_command(&strings([
+                "DEBUG",
+                "EVIL",
+                "GENERATOR",
+                "PROTOCOL",
+                "RESP3",
+                "CORPUS",
+                "RANDOM",
+                "VIOLATIONS",
+                "ON",
+            ]))
+            .unwrap();
+        let status = "generator_protocol=RESP3 generator_corpus=RANDOM generator_violations=ON";
+        for mode in ["RANDOM", "MUTATE", "OVERFLOW", "OFF", "RESET"] {
+            config
+                .apply_debug_command(&strings(["DEBUG", "EVIL", "MODE", mode]))
+                .unwrap();
+            assert!(config.status().ends_with(status));
+        }
+        let before = config.status();
+        for args in [
+            vec![],
+            vec!["PROTOCOL"],
+            vec!["PROTOCOL", "RESP2", "CORPUS", "bad"],
+            vec!["CORPUS", "BOUNDARY", "CORPUS", "RANDOM"],
+            vec!["VIOLATIONS", "OFF", "extra"],
+        ] {
+            let argv = ["DEBUG", "EVIL", "GENERATOR"]
+                .into_iter()
+                .chain(args)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert!(config.apply_debug_command(&argv).is_err());
+            assert_eq!(config.status(), before);
+        }
+        config
+            .apply_debug_command(&strings([
+                "DEBUG",
+                "EVIL",
+                "GENERATOR",
+                "VIOLATIONS",
+                "OFF",
+            ]))
+            .unwrap();
+        assert!(config.status().ends_with("generator_protocol=RESP3 generator_corpus=RANDOM generator_violations=OFF"));
     }
 
     #[test]
@@ -1164,10 +1223,10 @@ mod tests {
     fn replacement_subtrees_are_not_mutated_again() {
         let frame =
             parse_frame(b"*2\r\n#t\r\n%1\r\n#t\r\n~1\r\n#t\r\n").unwrap();
-        // Seed 2 generates a map containing a nested array. MANY may
+        // Seed 1 generates an array containing nested arrays. MANY may
         // corrupt its root length but must not mutate the generated children.
         let config = EvilConfig {
-            seed: 2,
+            seed: 1,
             mode: EvilMode::Mutate,
             probability: 100.0,
             strategy: MutationStrategy::Replace,
@@ -1176,7 +1235,7 @@ mod tests {
         let result = mutate_reply(&config, 9, "command", "upstream", &frame);
         assert_eq!(
             result.bytes,
-            b"%2\r\n_\r\n*2\r\n_\r\n:518262545842838998\r\n"
+            b"*5\r\n*4\r\n*-1\r\n:9223372036854775807\r\n+-1\r\n*-1\r\n*1\r\n:2147483648\r\n*-1\r\n-ERR -1\r\n"
         );
         assert_eq!(
             result
@@ -1190,14 +1249,14 @@ mod tests {
             ]
         );
 
-        // Seed 0 with ONE replaces the root with a complete two-item array.
+        // Seed 107 with ONE replaces the root with a complete four-item array.
         let config = EvilConfig {
-            seed: 0,
+            seed: 107,
             mutation_count: MutationCount::One,
             ..config
         };
         let result = mutate_reply(&config, 9, "command", "upstream", &frame);
-        assert_eq!(result.bytes, b"*2\r\n#f\r\n#t\r\n");
+        assert_eq!(result.bytes, b"*4\r\n$-1\r\n$-1\r\n-ERR -1\r\n*-1\r\n");
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.mutations[0].path, "root");
         assert_eq!(result.mutations[0].kind, MutationKind::RandomFrame);

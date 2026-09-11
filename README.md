@@ -163,6 +163,7 @@ DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL STRATEGY <PRESERVE|REPLACE>
 DEBUG EVIL MUTATIONS <ONE|MANY>
+DEBUG EVIL GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLATIONS <OFF|ON>]
 DEBUG EVIL FRAMING <AUTO|OFF>
 DEBUG EVIL FRAMING LENGTH [PROBABILITY <0.00-100.00>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]
 DEBUG EVIL TOPOLOGY <0.00-100.00>
@@ -190,15 +191,16 @@ Modes:
 Selecting a mode resets its probability to `100` (`0` for `OFF`) unless an
 explicit probability is supplied. This controls value mutation; explicit
 framing probability is independent. Mode changes preserve the strategy,
-mutation count, and framing settings. `RANDOM` always generates a reply for
-eligible commands; its `PROBABILITY` setting currently has no effect.
+mutation count, framing, and generator settings. `RANDOM` always generates a
+reply for eligible commands; its `PROBABILITY` setting currently has no effect.
 
 `STRATEGY` controls value mutation in `MUTATE` and `OVERFLOW`:
 
 - `PRESERVE` (default): retain aggregate containers and mutate their scalar
   children, including map keys and values. Scalar types are retained; their
-  contents may still be invalid, such as nonnumeric double text. Nulls and
-  empty containers have no mutable scalar value. In `OVERFLOW`, booleans
+  generated numeric and verbatim contents are valid unless generator
+  violations are enabled. Nulls and empty containers have no mutable scalar
+  value. In `OVERFLOW`, booleans
   and inline frames are also ineligible.
 - `REPLACE`: allow any original frame, including an entire aggregate, to be
   selected. `MUTATE` replaces it with a random frame; `OVERFLOW` applies
@@ -270,6 +272,60 @@ mutation operation count, not every possible difference from upstream bytes.
 The new mutation selection changes seeded `MUTATE` and `OVERFLOW` output
 relative to earlier versions; reproduce with the same build and settings.
 
+`GENERATOR` controls whole replies in `RANDOM`, replacement trees in
+`MUTATE STRATEGY REPLACE`, and scalar contents in `MUTATE`. Defaults are
+`PROTOCOL RESP2`, `CORPUS BOUNDARY`, and `VIOLATIONS OFF`:
+
+- `PROTOCOL RESP2`: generate simple strings, errors, signed integers, bulk
+  strings, arrays, and both RESP2 null forms. Every generated descendant uses
+  RESP2 types when violations are off.
+- `PROTOCOL RESP3`: additionally generate doubles, big numbers, booleans,
+  maps, sets, bulk errors, and verbatim strings. Nulls use the RESP3 null
+  marker. Ordinary generation excludes push and attribute frames.
+- `CORPUS BOUNDARY`: choose from edge cases 70% of the time at each supported
+  numeric, text, or size choice, with random values otherwise. Cases include empty and
+  singleton aggregates, empty versus null values, integer limits and nearby
+  values, big numbers beyond 64 bits, negative zero, floating-point extremes,
+  infinity, and NaN. Binary payloads include NUL, non-UTF-8 bytes, and embedded
+  RESP markers. Boundary sizes are `0`, `1`, `31`, `32`, `33`, `255`, `256`,
+  `257`, `4095`, `4096`, and `4097` bytes.
+- `CORPUS RANDOM`: skip the weighted boundary tables and generate random
+  values and sizes. Random blob contents are at most 256 bytes before any
+  error or verbatim prefix is added.
+- `VIOLATIONS ON`: also allow malformed double and big-number text, invalid
+  verbatim formats, standalone push/attribute frames, and RESP3 booleans in
+  the RESP2 profile. These are opportunities for deliberate failures, not a
+  guarantee that every reply is invalid. Push and attribute generation tests
+  unexpected or incomplete conversations; it does not implement asynchronous
+  push delivery or attributes followed by a normal reply.
+
+At least one generator option/value pair is required. Options are
+case-insensitive and may appear in any order. Omitted options retain their
+current values; duplicates and invalid updates leave all settings unchanged.
+Settings are per connection, survive mode changes and reset, and appear in
+`STATUS` as `generator_protocol`, `generator_corpus`, and
+`generator_violations`.
+
+Protocol selection does not negotiate `HELLO` or translate upstream replies.
+`PRESERVE` retains upstream scalar types, including RESP3 types under a RESP2
+generator profile. Valid generated values can still have the wrong type for
+the command. In `OVERFLOW`, doubles and big numbers use their boundary
+corpora, verbatim strings retain a `txt:` prefix, and integer/text overflow
+mutations retain their extreme-value behavior. Violations can make numeric
+contents malformed in either mutation mode.
+
+Generated trees have at most three levels (root included), four elements or
+pairs per aggregate, and 4097 bytes per blob payload including error/verbatim
+prefixes. These limits also apply with violations enabled. They bound each
+generated replacement independently; total output and traversal budgets for
+large upstream trees remain future work.
+
+Length corruption remains independently controlled by `FRAMING`.
+`VIOLATIONS OFF` does not disable the default `FRAMING AUTO` fault in
+`MUTATE` or `OVERFLOW`; use `FRAMING OFF` for correctly framed values.
+The expanded corpus changes seeded output in all three evil modes. Use the
+same build and configuration to reproduce a case.
+
 Configure and exercise the proxy on the same connection, for example in an
 interactive `redis-cli -p 6380` session:
 
@@ -298,6 +354,20 @@ For this example, the first `MGET` result's bulk length changes. Use
 `TARGET ANY` to explore different headers deterministically, or
 `FRAMING OFF` to test value mutations without length faults.
 
+To exercise a RESP3 client's value parser with the boundary corpus, configure
+the client for RESP3 and issue these commands on its connection:
+
+```text
+DEBUG EVIL GENERATOR PROTOCOL RESP3 CORPUS BOUNDARY VIOLATIONS OFF
+DEBUG EVIL FRAMING OFF
+DEBUG EVIL MODE RANDOM
+GET example
+```
+
+Switch to `DEBUG EVIL GENERATOR VIOLATIONS ON` to mix deliberate protocol
+and conversation faults into subsequent generated replies. This retains the
+selected protocol and corpus.
+
 Mutated replies can intentionally violate RESP framing, so the client may
 disconnect before subsequent commands can run.
 
@@ -313,7 +383,8 @@ RESP shape when those modes are enabled.
 to zero, resets the deterministic command index, invalidates older client
 connections, and resets the current connection's protocol fingerprints.
 It preserves the seed, filters, canonicalization setting, mutation strategy,
-mutation count setting, framing configuration, and topology probability.
+mutation count setting, framing and generator configuration, and topology
+probability.
 To disable topology mutation too, send `DEBUG EVIL TOPOLOGY 0`.
 The reset command and its reply are omitted from the new fingerprints.
 

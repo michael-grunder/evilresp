@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod cluster_rewrite;
 pub mod error;
 pub mod evil;
+mod framing;
 pub mod logging;
 mod mutation;
 pub mod protocol_fingerprint;

@@ -10,6 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
+use crate::framing::FramingConfig;
 use crate::mutation;
 use crate::resp::Frame;
 
@@ -149,6 +150,7 @@ pub struct EvilConfig {
     pub canonicalization: CanonicalizationMode,
     pub strategy: MutationStrategy,
     pub mutation_count: MutationCount,
+    pub(crate) framing: FramingConfig,
     include: Vec<FilterSpec>,
     exclude: Vec<FilterSpec>,
 }
@@ -168,6 +170,7 @@ impl Default for EvilConfig {
             canonicalization: CanonicalizationMode::Unordered,
             strategy: MutationStrategy::Preserve,
             mutation_count: MutationCount::Many,
+            framing: FramingConfig::Auto,
             include: Vec::new(),
             exclude,
         }
@@ -257,6 +260,10 @@ impl EvilConfig {
                 // Commit only after every option has been validated.
                 self.mode = mode;
                 self.probability = probability;
+                Ok(DebugResult::ok())
+            }
+            "FRAMING" => {
+                self.framing = FramingConfig::parse(&argv[3..])?;
                 Ok(DebugResult::ok())
             }
             "STRATEGY" => {
@@ -382,7 +389,7 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={}",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {}",
             self.mode,
             self.seed,
             self.probability,
@@ -392,6 +399,7 @@ impl EvilConfig {
             self.exclude_filters().join(","),
             self.strategy.as_str(),
             self.mutation_count.as_str(),
+            self.framing.status(),
         )
     }
 }
@@ -405,7 +413,7 @@ impl DebugResult {
     }
 }
 
-fn parse_probability(value: &str) -> AppResult<f64> {
+pub(crate) fn parse_probability(value: &str) -> AppResult<f64> {
     let probability = value.parse::<f64>().map_err(|error| {
         AppError::EvilConfig(format!("invalid probability: {error}"))
     })?;
@@ -545,6 +553,26 @@ fn command_attributes(command: &str) -> BTreeSet<&'static str> {
 pub struct AppliedMutation {
     pub path: String,
     pub kind: MutationKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<LengthMutation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LengthMutation {
+    pub kind: LengthCorruption,
+    // Strings retain exact decimal text even beyond integer/JSON ranges.
+    pub original: String,
+    pub replacement: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LengthCorruption {
+    Shorter,
+    Longer,
+    Negative,
+    Boundary,
+    Overflow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -625,6 +653,7 @@ pub fn random_reply(
         mutations: vec![AppliedMutation {
             path: "root".to_owned(),
             kind: MutationKind::RandomFrame,
+            length: None,
         }],
     }
 }
@@ -842,7 +871,7 @@ mod tests {
         }
         assert_eq!(config.strategy, MutationStrategy::Replace);
         assert_eq!(config.mutation_count, MutationCount::One);
-        assert!(config.status().ends_with("strategy=REPLACE mutations=ONE"));
+        assert!(config.status().contains("strategy=REPLACE mutations=ONE"));
         assert_eq!(EvilConfig::default().strategy, MutationStrategy::Preserve);
         assert_eq!(EvilConfig::default().mutation_count, MutationCount::Many);
         for args in [
@@ -851,11 +880,7 @@ mod tests {
         ] {
             config.apply_debug_command(&strings(args)).unwrap();
         }
-        assert!(
-            config
-                .status()
-                .ends_with("strategy=PRESERVE mutations=MANY")
-        );
+        assert!(config.status().contains("strategy=PRESERVE mutations=MANY"));
     }
 
     #[test]
@@ -893,6 +918,84 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(config.apply_debug_command(&argv).is_err(), "{argv:?}");
             assert_eq!(config.status(), before, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn framing_configuration_is_atomic_and_survives_mode_changes() {
+        let mut config = EvilConfig::default();
+        assert_eq!(config.framing.status(), "framing=AUTO");
+        config
+            .apply_debug_command(&strings([
+                "DEBUG",
+                "EVIL",
+                "FRAMING",
+                "length",
+                "kind",
+                "shorter",
+                "target",
+                "ROOT.001.000.KEY",
+                "probability",
+                "12.5",
+            ]))
+            .unwrap();
+        let status = "framing=LENGTH framing_probability=12.50 framing_target=root.1.0.key framing_kind=SHORTER";
+        assert!(config.status().ends_with(status));
+        for mode in ["MUTATE", "OVERFLOW", "OFF", "RESET"] {
+            config
+                .apply_debug_command(&strings(["DEBUG", "EVIL", "MODE", mode]))
+                .unwrap();
+            assert!(config.status().ends_with(status));
+        }
+        let before = config.status();
+        for args in [
+            vec![],
+            vec!["unknown"],
+            vec!["OFF", "extra"],
+            vec!["AUTO", "PROBABILITY", "50"],
+            vec!["LENGTH", "KIND"],
+            vec!["LENGTH", "KIND", "bad"],
+            vec!["LENGTH", "unexpected", "0"],
+            vec!["LENGTH", "PROBABILITY", "NaN"],
+            vec!["LENGTH", "PROBABILITY", "inf"],
+            vec!["LENGTH", "PROBABILITY", "-1"],
+            vec!["LENGTH", "PROBABILITY", "101"],
+            vec!["LENGTH", "PROBABILITY", "10", "PROBABILITY", "20"],
+            vec!["LENGTH", "TARGET", "ANY", "TARGET", "root"],
+            vec!["LENGTH", "KIND", "LONGER", "KIND", "SHORTER"],
+            vec!["LENGTH", "TARGET", "0"],
+            vec!["LENGTH", "TARGET", "root."],
+            vec!["LENGTH", "TARGET", "root.-1"],
+            vec!["LENGTH", "TARGET", "root.key"],
+            vec!["LENGTH", "TARGET", "root.0.key.value"],
+            vec!["LENGTH", "TARGET", "root.99999999999999999999999999"],
+        ] {
+            let argv = ["DEBUG", "EVIL", "FRAMING"]
+                .into_iter()
+                .chain(args)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert!(config.apply_debug_command(&argv).is_err(), "{argv:?}");
+            assert_eq!(config.status(), before, "{argv:?}");
+        }
+        // A fresh LENGTH selection resets its options, not value probability.
+        config
+            .apply_debug_command(&strings([
+                "DEBUG", "EVIL", "FRAMING", "LENGTH",
+            ]))
+            .unwrap();
+        assert_eq!(config.probability, 0.0);
+        assert_eq!(
+            config.framing.status(),
+            "framing=LENGTH framing_probability=100.00 framing_target=ANY framing_kind=RANDOM"
+        );
+        for setting in ["OFF", "AUTO"] {
+            config
+                .apply_debug_command(&strings([
+                    "DEBUG", "EVIL", "FRAMING", setting,
+                ]))
+                .unwrap();
+            assert_eq!(config.framing.status(), format!("framing={setting}"));
         }
     }
 

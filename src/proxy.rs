@@ -1269,6 +1269,7 @@ mod tests {
         for args in [
             ["DEBUG", "EVIL", "STRATEGY", "REPLACE"],
             ["DEBUG", "EVIL", "MUTATIONS", "ONE"],
+            ["DEBUG", "EVIL", "FRAMING", "OFF"],
         ] {
             first
                 .get_mut()
@@ -1293,6 +1294,7 @@ mod tests {
             String::from_utf8(read_bulk_string(&mut first).await).unwrap();
         assert!(first_status.contains("mode=RANDOM"));
         assert!(first_status.contains("strategy=REPLACE mutations=ONE"));
+        assert!(first_status.contains("framing=OFF"));
 
         let mut second = spawn_proxy_client(target, state, 1);
         second
@@ -1306,6 +1308,7 @@ mod tests {
         assert!(second_status.contains("mode=OFF"));
         assert!(second_status.contains("seed=0"));
         assert!(second_status.contains("strategy=PRESERVE mutations=MANY"));
+        assert!(second_status.contains("framing=AUTO"));
 
         drop(first);
         drop(second);
@@ -1400,6 +1403,124 @@ mod tests {
         proxy.await.unwrap().unwrap();
         upstream.await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn framing_only_mutation_records_exact_wire_bytes_across_connections()
+    {
+        let path = unique_socket_path("upstream-framing-only");
+        let repro_path = path.with_extension("jsonl");
+        let listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = tokio::io::split(stream);
+                let mut read = BufReader::new(read);
+                // All DEBUG settings stay local and the command is unchanged.
+                assert_eq!(
+                    read_raw_frame(&mut read).await.unwrap(),
+                    resp_command(&["LRANGE", "key", "0", "-1"])
+                );
+                write
+                    .write_all(b"*2\r\n+before\r\n*1\r\n$3\r\nfoo\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let expected = b"*2\r\n+before\r\n*1\r\n$2\r\nfoo\r\n";
+        for connection_id in [7, 99] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let target = ProxyTarget {
+                upstream: Endpoint::Unix(path.clone()),
+                listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+            };
+            let state = SharedState {
+                repro: Some(ReproWriter::open(&repro_path).await.unwrap()),
+                monitor: monitor_sender(),
+                reset_barrier: Arc::new(RwLock::new(())),
+                reset_epoch: Arc::new(AtomicU64::new(0)),
+                connection_ids: Arc::new(AtomicU64::new(0)),
+                command_ids: Arc::new(AtomicU64::new(0)),
+                local_slots: None,
+                redirection_map: ClusterRedirectionMap::default(),
+            };
+            let command_ids = state.command_ids.clone();
+            let proxy = tokio::spawn(proxy_connection(
+                Box::new(server),
+                target,
+                state,
+                connection_id,
+                0,
+            ));
+            let mut client = BufReader::new(client);
+            for args in [
+                &["DEBUG", "EVIL", "MODE", "MUTATE", "PROBABILITY", "0"][..],
+                &["DEBUG", "EVIL", "MUTATIONS", "ONE"],
+                &[
+                    "DEBUG",
+                    "EVIL",
+                    "FRAMING",
+                    "LENGTH",
+                    "TARGET",
+                    "root.1.0",
+                    "KIND",
+                    "SHORTER",
+                    "PROBABILITY",
+                    "100",
+                ],
+            ] {
+                client
+                    .get_mut()
+                    .write_all(&resp_command(args))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_raw_frame(&mut client).await.unwrap(),
+                    b"+OK\r\n"
+                );
+            }
+            assert_eq!(command_ids.load(Ordering::SeqCst), 0);
+            client
+                .get_mut()
+                .write_all(&resp_command(&["LRANGE", "key", "0", "-1"]))
+                .await
+                .unwrap();
+            client.get_mut().shutdown().await.unwrap();
+            // Read malformed output as raw bytes through EOF, without timing.
+            let mut response = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response)
+                .await
+                .unwrap();
+            assert_eq!(response, expected);
+            proxy.await.unwrap().unwrap();
+            assert_eq!(command_ids.load(Ordering::SeqCst), 1);
+        }
+        upstream.await.unwrap();
+        let records = std::fs::read_to_string(&repro_path).unwrap();
+        let records = records
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        for (record, connection_id) in records.iter().zip([7, 99]) {
+            assert_eq!(record["connection_id"], connection_id);
+            assert_eq!(record["command_index"], 0);
+            assert_eq!(
+                record["mutated_response_bytes_hex"],
+                hex::encode(expected)
+            );
+            assert_eq!(
+                record["mutations"],
+                serde_json::json!([{
+                    "path": "root.1.0", "kind": "wrong_length",
+                    "length": {"kind": "shorter", "original": "3", "replacement": "2"},
+                }])
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(repro_path).unwrap();
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use crate::evil::{
     AppliedMutation, EvilConfig, EvilMode, MutatedReply, MutationCount,
     MutationKind, MutationStrategy,
 };
+use crate::framing::{FramingConfig, mutate_length};
 use crate::resp::Frame;
 
 pub(crate) fn mutate(
@@ -22,6 +23,15 @@ pub(crate) fn mutate(
             bytes: frame.encode(),
             mutations,
         };
+    }
+
+    // An explicit framing fault has priority for the single mutation slot.
+    // If it cannot apply, value mutation still gets its probability check.
+    if config.mutation_count == MutationCount::One
+        && matches!(config.framing, FramingConfig::Length(_))
+        && let Some(reply) = mutate_length(&frame, config, rng)
+    {
+        return reply;
     }
 
     match config.mutation_count {
@@ -46,18 +56,18 @@ pub(crate) fn mutate(
         }
     }
 
-    let mut bytes = frame.encode();
-    // ONE targets a value or a replacement, never a second framing fault.
+    // MANY applies framing to the final typed tree after value mutation.
     if config.mutation_count == MutationCount::Many
-        && should_apply(config.probability, rng)
-        && corrupt_first_length(&mut bytes, config.mode)
+        && let Some(mut reply) = mutate_length(&frame, config, rng)
     {
-        mutations.push(AppliedMutation {
-            path: "root".to_owned(),
-            kind: MutationKind::WrongLength,
-        });
+        mutations.append(&mut reply.mutations);
+        reply.mutations = mutations;
+        return reply;
     }
-    MutatedReply { bytes, mutations }
+    MutatedReply {
+        bytes: frame.encode(),
+        mutations,
+    }
 }
 
 fn eligible(frame: &Frame, config: &EvilConfig) -> bool {
@@ -107,6 +117,7 @@ fn mutate_selected(
             mutations.push(AppliedMutation {
                 path: path.to_owned(),
                 kind: mutate_one(frame, config, rng),
+                length: None,
             });
             return true;
         }
@@ -165,6 +176,7 @@ fn mutate_frame(
         mutations.push(AppliedMutation {
             path: path.to_owned(),
             kind,
+            length: None,
         });
         // Do not recursively mutate a replacement's generated descendants.
         return;
@@ -350,33 +362,6 @@ fn random_ascii(rng: &mut ChaCha20Rng, max_len: usize) -> String {
 fn random_bytes(rng: &mut ChaCha20Rng, max_len: usize) -> Vec<u8> {
     let len = rng.gen_range(0..=max_len);
     (0..len).map(|_| rng.r#gen()).collect()
-}
-
-fn corrupt_first_length(bytes: &mut Vec<u8>, mode: EvilMode) -> bool {
-    let Some(prefix) = bytes.first().copied() else {
-        return false;
-    };
-    if !matches!(
-        prefix,
-        b'$' | b'*' | b'!' | b'=' | b'%' | b'~' | b'>' | b'|'
-    ) {
-        return false;
-    }
-
-    let Some(line_end) = bytes.windows(2).position(|window| window == b"\r\n")
-    else {
-        return false;
-    };
-    let current = std::str::from_utf8(&bytes[1..line_end])
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok());
-    let replacement = if mode == EvilMode::Overflow {
-        i64::MAX
-    } else {
-        current.unwrap_or(0).saturating_add(1)
-    };
-    bytes.splice(1..line_end, replacement.to_string().bytes());
-    true
 }
 
 #[cfg(test)]

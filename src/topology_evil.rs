@@ -67,6 +67,7 @@ pub fn maybe_mutate_topology(
                 vec![AppliedMutation {
                     path: "topology".to_owned(),
                     kind: MutationKind::TopologyFakeRedirection,
+                    length: None,
                 }],
             )
         }
@@ -165,6 +166,7 @@ fn apply_redirection_mutations(
         mutations.push(AppliedMutation {
             path: "topology.kind".to_owned(),
             kind: MutationKind::TopologyWrongRedirectionKind,
+            length: None,
         });
     }
 
@@ -173,6 +175,7 @@ fn apply_redirection_mutations(
         mutations.push(AppliedMutation {
             path: "topology.slot".to_owned(),
             kind: MutationKind::TopologyWrongSlot,
+            length: None,
         });
     }
 
@@ -183,6 +186,7 @@ fn apply_redirection_mutations(
         mutations.push(AppliedMutation {
             path: "topology.server".to_owned(),
             kind: MutationKind::TopologyWrongServer,
+            length: None,
         });
     }
 
@@ -191,6 +195,7 @@ fn apply_redirection_mutations(
         mutations.push(AppliedMutation {
             path: "topology.slot".to_owned(),
             kind: MutationKind::TopologyWildSlot,
+            length: None,
         });
     }
 }

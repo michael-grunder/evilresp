@@ -134,6 +134,13 @@ Byte fields use hex encoding, and the record's hashes use SHA-256. The field
 on the connection that produced the record. Upstream bytes and their hash are
 the original response, before cluster rewriting or canonicalization, and are
 `null` in `RANDOM` mode. Mutation entries contain `path` and `kind` fields.
+Length faults keep `kind: "wrong_length"` and add a `length` object containing
+the applied corruption `kind`, `original` length, and `replacement` length.
+Both lengths are decimal strings, including values beyond integer ranges.
+Other mutations omit `length`. Paths identify the actual encoded target,
+for example `root.1.0.value` for the value of the first map pair inside the
+second array child. Paths refer to the canonicalized tree; in `MANY`, they
+also reflect preceding value mutation.
 Write failures are logged and do not stop proxying.
 
 For a reproducible run, use the same configuration, command order, and
@@ -156,6 +163,8 @@ DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL STRATEGY <PRESERVE|REPLACE>
 DEBUG EVIL MUTATIONS <ONE|MANY>
+DEBUG EVIL FRAMING <AUTO|OFF>
+DEBUG EVIL FRAMING LENGTH [PROBABILITY <0.00-100.00>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]
 DEBUG EVIL TOPOLOGY <0.00-100.00>
 DEBUG EVIL MODE RESET
 DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>
@@ -179,9 +188,10 @@ Modes:
 - `OVERFLOW`: mutate toward overflow-prone values and lengths.
 
 Selecting a mode resets its probability to `100` (`0` for `OFF`) unless an
-explicit probability is supplied. It preserves the strategy and mutation
-count settings. `RANDOM` always generates a reply for eligible commands;
-its `PROBABILITY` setting currently has no effect.
+explicit probability is supplied. This controls value mutation; explicit
+framing probability is independent. Mode changes preserve the strategy,
+mutation count, and framing settings. `RANDOM` always generates a reply for
+eligible commands; its `PROBABILITY` setting currently has no effect.
 
 `STRATEGY` controls value mutation in `MUTATE` and `OVERFLOW`:
 
@@ -198,17 +208,59 @@ its `PROBABILITY` setting currently has no effect.
 
 `MUTATIONS` controls selection in those same two modes:
 
-- `MANY` (default): apply probability independently at each eligible original
-  frame, then make a separate root length-corruption attempt at the same
-  probability. This length fault can still break the outer framing with
-  `STRATEGY PRESERVE`; the original aggregate bodies survive value mutation.
-- `ONE`: apply probability once to the reply, then uniformly select one
-  eligible original frame and change its value or replace it. No additional
-  length corruption runs. At probability `100`, exactly one RESP mutation
-  occurs if an eligible frame exists. If the probability check fails or no
-  frame is eligible, the canonicalized reply is returned unchanged and no
-  RESP mutation is recorded. For example, an empty array has no eligible
-  frame with `PRESERVE`, but can be replaced with `REPLACE`.
+- `MANY` (default): apply value probability independently at each eligible
+  original frame, then run the framing stage on the resulting tree. A framing
+  fault can still break the wire format with `STRATEGY PRESERVE`.
+- `ONE`: with `FRAMING AUTO` or `OFF`, apply value probability once to the
+  reply, then uniformly select one eligible original frame and change its
+  value or replace it. No extra framing fault runs. With explicit
+  `FRAMING LENGTH`, try the framing fault first; if it succeeds, it takes the
+  single mutation slot and no values change. If its probability check fails
+  or its target is ineligible, try value mutation as above. At value
+  probability `100`, exactly one RESP mutation occurs if an eligible value
+  exists. With no applied mutation, the canonicalized reply is returned
+  unchanged and no RESP mutation is recorded.
+
+`FRAMING` separates length faults from value mutation in `MUTATE` and
+`OVERFLOW`:
+
+- `AUTO` (default): keep the existing root-only length attempt in `MANY`,
+  using the mode's probability. `MUTATE` adds one to the root length;
+  `OVERFLOW` advertises `9223372036854775807`. It does nothing in `ONE`.
+- `OFF`: disable all length faults while retaining value mutation.
+- `LENGTH`: attempt one length fault per reply using its own probability,
+  target, and corruption kind. It works even at value probability zero.
+  Each `FRAMING LENGTH` command resets omitted options to probability `100`,
+  target `ANY`, and kind `RANDOM`. Options can appear in any order;
+  duplicate options are rejected. `AUTO` and `OFF` accept no options.
+
+`TARGET ANY` uniformly selects from eligible length headers. A specific path
+selects only that frame: `root`, `root.0` for an array/set/push child, or
+`root.0.key` / `root.0.value` for a map/attribute pair. Compose paths for
+nested frames, for example `root.1.0.value.2`. Indexes are zero-based;
+path words are case-insensitive and leading zeros in indexes are normalized.
+An absent path, a scalar without a length header, or a pair index without
+`.key` or `.value` is ineligible and produces no framing mutation. Empty
+containers and RESP2 null strings/arrays do have eligible length headers.
+
+Length corruption kinds:
+
+| Kind | Advertised length |
+| --- | --- |
+| `SHORTER` | Current length minus one, including `0` to `-1` and `-1` to `-2`. |
+| `LONGER` | Current length plus one. |
+| `NEGATIVE` | `-2`, `-3`, or the minimum signed 64-bit integer. |
+| `BOUNDARY` | `0`, `1`, signed 32-bit maximum and its successor, unsigned 32-bit maximum and its successor, signed 64-bit maximum, or unsigned 64-bit maximum. |
+| `OVERFLOW` | Signed 64-bit maximum plus one, unsigned 64-bit maximum plus one, signed 64-bit minimum minus one, or unsigned 128-bit maximum plus one. |
+| `RANDOM` | Select one of the five kinds above. |
+
+Only the chosen header's decimal length changes; bodies, terminators, sibling
+frames, and other headers retain their encoding. Map and attribute lengths
+count pairs. The actual output allocation uses actual contents, never the
+advertised length. A boundary matching the current length is replaced by
+another boundary so the fault changes bytes. Framing targets the original
+canonicalized tree in `ONE`, and the tree after value mutation in `MANY`,
+including generated replacements. A path removed by replacement is skipped.
 
 These controls are per connection, appear in `STATUS`, and reject missing,
 invalid, or extra arguments without changing configuration. They do not
@@ -232,6 +284,20 @@ GET example
 DEBUG EVIL STATUS
 ```
 
+To change only the length of a nested reply while retaining its values, use
+the same connection for setup and the command:
+
+```text
+DEBUG EVIL MODE MUTATE PROBABILITY 0
+DEBUG EVIL MUTATIONS ONE
+DEBUG EVIL FRAMING LENGTH TARGET root.0 KIND LONGER PROBABILITY 100
+MGET first second
+```
+
+For this example, the first `MGET` result's bulk length changes. Use
+`TARGET ANY` to explore different headers deterministically, or
+`FRAMING OFF` to test value mutations without length faults.
+
 Mutated replies can intentionally violate RESP framing, so the client may
 disconnect before subsequent commands can run.
 
@@ -247,8 +313,8 @@ RESP shape when those modes are enabled.
 to zero, resets the deterministic command index, invalidates older client
 connections, and resets the current connection's protocol fingerprints.
 It preserves the seed, filters, canonicalization setting, mutation strategy,
-mutation count setting, and topology probability. To disable topology
-mutation too, send `DEBUG EVIL TOPOLOGY 0`.
+mutation count setting, framing configuration, and topology probability.
+To disable topology mutation too, send `DEBUG EVIL TOPOLOGY 0`.
 The reset command and its reply are omitted from the new fingerprints.
 
 Canonicalization controls whether upstream replies are normalized before they
@@ -264,7 +330,8 @@ reply shape.
 Transaction bookkeeping follows upstream acknowledgements: rejected commands
 do not shift the command names used to canonicalize `EXEC` results. In
 `MUTATE` and `OVERFLOW`, canonicalization still runs at probability zero and
-may reorder the response. Use `OFF` with topology probability zero for normal
+may reorder the response; explicit framing faults can also run at value
+probability zero. Use `OFF` with topology probability zero for normal
 proxy behavior.
 
 Filters are case-insensitive. Plain strings match literal command names, regex

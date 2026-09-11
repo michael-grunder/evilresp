@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `DEBUG EVIL FRAMING <AUTO|OFF|LENGTH>` with independent probability,
+  root or nested target paths, and shorter, longer, negative, boundary, and
+  overflow length faults. Framing-only mutation works at value probability
+  zero; explicit framing takes priority for the `MUTATIONS ONE` slot.
+- Added `length` details to repro mutation entries for length faults, recording
+  the applied corruption kind and original/replacement decimal strings while
+  retaining existing `path` and `kind` fields. Other mutation entries retain
+  their existing shape.
 - Added `DEBUG EVIL STRATEGY <PRESERVE|REPLACE>` to choose scalar mutation
   within original reply containers or whole-frame replacement, and
   `DEBUG EVIL MUTATIONS <ONE|MANY>` to select one eligible frame per reply
@@ -46,6 +54,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Encoded selected length faults directly from the typed frame tree, keeping
+  actual bodies and other headers intact without allocating advertised sizes.
+  Default `FRAMING AUTO` preserves the previous root-only wire behavior;
+  framing settings are per connection and survive mode changes and reset.
 - Defaulted RESP value mutation to `PRESERVE`, allowing `OVERFLOW` to reach
   values inside arrays, maps, and sets at full probability. `MANY` retains
   the separate root length-corruption attempt. Selected value mutations

@@ -32,8 +32,41 @@ pub enum Frame {
 impl Frame {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        self.encode_into(&mut out);
+        self.encode_into(&mut out, &mut |_| None);
         out
+    }
+
+    /// Override one length header by pre-order frame index. Bodies and
+    /// child traversal always use actual sizes, never the advertised length.
+    pub(crate) fn encode_with_length(
+        &self,
+        target: usize,
+        replacement: &str,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut index = 0;
+        self.encode_into(&mut out, &mut |_| {
+            let selected = index == target;
+            index += 1;
+            selected.then_some(replacement)
+        });
+        out
+    }
+
+    pub(crate) fn declared_length(&self) -> Option<i128> {
+        match self {
+            Self::BulkString(None) | Self::Array(None) => Some(-1),
+            Self::BulkString(Some(bytes))
+            | Self::BulkError(bytes)
+            | Self::VerbatimString(bytes) => Some(bytes.len() as i128),
+            Self::Array(Some(items)) | Self::Set(items) | Self::Push(items) => {
+                Some(items.len() as i128)
+            }
+            Self::Map(items) | Self::Attribute(items) => {
+                Some(items.len() as i128)
+            }
+            _ => None,
+        }
     }
 
     pub fn command_name(&self) -> Option<String> {
@@ -68,7 +101,12 @@ impl Frame {
         }
     }
 
-    fn encode_into(&self, out: &mut Vec<u8>) {
+    fn encode_into<'a>(
+        &self,
+        out: &mut Vec<u8>,
+        header: &mut impl FnMut(&Frame) -> Option<&'a str>,
+    ) {
+        let replacement = header(self);
         match self {
             Frame::SimpleString(value) => {
                 push_line(out, b'+', value.as_bytes())
@@ -77,15 +115,25 @@ impl Frame {
             Frame::Integer(value) => {
                 push_line(out, b':', value.to_string().as_bytes())
             }
-            Frame::BulkString(Some(bytes)) => push_blob(out, b'$', bytes),
-            Frame::BulkString(None) => out.extend_from_slice(b"$-1\r\n"),
+            Frame::BulkString(Some(bytes)) => {
+                push_blob(out, b'$', bytes, replacement)
+            }
+            Frame::BulkString(None) => {
+                push_line(out, b'$', replacement.unwrap_or("-1").as_bytes())
+            }
             Frame::Array(Some(items)) => {
-                push_line(out, b'*', items.len().to_string().as_bytes());
+                push_line(
+                    out,
+                    b'*',
+                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
+                );
                 for item in items {
-                    item.encode_into(out);
+                    item.encode_into(out, header);
                 }
             }
-            Frame::Array(None) => out.extend_from_slice(b"*-1\r\n"),
+            Frame::Array(None) => {
+                push_line(out, b'*', replacement.unwrap_or("-1").as_bytes())
+            }
             Frame::Null => out.extend_from_slice(b"_\r\n"),
             Frame::Boolean(value) => {
                 out.extend_from_slice(if *value {
@@ -96,32 +144,50 @@ impl Frame {
             }
             Frame::Double(value) => push_line(out, b',', value.as_bytes()),
             Frame::BigNumber(value) => push_line(out, b'(', value.as_bytes()),
-            Frame::BulkError(bytes) => push_blob(out, b'!', bytes),
-            Frame::VerbatimString(bytes) => push_blob(out, b'=', bytes),
+            Frame::BulkError(bytes) => push_blob(out, b'!', bytes, replacement),
+            Frame::VerbatimString(bytes) => {
+                push_blob(out, b'=', bytes, replacement)
+            }
             Frame::Map(items) => {
-                push_line(out, b'%', items.len().to_string().as_bytes());
+                push_line(
+                    out,
+                    b'%',
+                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
+                );
                 for (key, value) in items {
-                    key.encode_into(out);
-                    value.encode_into(out);
+                    key.encode_into(out, header);
+                    value.encode_into(out, header);
                 }
             }
             Frame::Set(items) => {
-                push_line(out, b'~', items.len().to_string().as_bytes());
+                push_line(
+                    out,
+                    b'~',
+                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
+                );
                 for item in items {
-                    item.encode_into(out);
+                    item.encode_into(out, header);
                 }
             }
             Frame::Push(items) => {
-                push_line(out, b'>', items.len().to_string().as_bytes());
+                push_line(
+                    out,
+                    b'>',
+                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
+                );
                 for item in items {
-                    item.encode_into(out);
+                    item.encode_into(out, header);
                 }
             }
             Frame::Attribute(items) => {
-                push_line(out, b'|', items.len().to_string().as_bytes());
+                push_line(
+                    out,
+                    b'|',
+                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
+                );
                 for (key, value) in items {
-                    key.encode_into(out);
-                    value.encode_into(out);
+                    key.encode_into(out, header);
+                    value.encode_into(out, header);
                 }
             }
             Frame::Inline(parts) => {
@@ -143,8 +209,17 @@ fn push_line(out: &mut Vec<u8>, prefix: u8, value: &[u8]) {
     out.extend_from_slice(b"\r\n");
 }
 
-fn push_blob(out: &mut Vec<u8>, prefix: u8, bytes: &[u8]) {
-    push_line(out, prefix, bytes.len().to_string().as_bytes());
+fn push_blob(
+    out: &mut Vec<u8>,
+    prefix: u8,
+    bytes: &[u8],
+    replacement: Option<&str>,
+) {
+    push_line(
+        out,
+        prefix,
+        replacement.unwrap_or(&bytes.len().to_string()).as_bytes(),
+    );
     out.extend_from_slice(bytes);
     out.extend_from_slice(b"\r\n");
 }

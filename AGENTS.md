@@ -56,6 +56,7 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `protocol_fingerprint.rs` | Per-connection BLAKE3/TLSH fingerprints of client-in and client-out bytes.                                                     |
 | `repro.rs`                | `--repro-file` JSONL writer and `ReproRecord` schema.                                                                         |
 | `transaction.rs`          | Tracking upstream-acknowledged transaction commands for `EXEC` reply canonicalization.                                      |
+| `transport.rs`            | Transport configuration, deterministic delivery plans, chunk execution, shutdown, and partial-write accounting. |
 
 Add new modules around a responsibility (parsing, model, execution, I/O,
 config), not around an incidental category. Prefer a new focused file over
@@ -92,6 +93,10 @@ them need a test proving they still hold.
   replicas each have a listener, with primary ports allocated first.
 - **The repro JSONL record is a contract.** External tooling parses it. Add
   fields; do not rename or remove existing ones without a changelog entry.
+- **Delivery plans are deterministic; I/O outcomes are observations.** Keep
+  transport RNG separate from RESP mutation. Fingerprints count accepted
+  bytes, including partial writes. Truncation ends command processing after
+  write-side shutdown; buffered commands must not consume more indexes.
 
 ## Code Conventions
 

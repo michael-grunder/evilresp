@@ -116,7 +116,8 @@ cargo run -- --proxy localhost:6379 --log-mode json
 
 ## Repro JSONL
 
-Use `--repro-file <path>` to append one JSON object per mutated reply:
+Use `--repro-file <path>` to append one JSON object per mutated reply,
+applied transport fault, or ordinary reply delivery failure:
 
 ```bash
 cargo run -- --proxy localhost:6379 --repro-file repro.jsonl
@@ -141,7 +142,35 @@ Other mutations omit `length`. Paths identify the actual encoded target,
 for example `root.1.0.value` for the value of the first map pair inside the
 second array child. Paths refer to the canonicalized tree; in `MANY`, they
 also reflect preceding value mutation.
-Write failures are logged and do not stop proxying.
+Repro-file write failures are logged and do not stop proxying.
+
+Records retain `mutated_response_bytes_hex` and its hash as the full response
+**before transport faults**. Delivery adds these fields:
+
+- `delivery_plan`: version `1`, `extra_reply_count`, `extra_reply_bytes_hex`,
+  `truncate_at` (a byte offset or `null`), and `chunk_ends` (exclusive byte
+  offsets into the planned stream, including its final end). A non-null
+  truncation offset requires write-side shutdown after the last chunk.
+- `planned_wire_bytes_hex`: response plus extra replies, cut at the selected
+  offset. This is the complete intended byte stream, even if delivery failed.
+- `delivery_outcome`: `bytes_written`, SHA-256 `written_bytes_hash`,
+  `completed_chunks`, `shutdown_completed`, `error_stage` (`write`, `flush`,
+  `shutdown`, or `null`), and `error_kind` (Rust I/O error kind or `null`).
+  The written bytes are exactly the first `bytes_written` bytes of the planned
+  stream. A completed chunk includes a successful flush.
+
+To replay delivery without regenerating mutations, decode the planned bytes,
+write and flush each slice ending at `chunk_ends`, then shut down the write
+side if `truncate_at` is non-null. The plan can also reconstruct those bytes:
+append the recorded extra reply the recorded number of times to the original
+mutated response, then truncate. Empty output has no chunks. Transport-only
+records may have an empty `mutations` list and mode `OFF`.
+
+Records are appended after the delivery attempt, before processing another
+command or returning an I/O error. This captures observed partial-write and
+shutdown failures, but a blocked or cancelled delivery has no completed
+record yet. The deterministic plan describes intended delivery; OS errors
+and how much a peer receives are observations, not seeded fault choices.
 
 For a reproducible run, use the same configuration, command order, and
 upstream data. Command indexes are shared across connections, start at zero,
@@ -166,6 +195,8 @@ DEBUG EVIL MUTATIONS <ONE|MANY>
 DEBUG EVIL GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLATIONS <OFF|ON>]
 DEBUG EVIL FRAMING <AUTO|OFF>
 DEBUG EVIL FRAMING LENGTH [PROBABILITY <0.00-100.00>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]
+DEBUG EVIL TRANSPORT OFF
+DEBUG EVIL TRANSPORT [TRUNCATE <OFF|RANDOM|bytes>] [EXTRA <0..16>] [CHUNKS <OFF|RANDOM|offsets>] [PROBABILITY <0.00-100.00>]
 DEBUG EVIL TOPOLOGY <0.00-100.00>
 DEBUG EVIL MODE RESET
 DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>
@@ -181,7 +212,8 @@ return an error without changing the current configuration. `SEED` and
 
 Modes:
 
-- `OFF`: proxy without modifying replies.
+- `OFF`: disable RESP mutation. Independent topology and transport faults
+  can still apply if configured.
 - `RANDOM`: return deterministic random RESP frames without consulting the
   upstream for included commands.
 - `MUTATE`: proxy the command, parse the upstream reply, and recursively mutate
@@ -191,8 +223,9 @@ Modes:
 Selecting a mode resets its probability to `100` (`0` for `OFF`) unless an
 explicit probability is supplied. This controls value mutation; explicit
 framing probability is independent. Mode changes preserve the strategy,
-mutation count, framing, and generator settings. `RANDOM` always generates a
-reply for eligible commands; its `PROBABILITY` setting currently has no effect.
+mutation count, framing, generator, and transport settings. `RANDOM` always
+generates a reply for eligible commands; its `PROBABILITY` setting currently
+has no effect.
 
 `STRATEGY` controls value mutation in `MUTATE` and `OVERFLOW`:
 
@@ -368,6 +401,61 @@ Switch to `DEBUG EVIL GENERATOR VIOLATIONS ON` to mix deliberate protocol
 and conversation faults into subsequent generated replies. This retains the
 selected protocol and corpus.
 
+`TRANSPORT` applies after topology rewriting and RESP mutation, including in
+`OFF` and `RANDOM`. It defaults to disabled, uses the same include/exclude
+filters, and never touches local commands or cluster bootstrap queries.
+It does not consume an extra command index or a `MUTATIONS ONE` slot.
+
+- `EXTRA n`: append up to 16 copies of the valid RESP2/RESP3 simple reply
+  `+EVILRESP\r\n`. Extras have no corresponding upstream command. The
+  connection remains open, allowing tests of reply/command misalignment.
+- `TRUNCATE bytes`: send only that many bytes of the response-plus-extras,
+  then shut down the write side and end the connection. `0` sends immediate
+  EOF. An offset at or beyond the complete stream length is ineligible and
+  does not close the connection. `RANDOM` selects a seeded offset from zero
+  through length minus one; `OFF` disables truncation.
+- `CHUNKS offsets`: split the remaining stream at comma-separated absolute
+  byte offsets, for example `1,3,4,8`. Offsets must be strictly increasing
+  positive integers, with at most 64 boundaries. Offsets at or beyond the
+  remaining length are ignored. `RANDOM` chooses one to 64 seeded boundary
+  candidates where possible and coalesces duplicates; `OFF` writes one chunk.
+- `PROBABILITY`: independently apply the configured plan with this percentage
+  chance per eligible reply; default `100`. At zero, all transport faults
+  are disabled, regardless of the RESP mutation probability.
+
+Options may appear in any order and are case-insensitive. Supply at least
+one option/value pair; omitted options retain their values, and invalid or
+duplicate options leave all settings unchanged. `TRANSPORT OFF` clears all
+transport options and restores transport probability to `100`. Settings are
+per connection, appear in `STATUS`, and survive mode changes and reset.
+
+Planning uses a separate, versioned ChaCha20 RNG derived from the seed,
+command index, command hash, and canonicalized response hash used by RESP
+mutation (empty in `RANDOM`). With RESP mutation off, canonicalization is
+used only for the transport seed; relayed bytes retain their order. Transport
+settings do not change the RESP RNG stream or chosen value/framing mutations.
+
+Each planned chunk is fully written and flushed before the next starts.
+Short writes finish the current chunk; interrupted writes are retried.
+Chunk boundaries specify proxy writes, not TCP packets or client reads:
+socket buffering may split or combine them. No wall-clock delays are used.
+Truncation calls write-side shutdown and ends command processing, so queued
+client commands are not forwarded or assigned indexes. Any write, flush, or
+shutdown failure also ends that connection without retrying the whole reply.
+
+For example, test EOF inside a bulk payload while keeping its RESP header:
+
+```text
+DEBUG EVIL MODE OFF
+DEBUG EVIL INCLUDE GET
+DEBUG EVIL TRANSPORT TRUNCATE 6 CHUNKS 1,3,4
+GET example
+```
+
+An upstream `$3\r\nfoo\r\n` becomes `$3\r\nfo` followed by EOF. Reconnect
+and configure `TRANSPORT EXTRA 1 CHUNKS RANDOM` to test surplus replies with
+seeded fragmentation instead.
+
 Mutated replies can intentionally violate RESP framing, so the client may
 disconnect before subsequent commands can run.
 
@@ -383,9 +471,10 @@ RESP shape when those modes are enabled.
 to zero, resets the deterministic command index, invalidates older client
 connections, and resets the current connection's protocol fingerprints.
 It preserves the seed, filters, canonicalization setting, mutation strategy,
-mutation count setting, framing and generator configuration, and topology
-probability.
-To disable topology mutation too, send `DEBUG EVIL TOPOLOGY 0`.
+mutation count setting, framing, generator and transport configuration, and
+topology probability.
+To disable the independent faults too, send `DEBUG EVIL TOPOLOGY 0` and
+`DEBUG EVIL TRANSPORT OFF`.
 The reset command and its reply are omitted from the new fingerprints.
 
 Canonicalization controls whether upstream replies are normalized before they
@@ -402,8 +491,8 @@ Transaction bookkeeping follows upstream acknowledgements: rejected commands
 do not shift the command names used to canonicalize `EXEC` results. In
 `MUTATE` and `OVERFLOW`, canonicalization still runs at probability zero and
 may reorder the response; explicit framing faults can also run at value
-probability zero. Use `OFF` with topology probability zero for normal
-proxy behavior.
+probability zero. Use `OFF` with topology probability zero and transport off
+for normal proxy behavior.
 
 Filters are case-insensitive. Plain strings match literal command names, regex
 strings such as `^GET.*` match command names, and attributes such as `@read`,
@@ -434,6 +523,14 @@ DEBUG PROTOCOL <IN|OUT> <BLAKE3|TLSH>
 similarity hash, or `TNULL` until the observed byte stream is large and varied
 enough for TLSH. `DEBUG PROTOCOL` requests and replies do not update the
 fingerprints they read.
+
+Output fingerprints count each byte accepted by the client writer, including
+extra replies and a prefix accepted before an I/O failure. Omitted bytes after
+truncation are not counted. Identical bytes have identical fingerprints
+regardless of chunk boundaries or short writes. A successful socket write
+does not prove the peer received or parsed those bytes. Fingerprints cannot
+be queried on a connection after truncation closes it; repro delivery outcomes
+retain the accepted byte count and SHA-256 hash for that reply.
 
 ## Protocol limits
 

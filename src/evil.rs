@@ -14,6 +14,7 @@ use crate::framing::FramingConfig;
 use crate::generator::GeneratorConfig;
 use crate::mutation;
 use crate::resp::Frame;
+use crate::transport::TransportConfig;
 
 pub const DEFAULT_EXCLUDED_COMMANDS: &[&str] = &[
     "AUTH",
@@ -153,6 +154,7 @@ pub struct EvilConfig {
     pub mutation_count: MutationCount,
     pub(crate) framing: FramingConfig,
     pub(crate) generator: GeneratorConfig,
+    pub(crate) transport: TransportConfig,
     include: Vec<FilterSpec>,
     exclude: Vec<FilterSpec>,
 }
@@ -174,6 +176,7 @@ impl Default for EvilConfig {
             mutation_count: MutationCount::Many,
             framing: FramingConfig::Auto,
             generator: GeneratorConfig::default(),
+            transport: TransportConfig::default(),
             include: Vec::new(),
             exclude,
         }
@@ -263,6 +266,10 @@ impl EvilConfig {
                 // Commit only after every option has been validated.
                 self.mode = mode;
                 self.probability = probability;
+                Ok(DebugResult::ok())
+            }
+            "TRANSPORT" => {
+                self.transport = self.transport.updated(&argv[3..])?;
                 Ok(DebugResult::ok())
             }
             "GENERATOR" => {
@@ -396,7 +403,7 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {} {}",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {} {} {}",
             self.mode,
             self.seed,
             self.probability,
@@ -408,6 +415,7 @@ impl EvilConfig {
             self.mutation_count.as_str(),
             self.framing.status(),
             self.generator.status(),
+            self.transport.status(),
         )
     }
 }
@@ -798,7 +806,7 @@ fn sort_key(frame: &Frame) -> Vec<u8> {
     frame.encode()
 }
 
-fn rng_for(
+pub(crate) fn rng_for(
     seed: u64,
     command_index: u64,
     command_hash: &str,
@@ -1028,7 +1036,7 @@ mod tests {
             config
                 .apply_debug_command(&strings(["DEBUG", "EVIL", "MODE", mode]))
                 .unwrap();
-            assert!(config.status().ends_with(status));
+            assert!(config.status().contains(status));
         }
         let before = config.status();
         for args in [
@@ -1055,7 +1063,7 @@ mod tests {
                 "OFF",
             ]))
             .unwrap();
-        assert!(config.status().ends_with("generator_protocol=RESP3 generator_corpus=RANDOM generator_violations=OFF"));
+        assert!(config.status().contains("generator_protocol=RESP3 generator_corpus=RANDOM generator_violations=OFF"));
     }
 
     #[test]

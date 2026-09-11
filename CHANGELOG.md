@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added independent `DEBUG EVIL TRANSPORT` plans for truncation followed by
+  write-side shutdown, up to 16 extra replies, explicit or seeded chunk
+  boundaries, and per-reply probability. Plans honor filters and bootstrap
+  bypasses, are per connection, and survive mode changes and reset.
+- Added versioned `delivery_plan`, `planned_wire_bytes_hex`, and
+  `delivery_outcome` fields to repro records, including accepted byte counts,
+  hashes, completed chunks, shutdown results, and I/O failure stage/kind.
+  Transport-only faults and ordinary reply write failures produce records.
+  Existing mutated-response fields retain the pre-transport response.
+
 - Added `DEBUG EVIL GENERATOR` with per-connection `PROTOCOL RESP2|RESP3`,
   `CORPUS BOUNDARY|RANDOM`, and `VIOLATIONS OFF|ON` controls, reported by
   `STATUS` and preserved by mode changes and reset. Partial updates retain
@@ -63,6 +73,13 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Unified reply delivery after RESP/topology processing. Transport uses a
+  separate seeded RNG; chunk plans do not guarantee client read boundaries.
+  Truncation and delivery errors stop processing buffered commands.
+- Append repro records after delivery to capture partial failures, before
+  processing the next command. Pending or cancelled delivery has no completed
+  record; observed OS failures are separate from deterministic plans.
+
 - Defaulted generation to RESP2 with a weighted boundary corpus and
   violations disabled. Generated trees stay within the selected protocol
   unless violations are enabled; protocol selection does not translate
@@ -98,6 +115,10 @@ All notable changes to this project will be documented in this file.
   server capabilities on connect.
 
 ### Fixed
+
+- Count successful partial client writes in protocol fingerprints, including
+  when a later write fails. Retry interrupted writes and reject zero-progress
+  writes without losing the accepted prefix from delivery accounting.
 
 - Made rejected `DEBUG EVIL MODE` updates leave the active configuration
   unchanged; `SEED` and `STATUS` now reject extra arguments.

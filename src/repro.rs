@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::error::AppResult;
 use crate::evil::{AppliedMutation, EvilMode, deterministic_hash};
+pub use crate::transport::{DeliveryOutcome, DeliveryPlan};
 
 #[derive(Clone)]
 pub struct ReproWriter {
@@ -50,6 +51,12 @@ pub struct ReproRecord {
     pub mutated_response_bytes_hex: String,
     pub selected_evil_mode: EvilMode,
     pub mutations: Vec<AppliedMutation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_plan: Option<DeliveryPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_outcome: Option<DeliveryOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_wire_bytes_hex: Option<String>,
 }
 
 impl ReproRecord {
@@ -78,6 +85,9 @@ impl ReproRecord {
             mutated_response_bytes_hex: hex::encode(mutated_response_bytes),
             selected_evil_mode,
             mutations,
+            delivery_plan: None,
+            delivery_outcome: None,
+            planned_wire_bytes_hex: None,
         }
     }
 }

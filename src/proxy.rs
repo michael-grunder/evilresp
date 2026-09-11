@@ -19,9 +19,9 @@ use crate::cluster_rewrite::{
 };
 use crate::error::{AppError, AppResult};
 use crate::evil::{
-    DebugAction, DebugResult, EvilConfig, EvilMode, canonicalize_reply,
-    canonicalize_transaction_reply, deterministic_hash, mutate_reply,
-    random_reply,
+    DebugAction, DebugResult, EvilConfig, EvilMode, MutatedReply,
+    canonicalize_reply, canonicalize_transaction_reply, deterministic_hash,
+    mutate_reply, random_reply,
 };
 use crate::protocol_fingerprint::{
     ProtocolDirection, ProtocolFingerprints, parse_debug_protocol,
@@ -30,6 +30,7 @@ use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
 use crate::topology_evil::{maybe_mutate_topology, normalize_redirection};
 use crate::transaction::TransactionCommands;
+use crate::transport::{self, DeliveryPlan};
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -281,8 +282,12 @@ async fn proxy_connection(
                 client_write.write_all(&response).await?;
                 fingerprints.reset();
             } else {
-                client_write.write_all(&response).await?;
-                fingerprints.update(ProtocolDirection::Out, &response);
+                write_client_bytes(
+                    &mut client_write,
+                    &mut fingerprints,
+                    &response,
+                )
+                .await?;
             }
             continue;
         }
@@ -338,9 +343,13 @@ async fn proxy_connection(
 
         publish_monitor_command(&state, connection_id, &command_frame);
 
-        if config.mode == EvilMode::Random && should_mutate {
-            if let Some(local_slots) = &state.local_slots
-                && let Some(mutated) = maybe_mutate_topology(
+        let transport_enabled = should_mutate && config.transport.enabled();
+        let (upstream_bytes, response, delivery_seed_hash) = if config.mode
+            == EvilMode::Random
+            && should_mutate
+        {
+            let topology = if let Some(local_slots) = &state.local_slots {
+                maybe_mutate_topology(
                     &config,
                     command_id,
                     &command_hash,
@@ -348,154 +357,138 @@ async fn proxy_connection(
                     None,
                     local_slots,
                 )?
+            } else {
+                None
+            };
+            let response = match topology {
+                Some(mutated) => MutatedReply {
+                    bytes: mutated.frame.encode(),
+                    mutations: mutated.mutations,
+                },
+                None => random_reply(&config, command_id, &command_hash),
+            };
+            (None, response, String::new())
+        } else {
+            upstream_write.write_all(&command_bytes).await?;
+            upstream_write.flush().await?;
+            let upstream_bytes = read_raw_frame(&mut upstream_read).await?;
+            let exec_commands =
+                transaction_commands.observe(&argv, &upstream_bytes);
+            let relay_bytes =
+                normalize_cluster_redirection(&upstream_bytes, &state)?;
+            let topology = if should_mutate
+                && let Some(local_slots) = &state.local_slots
             {
-                let bytes = mutated.frame.encode();
-                write_repro(
-                    &state,
-                    ReproRecord::new(
-                        config.seed,
-                        connection_id,
-                        command_id,
-                        &command_bytes,
-                        None,
-                        &bytes,
-                        config.mode,
-                        mutated.mutations,
-                    ),
-                )
-                .await;
-                write_client_bytes(
-                    &mut client_write,
-                    &mut fingerprints,
-                    &bytes,
-                )
-                .await?;
-                continue;
-            }
-
-            let mutated = random_reply(&config, command_id, &command_hash);
-            write_repro(
-                &state,
-                ReproRecord::new(
-                    config.seed,
-                    connection_id,
+                maybe_mutate_topology(
+                    &config,
                     command_id,
-                    &command_bytes,
-                    None,
-                    &mutated.bytes,
-                    config.mode,
-                    mutated.mutations,
-                ),
-            )
-            .await;
-            write_client_bytes(
-                &mut client_write,
-                &mut fingerprints,
-                &mutated.bytes,
-            )
-            .await?;
-            continue;
-        }
-
-        upstream_write.write_all(&command_bytes).await?;
-        upstream_write.flush().await?;
-
-        let upstream_bytes = read_raw_frame(&mut upstream_read).await?;
-        let exec_transaction_commands =
-            transaction_commands.observe(&argv, &upstream_bytes);
-        let relay_upstream_bytes =
-            normalize_cluster_redirection(&upstream_bytes, &state)?;
-        let mut applied_mutations = Vec::new();
-        let response_frame = if should_mutate
-            && let Some(local_slots) = &state.local_slots
-            && let Some(mutated) = maybe_mutate_topology(
-                &config,
-                command_id,
-                &command_hash,
-                &command_frame,
-                Some(&relay_upstream_bytes),
-                local_slots,
-            )? {
-            applied_mutations = mutated.mutations;
-            Some(mutated.frame)
-        } else {
-            None
-        };
-        let base_response_bytes = response_frame
-            .as_ref()
-            .map(Frame::encode)
-            .unwrap_or_else(|| relay_upstream_bytes.clone());
-        let response_bytes = if should_mutate
-            && matches!(config.mode, EvilMode::Mutate | EvilMode::Overflow)
-        {
-            let upstream_frame = match &response_frame {
-                Some(frame) => frame.clone(),
-                None => parse_frame(&relay_upstream_bytes)?,
+                    &command_hash,
+                    &command_frame,
+                    Some(&relay_bytes),
+                    local_slots,
+                )?
+            } else {
+                None
             };
-            let mutation_frame = match exec_transaction_commands {
-                Some(commands) => canonicalize_transaction_reply(
-                    config.canonicalization,
-                    &commands,
-                    &upstream_frame,
-                ),
-                None => canonicalize_reply(
-                    config.canonicalization,
-                    command_name.as_deref(),
-                    &upstream_frame,
-                ),
+            let (base_bytes, mut mutations) = match topology {
+                Some(mutated) => (mutated.frame.encode(), mutated.mutations),
+                None => (relay_bytes, Vec::new()),
             };
-            let upstream_hash = deterministic_hash(&mutation_frame.encode());
-            let mutated = mutate_reply(
-                &config,
-                command_id,
-                &command_hash,
-                &upstream_hash,
-                &mutation_frame,
-            );
-            applied_mutations.extend(mutated.mutations);
-            if !applied_mutations.is_empty() {
-                write_repro(
-                    &state,
-                    ReproRecord::new(
-                        config.seed,
-                        connection_id,
-                        command_id,
-                        &command_bytes,
-                        Some(&upstream_bytes),
-                        &mutated.bytes,
-                        config.mode,
-                        applied_mutations,
+            let mutate_values = should_mutate
+                && matches!(config.mode, EvilMode::Mutate | EvilMode::Overflow);
+            // Transport uses the same canonical input as RESP mutation,
+            // even when it runs alone with MODE OFF. Relay bytes stay intact.
+            let canonical = if mutate_values || transport_enabled {
+                let frame = parse_frame(&base_bytes)?;
+                Some(match exec_commands {
+                    Some(commands) => canonicalize_transaction_reply(
+                        config.canonicalization,
+                        &commands,
+                        &frame,
                     ),
-                )
-                .await;
-            }
-            mutated.bytes
-        } else {
-            if !applied_mutations.is_empty() {
-                write_repro(
-                    &state,
-                    ReproRecord::new(
-                        config.seed,
-                        connection_id,
-                        command_id,
-                        &command_bytes,
-                        Some(&upstream_bytes),
-                        &base_response_bytes,
-                        config.mode,
-                        applied_mutations,
+                    None => canonicalize_reply(
+                        config.canonicalization,
+                        command_name.as_deref(),
+                        &frame,
                     ),
-                )
-                .await;
-            }
-            base_response_bytes
+                })
+            } else {
+                None
+            };
+            let seed_hash = canonical
+                .as_ref()
+                .map(|frame| deterministic_hash(&frame.encode()))
+                .unwrap_or_default();
+            let bytes = if mutate_values {
+                // mutate_values always prepares a canonical frame above.
+                let frame =
+                    canonical.as_ref().expect("canonical mutation input");
+                let mutated = mutate_reply(
+                    &config,
+                    command_id,
+                    &command_hash,
+                    &seed_hash,
+                    frame,
+                );
+                mutations.extend(mutated.mutations);
+                mutated.bytes
+            } else {
+                base_bytes
+            };
+            (
+                Some(upstream_bytes),
+                MutatedReply { bytes, mutations },
+                seed_hash,
+            )
         };
 
-        write_client_bytes(
+        let plan = if transport_enabled {
+            config.transport.plan(
+                config.seed,
+                command_id,
+                &command_hash,
+                &delivery_seed_hash,
+                response.bytes.len(),
+            )
+        } else {
+            DeliveryPlan::plain(response.bytes.len())
+        };
+        let record_needed = !response.mutations.is_empty() || plan.is_fault();
+        // Keep the pre-transport response fields unchanged for existing readers.
+        let mut record = state.repro.as_ref().map(|_| {
+            ReproRecord::new(
+                config.seed,
+                connection_id,
+                command_id,
+                &command_bytes,
+                upstream_bytes.as_deref(),
+                &response.bytes,
+                config.mode,
+                response.mutations,
+            )
+        });
+        let wire_bytes = plan.wire_bytes(response.bytes);
+        let (outcome, result) = transport::deliver(
             &mut client_write,
             &mut fingerprints,
-            &response_bytes,
+            &wire_bytes,
+            &plan,
         )
-        .await?;
+        .await;
+        // Persist successful delivery and partial failures before leaving the
+        // connection or consuming another command index.
+        if (record_needed || result.is_err())
+            && let Some(mut record) = record.take()
+        {
+            record.planned_wire_bytes_hex = Some(hex::encode(&wire_bytes));
+            record.delivery_plan = Some(plan.clone());
+            record.delivery_outcome = Some(outcome);
+            write_repro(&state, record).await;
+        }
+        result?;
+        if plan.truncate_at.is_some() {
+            return Ok(());
+        }
     }
 }
 
@@ -640,8 +633,7 @@ async fn write_client_bytes<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    writer.write_all(bytes).await?;
-    fingerprints.update(ProtocolDirection::Out, bytes);
+    transport::write_counted(writer, fingerprints, bytes, &mut 0).await?;
     Ok(())
 }
 
@@ -1313,6 +1305,21 @@ mod tests {
         assert!(first_status.contains("framing=OFF"));
         assert!(first_status.contains("generator_protocol=RESP3 generator_corpus=RANDOM generator_violations=ON"));
 
+        transport_setup(
+            &mut first,
+            &["DEBUG", "EVIL", "TRANSPORT", "TRUNCATE", "0"],
+        )
+        .await;
+        first
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "STATUS"]))
+            .await
+            .unwrap();
+        let status =
+            String::from_utf8(read_raw_frame(&mut first).await.unwrap())
+                .unwrap();
+        assert!(status.contains("transport=ON"));
+
         let mut second = spawn_proxy_client(target, state, 1);
         second
             .get_mut()
@@ -1326,6 +1333,7 @@ mod tests {
         assert!(second_status.contains("seed=0"));
         assert!(second_status.contains("strategy=PRESERVE mutations=MANY"));
         assert!(second_status.contains("framing=AUTO"));
+        assert!(second_status.contains("transport=OFF"));
         assert!(second_status.contains("generator_protocol=RESP2 generator_corpus=BOUNDARY generator_violations=OFF"));
 
         drop(first);
@@ -1421,6 +1429,252 @@ mod tests {
         proxy.await.unwrap().unwrap();
         upstream.await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn transport_test_state(repro: ReproWriter) -> SharedState {
+        SharedState {
+            repro: Some(repro),
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
+        }
+    }
+
+    async fn transport_setup(
+        client: &mut BufReader<UnixStream>,
+        args: &[&str],
+    ) {
+        client
+            .get_mut()
+            .write_all(&resp_command(args))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(client).await.unwrap(), b"+OK\r\n");
+    }
+
+    #[tokio::test]
+    async fn transport_truncation_records_repeatable_eof_and_stops_pipeline() {
+        use tokio::io::AsyncReadExt;
+        let path = unique_socket_path("transport-truncate");
+        let repro_path = path.with_extension("jsonl");
+        let listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    resp_command(&["GET", "one"])
+                );
+                stream.get_mut().write_all(b"$3\r\nfoo\r\n").await.unwrap();
+                // The second pipelined command must never be forwarded.
+                assert_eq!(
+                    stream.read_u8().await.unwrap_err().kind(),
+                    ErrorKind::UnexpectedEof
+                );
+            }
+        });
+        for connection_id in [7, 99] {
+            let state = transport_test_state(
+                ReproWriter::open(&repro_path).await.unwrap(),
+            );
+            let ids = state.command_ids.clone();
+            let (client, server) = UnixStream::pair().unwrap();
+            let proxy = tokio::spawn(proxy_connection(
+                Box::new(server),
+                ProxyTarget {
+                    upstream: Endpoint::Unix(path.clone()),
+                    listen: Endpoint::Unix(unique_socket_path("unused")),
+                },
+                state,
+                connection_id,
+                0,
+            ));
+            let mut client = BufReader::new(client);
+            transport_setup(
+                &mut client,
+                &[
+                    "DEBUG",
+                    "EVIL",
+                    "TRANSPORT",
+                    "TRUNCATE",
+                    "6",
+                    "CHUNKS",
+                    "RANDOM",
+                ],
+            )
+            .await;
+            // RESET preserves the plan, and local replies cannot be truncated.
+            transport_setup(&mut client, &["DEBUG", "EVIL", "MODE", "RESET"])
+                .await;
+            assert_eq!(ids.load(Ordering::SeqCst), 0);
+            let pipeline =
+                [resp_command(&["GET", "one"]), resp_command(&["GET", "two"])]
+                    .concat();
+            client.get_mut().write_all(&pipeline).await.unwrap();
+            let mut bytes = Vec::new();
+            // EOF must arrive from the proxy without a client-side shutdown.
+            client.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"$3\r\nfo");
+            proxy.await.unwrap().unwrap();
+            assert_eq!(ids.load(Ordering::SeqCst), 1);
+        }
+        upstream.await.unwrap();
+        let records = std::fs::read_to_string(&repro_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["delivery_plan"], records[1]["delivery_plan"]);
+        assert_eq!(
+            records[0]["delivery_outcome"],
+            records[1]["delivery_outcome"]
+        );
+        for record in records {
+            assert_eq!(
+                record["mutated_response_bytes_hex"],
+                hex::encode(b"$3\r\nfoo\r\n")
+            );
+            assert_eq!(
+                record["planned_wire_bytes_hex"],
+                hex::encode(b"$3\r\nfo")
+            );
+            assert_eq!(record["delivery_plan"]["truncate_at"], 6);
+            assert_eq!(record["delivery_outcome"]["bytes_written"], 6);
+            assert_eq!(record["delivery_outcome"]["shutdown_completed"], true);
+            assert_eq!(
+                record["delivery_outcome"]["written_bytes_hash"],
+                deterministic_hash(b"$3\r\nfo")
+            );
+            assert_eq!(
+                record["delivery_outcome"]["error_kind"],
+                serde_json::Value::Null
+            );
+            assert_eq!(record["mutations"], serde_json::json!([]));
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(repro_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_extra_replies_keep_connection_and_fingerprints_consistent()
+     {
+        let path = unique_socket_path("transport-extra");
+        let repro_path = path.with_extension("jsonl");
+        let listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            for (command, response) in [
+                (&["GET", "one"][..], &b"+OK\r\n"[..]),
+                (&["GET", "two"][..], &b"+OK\r\n"[..]),
+                (&["PING"][..], &b"+PONG\r\n"[..]),
+                (&["HELLO"][..], &b"+OK\r\n"[..]),
+            ] {
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    resp_command(command)
+                );
+                stream.get_mut().write_all(response).await.unwrap();
+            }
+        });
+        let state =
+            transport_test_state(ReproWriter::open(&repro_path).await.unwrap());
+        let ids = state.command_ids.clone();
+        let (client, server) = UnixStream::pair().unwrap();
+        let proxy = tokio::spawn(proxy_connection(
+            Box::new(server),
+            ProxyTarget {
+                upstream: Endpoint::Unix(path.clone()),
+                listen: Endpoint::Unix(unique_socket_path("unused")),
+            },
+            state,
+            3,
+            0,
+        ));
+        let mut client = BufReader::new(client);
+        transport_setup(
+            &mut client,
+            &["DEBUG", "EVIL", "INCLUDE", "GET", "HELLO"],
+        )
+        .await;
+        transport_setup(
+            &mut client,
+            &["DEBUG", "EVIL", "TRANSPORT", "EXTRA", "2", "CHUNKS", "1,3"],
+        )
+        .await;
+        let mut output = b"+OK\r\n+OK\r\n".to_vec();
+        for key in ["one", "two"] {
+            client
+                .get_mut()
+                .write_all(&resp_command(&["GET", key]))
+                .await
+                .unwrap();
+            for expected in
+                [b"+OK\r\n".as_slice(), b"+EVILRESP\r\n", b"+EVILRESP\r\n"]
+            {
+                let bytes = read_raw_frame(&mut client).await.unwrap();
+                assert_eq!(bytes, expected);
+                output.extend(bytes);
+            }
+        }
+        // Include and default exclude filters both protect non-target traffic.
+        for (args, expected) in [
+            (&["PING"][..], b"+PONG\r\n".as_slice()),
+            (&["HELLO"][..], b"+OK\r\n"),
+        ] {
+            client
+                .get_mut()
+                .write_all(&resp_command(args))
+                .await
+                .unwrap();
+            let bytes = read_raw_frame(&mut client).await.unwrap();
+            assert_eq!(bytes, expected);
+            output.extend(bytes);
+        }
+        client
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "PROTOCOL", "OUT", "BLAKE3"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_frame(&read_raw_frame(&mut client).await.unwrap()).unwrap(),
+            Frame::BulkString(Some(blake3_hex(&output).into_bytes()))
+        );
+        drop(client);
+        proxy.await.unwrap().unwrap();
+        upstream.await.unwrap();
+        assert_eq!(ids.load(Ordering::SeqCst), 4);
+        let records = std::fs::read_to_string(&repro_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert_eq!(record["delivery_plan"]["extra_reply_count"], 2);
+            assert_eq!(
+                record["delivery_plan"]["chunk_ends"],
+                serde_json::json!([1, 3, 27])
+            );
+            assert_eq!(
+                record["planned_wire_bytes_hex"],
+                hex::encode(b"+OK\r\n+EVILRESP\r\n+EVILRESP\r\n")
+            );
+            assert_eq!(record["delivery_outcome"]["bytes_written"], 27);
+            assert_eq!(record["delivery_outcome"]["shutdown_completed"], false);
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(repro_path).unwrap();
     }
 
     #[tokio::test]
@@ -1921,6 +2175,20 @@ mod tests {
             )]),
         };
         let mut client = spawn_proxy_client(target, state.clone(), 0);
+        transport_setup(
+            &mut client,
+            &["DEBUG", "EVIL", "TRANSPORT", "TRUNCATE", "0"],
+        )
+        .await;
+        client
+            .get_mut()
+            .write_all(&resp_command(&["CLUSTER", "SLOTS"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_raw_frame(&mut client).await.unwrap(),
+            cluster_slots_frame().encode()
+        );
 
         client
             .get_mut()
@@ -1933,6 +2201,8 @@ mod tests {
               %4\r\n$2\r\nid\r\n$1\r\na\r\n$4\r\nport\r\n:6382\r\n$2\r\nip\r\n$9\r\n127.0.0.1\r\n$4\r\nrole\r\n$6\r\nmaster\r\n"
         );
         assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
+        transport_setup(&mut client, &["DEBUG", "EVIL", "TRANSPORT", "OFF"])
+            .await;
 
         client
             .get_mut()

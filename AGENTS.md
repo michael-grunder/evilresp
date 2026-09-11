@@ -46,7 +46,8 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `error.rs`                | `AppError` (`thiserror`) and `AppResult<T>`. Add variants here, not ad-hoc types.                                             |
 | `resp.rs`                 | RESP2/RESP3 `Frame` type, parsing, encoding, raw frame reads off a stream.                                                    |
 | `proxy.rs`                | Listener/accept loop, per-connection state, command dispatch, local `DEBUG`/`MONITOR` handling, reset epochs. Largest module. |
-| `evil.rs`                 | `EvilConfig` parsing (`DEBUG EVIL ...`), include/exclude filters, canonicalization, the seeded mutation pipeline.              |
+| `evil.rs`                 | `EvilConfig` parsing (`DEBUG EVIL ...`), include/exclude filters, canonicalization, and deterministic mutation seeding.         |
+| `mutation.rs`             | Original-frame selection, structure-preserving scalar mutation, frame replacement, random generation, and length corruption. |
 | `topology_evil.rs`        | Fake/altered `MOVED`/`ASK` redirections, independent of RESP mutation.                                                        |
 | `cluster.rs`              | Startup `CLUSTER SLOTS` probe, `Topology`, mapping upstream nodes to local listeners.                                          |
 | `cluster_rewrite.rs`      | Rewriting `CLUSTER SLOTS`/`SHARDS`/`NODES` replies and redirections to local listeners.                                        |

@@ -154,6 +154,8 @@ their own `DEBUG EVIL` setup commands.
 ```text
 DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
+DEBUG EVIL STRATEGY <PRESERVE|REPLACE>
+DEBUG EVIL MUTATIONS <ONE|MANY>
 DEBUG EVIL TOPOLOGY <0.00-100.00>
 DEBUG EVIL MODE RESET
 DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>
@@ -177,10 +179,44 @@ Modes:
 - `OVERFLOW`: mutate toward overflow-prone values and lengths.
 
 Selecting a mode resets its probability to `100` (`0` for `OFF`) unless an
-explicit probability is supplied. In `MUTATE` and `OVERFLOW`, probability
-applies to each visited frame and a separate length-corruption attempt, not
-to the reply as a whole. `RANDOM` always generates a reply for eligible
-commands; its `PROBABILITY` setting currently has no effect.
+explicit probability is supplied. It preserves the strategy and mutation
+count settings. `RANDOM` always generates a reply for eligible commands;
+its `PROBABILITY` setting currently has no effect.
+
+`STRATEGY` controls value mutation in `MUTATE` and `OVERFLOW`:
+
+- `PRESERVE` (default): retain aggregate containers and mutate their scalar
+  children, including map keys and values. Scalar types are retained; their
+  contents may still be invalid, such as nonnumeric double text. Nulls and
+  empty containers have no mutable scalar value. In `OVERFLOW`, booleans
+  and inline frames are also ineligible.
+- `REPLACE`: allow any original frame, including an entire aggregate, to be
+  selected. `MUTATE` replaces it with a random frame; `OVERFLOW` applies
+  overflow values and replaces aggregates, nulls, booleans, and inline frames
+  with the maximum signed 64-bit integer. Replacement subtrees are not
+  recursively mutated again.
+
+`MUTATIONS` controls selection in those same two modes:
+
+- `MANY` (default): apply probability independently at each eligible original
+  frame, then make a separate root length-corruption attempt at the same
+  probability. This length fault can still break the outer framing with
+  `STRATEGY PRESERVE`; the original aggregate bodies survive value mutation.
+- `ONE`: apply probability once to the reply, then uniformly select one
+  eligible original frame and change its value or replace it. No additional
+  length corruption runs. At probability `100`, exactly one RESP mutation
+  occurs if an eligible frame exists. If the probability check fails or no
+  frame is eligible, the canonicalized reply is returned unchanged and no
+  RESP mutation is recorded. For example, an empty array has no eligible
+  frame with `PRESERVE`, but can be replaced with `REPLACE`.
+
+These controls are per connection, appear in `STATUS`, and reject missing,
+invalid, or extra arguments without changing configuration. They do not
+affect `OFF`, `RANDOM`, or independent topology mutation. Canonicalization
+and topology rewriting still precede RESP mutation, so `ONE` limits the RESP
+mutation operation count, not every possible difference from upstream bytes.
+The new mutation selection changes seeded `MUTATE` and `OVERFLOW` output
+relative to earlier versions; reproduce with the same build and settings.
 
 Configure and exercise the proxy on the same connection, for example in an
 interactive `redis-cli -p 6380` session:
@@ -189,6 +225,8 @@ interactive `redis-cli -p 6380` session:
 DEBUG EVIL MODE RESET
 DEBUG EVIL SEED 1234
 DEBUG EVIL INCLUDE GET
+DEBUG EVIL STRATEGY PRESERVE
+DEBUG EVIL MUTATIONS ONE
 DEBUG EVIL MODE MUTATE PROBABILITY 10
 GET example
 DEBUG EVIL STATUS
@@ -208,8 +246,9 @@ RESP shape when those modes are enabled.
 `DEBUG EVIL MODE RESET` disables RESP evil mode, sets RESP mutation probability
 to zero, resets the deterministic command index, invalidates older client
 connections, and resets the current connection's protocol fingerprints.
-It preserves the seed, filters, canonicalization setting, and topology
-probability. To disable topology mutation too, send `DEBUG EVIL TOPOLOGY 0`.
+It preserves the seed, filters, canonicalization setting, mutation strategy,
+mutation count setting, and topology probability. To disable topology
+mutation too, send `DEBUG EVIL TOPOLOGY 0`.
 The reset command and its reply are omitted from the new fingerprints.
 
 Canonicalization controls whether upstream replies are normalized before they

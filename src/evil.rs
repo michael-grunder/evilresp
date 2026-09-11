@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use regex::Regex;
@@ -11,6 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
+use crate::mutation;
 use crate::resp::Frame;
 
 pub const DEFAULT_EXCLUDED_COMMANDS: &[&str] = &[
@@ -110,6 +110,36 @@ impl FromStr for CanonicalizationMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationStrategy {
+    Preserve,
+    Replace,
+}
+
+impl MutationStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "PRESERVE",
+            Self::Replace => "REPLACE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationCount {
+    One,
+    Many,
+}
+
+impl MutationCount {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::One => "ONE",
+            Self::Many => "MANY",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EvilConfig {
     pub seed: u64,
@@ -117,6 +147,8 @@ pub struct EvilConfig {
     pub probability: f64,
     pub topology_probability: f64,
     pub canonicalization: CanonicalizationMode,
+    pub strategy: MutationStrategy,
+    pub mutation_count: MutationCount,
     include: Vec<FilterSpec>,
     exclude: Vec<FilterSpec>,
 }
@@ -134,6 +166,8 @@ impl Default for EvilConfig {
             probability: 0.0,
             topology_probability: 0.0,
             canonicalization: CanonicalizationMode::Unordered,
+            strategy: MutationStrategy::Preserve,
+            mutation_count: MutationCount::Many,
             include: Vec::new(),
             exclude,
         }
@@ -225,6 +259,43 @@ impl EvilConfig {
                 self.probability = probability;
                 Ok(DebugResult::ok())
             }
+            "STRATEGY" => {
+                if argv.len() != 4 {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL STRATEGY requires PRESERVE or REPLACE"
+                            .to_owned(),
+                    ));
+                }
+                self.strategy =
+                    match argv[3].to_ascii_uppercase().as_str() {
+                        "PRESERVE" => MutationStrategy::Preserve,
+                        "REPLACE" => MutationStrategy::Replace,
+                        _ => return Err(AppError::EvilConfig(
+                            "DEBUG EVIL STRATEGY requires PRESERVE or REPLACE"
+                                .to_owned(),
+                        )),
+                    };
+                Ok(DebugResult::ok())
+            }
+            "MUTATIONS" => {
+                if argv.len() != 4 {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL MUTATIONS requires ONE or MANY".to_owned(),
+                    ));
+                }
+                self.mutation_count =
+                    match argv[3].to_ascii_uppercase().as_str() {
+                        "ONE" => MutationCount::One,
+                        "MANY" => MutationCount::Many,
+                        _ => {
+                            return Err(AppError::EvilConfig(
+                                "DEBUG EVIL MUTATIONS requires ONE or MANY"
+                                    .to_owned(),
+                            ));
+                        }
+                    };
+                Ok(DebugResult::ok())
+            }
             "CANONICALIZE" => {
                 let Some(mode) = argv.get(3) else {
                     return Err(AppError::EvilConfig(
@@ -311,7 +382,7 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}]",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={}",
             self.mode,
             self.seed,
             self.probability,
@@ -319,6 +390,8 @@ impl EvilConfig {
             self.canonicalization,
             self.include_filters().join(","),
             self.exclude_filters().join(","),
+            self.strategy.as_str(),
+            self.mutation_count.as_str(),
         )
     }
 }
@@ -546,7 +619,7 @@ pub fn random_reply(
     command_hash: &str,
 ) -> MutatedReply {
     let mut rng = rng_for(config.seed, command_index, command_hash, "");
-    let frame = random_frame(&mut rng, 0);
+    let frame = mutation::random_frame(&mut rng, 0);
     MutatedReply {
         bytes: frame.encode(),
         mutations: vec![AppliedMutation {
@@ -565,28 +638,7 @@ pub fn mutate_reply(
 ) -> MutatedReply {
     let mut rng =
         rng_for(config.seed, command_index, command_hash, upstream_hash);
-    let mut frame = upstream.clone();
-    let mut mutations = Vec::new();
-    mutate_frame(
-        &mut frame,
-        config.mode,
-        config.probability,
-        &mut rng,
-        "root",
-        &mut mutations,
-    );
-
-    let mut bytes = frame.encode();
-    if should_apply(config.probability, &mut rng)
-        && corrupt_first_length(&mut bytes, config.mode)
-    {
-        mutations.push(AppliedMutation {
-            path: "root".to_owned(),
-            kind: MutationKind::WrongLength,
-        });
-    }
-
-    MutatedReply { bytes, mutations }
+    mutation::mutate(upstream, config, &mut rng)
 }
 
 fn canonicalize_all_containers(frame: &mut Frame) {
@@ -724,207 +776,6 @@ fn rng_for(
     ChaCha20Rng::from_seed(bytes)
 }
 
-fn mutate_frame(
-    frame: &mut Frame,
-    mode: EvilMode,
-    probability: f64,
-    rng: &mut ChaCha20Rng,
-    path: &str,
-    mutations: &mut Vec<AppliedMutation>,
-) {
-    if should_apply(probability, rng) {
-        let kind = mutate_one(frame, mode, rng);
-        mutations.push(AppliedMutation {
-            path: path.to_owned(),
-            kind,
-        });
-    }
-
-    match frame {
-        Frame::Array(Some(items)) | Frame::Set(items) | Frame::Push(items) => {
-            for (index, item) in items.iter_mut().enumerate() {
-                mutate_frame(
-                    item,
-                    mode,
-                    probability,
-                    rng,
-                    &format!("{path}.{index}"),
-                    mutations,
-                );
-            }
-        }
-        Frame::Map(items) | Frame::Attribute(items) => {
-            for (index, (key, value)) in items.iter_mut().enumerate() {
-                mutate_frame(
-                    key,
-                    mode,
-                    probability,
-                    rng,
-                    &format!("{path}.{index}.key"),
-                    mutations,
-                );
-                mutate_frame(
-                    value,
-                    mode,
-                    probability,
-                    rng,
-                    &format!("{path}.{index}.value"),
-                    mutations,
-                );
-            }
-        }
-        _ => {}
-    }
-}
-
-fn should_apply(probability: f64, rng: &mut ChaCha20Rng) -> bool {
-    probability > 0.0 && rng.gen_range(0.0..100.0) < probability
-}
-
-fn mutate_one(
-    frame: &mut Frame,
-    mode: EvilMode,
-    rng: &mut ChaCha20Rng,
-) -> MutationKind {
-    if mode == EvilMode::Overflow {
-        apply_overflow(frame, rng);
-        return MutationKind::OverflowValue;
-    }
-
-    match rng.gen_range(0..3) {
-        0 => {
-            *frame = random_frame(rng, 0);
-            MutationKind::WrongType
-        }
-        1 => {
-            apply_random_value(frame, rng);
-            MutationKind::RandomValue
-        }
-        _ => {
-            *frame = random_frame(rng, 0);
-            MutationKind::RandomFrame
-        }
-    }
-}
-
-fn apply_random_value(frame: &mut Frame, rng: &mut ChaCha20Rng) {
-    match frame {
-        Frame::SimpleString(value)
-        | Frame::SimpleError(value)
-        | Frame::Double(value)
-        | Frame::BigNumber(value) => *value = random_ascii(rng, 24),
-        Frame::Integer(value) => *value = rng.r#gen(),
-        Frame::BulkString(Some(bytes))
-        | Frame::BulkError(bytes)
-        | Frame::VerbatimString(bytes) => *bytes = random_bytes(rng, 32),
-        Frame::BulkString(None) => {
-            *frame = Frame::BulkString(Some(random_bytes(rng, 16)))
-        }
-        Frame::Array(None) => {
-            *frame = Frame::Array(Some(vec![random_frame(rng, 1)]))
-        }
-        Frame::Null => *frame = Frame::BulkString(Some(random_bytes(rng, 8))),
-        Frame::Boolean(value) => *value = !*value,
-        Frame::Inline(parts) => {
-            *parts = vec![random_bytes(rng, 8), random_bytes(rng, 8)]
-        }
-        Frame::Array(Some(_))
-        | Frame::Map(_)
-        | Frame::Set(_)
-        | Frame::Push(_)
-        | Frame::Attribute(_) => {
-            *frame = random_frame(rng, 0);
-        }
-    }
-}
-
-fn apply_overflow(frame: &mut Frame, rng: &mut ChaCha20Rng) {
-    match frame {
-        Frame::Integer(value) => {
-            *value = if rng.r#gen() { i64::MAX } else { i64::MIN };
-        }
-        Frame::SimpleString(value)
-        | Frame::SimpleError(value)
-        | Frame::Double(value)
-        | Frame::BigNumber(value) => {
-            *value = if rng.r#gen() {
-                i64::MAX.to_string()
-            } else {
-                u64::MAX.to_string()
-            };
-        }
-        Frame::BulkString(Some(bytes))
-        | Frame::BulkError(bytes)
-        | Frame::VerbatimString(bytes) => {
-            *bytes = if rng.r#gen() {
-                i64::MAX.to_string().into_bytes()
-            } else {
-                u64::MAX.to_string().into_bytes()
-            };
-        }
-        _ => *frame = Frame::Integer(i64::MAX),
-    }
-}
-
-fn random_frame(rng: &mut ChaCha20Rng, depth: u8) -> Frame {
-    let max_kind = if depth >= 2 { 6 } else { 8 };
-    match rng.gen_range(0..max_kind) {
-        0 => Frame::SimpleString(random_ascii(rng, 20)),
-        1 => Frame::SimpleError(random_ascii(rng, 20)),
-        2 => Frame::Integer(rng.r#gen()),
-        3 => Frame::BulkString(Some(random_bytes(rng, 32))),
-        4 => Frame::Null,
-        5 => Frame::Boolean(rng.r#gen()),
-        6 => Frame::Array(Some(vec![
-            random_frame(rng, depth + 1),
-            random_frame(rng, depth + 1),
-        ])),
-        _ => Frame::Map(vec![(
-            random_frame(rng, depth + 1),
-            random_frame(rng, depth + 1),
-        )]),
-    }
-}
-
-fn random_ascii(rng: &mut ChaCha20Rng, max_len: usize) -> String {
-    let len = rng.gen_range(0..=max_len);
-    (0..len)
-        .map(|_| char::from(rng.gen_range(0x21_u8..=0x7e_u8)))
-        .collect()
-}
-
-fn random_bytes(rng: &mut ChaCha20Rng, max_len: usize) -> Vec<u8> {
-    let len = rng.gen_range(0..=max_len);
-    (0..len).map(|_| rng.r#gen()).collect()
-}
-
-fn corrupt_first_length(bytes: &mut Vec<u8>, mode: EvilMode) -> bool {
-    let Some(prefix) = bytes.first().copied() else {
-        return false;
-    };
-    if !matches!(
-        prefix,
-        b'$' | b'*' | b'!' | b'=' | b'%' | b'~' | b'>' | b'|'
-    ) {
-        return false;
-    }
-
-    let Some(line_end) = bytes.windows(2).position(|window| window == b"\r\n")
-    else {
-        return false;
-    };
-    let current = std::str::from_utf8(&bytes[1..line_end])
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok());
-    let replacement = if mode == EvilMode::Overflow {
-        i64::MAX
-    } else {
-        current.unwrap_or(0).saturating_add(1)
-    };
-    bytes.splice(1..line_end, replacement.to_string().bytes());
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,6 +828,37 @@ mod tests {
     }
 
     #[test]
+    fn mutation_controls_are_local_validated_and_preserved_by_reset() {
+        let mut config = EvilConfig::default();
+        assert_eq!(config.strategy, MutationStrategy::Preserve);
+        assert_eq!(config.mutation_count, MutationCount::Many);
+        for args in [
+            ["DEBUG", "EVIL", "STRATEGY", "replace"],
+            ["DEBUG", "EVIL", "MUTATIONS", "one"],
+            ["DEBUG", "EVIL", "MODE", "OVERFLOW"],
+            ["DEBUG", "EVIL", "MODE", "RESET"],
+        ] {
+            config.apply_debug_command(&strings(args)).unwrap();
+        }
+        assert_eq!(config.strategy, MutationStrategy::Replace);
+        assert_eq!(config.mutation_count, MutationCount::One);
+        assert!(config.status().ends_with("strategy=REPLACE mutations=ONE"));
+        assert_eq!(EvilConfig::default().strategy, MutationStrategy::Preserve);
+        assert_eq!(EvilConfig::default().mutation_count, MutationCount::Many);
+        for args in [
+            ["DEBUG", "EVIL", "STRATEGY", "preserve"],
+            ["DEBUG", "EVIL", "MUTATIONS", "many"],
+        ] {
+            config.apply_debug_command(&strings(args)).unwrap();
+        }
+        assert!(
+            config
+                .status()
+                .ends_with("strategy=PRESERVE mutations=MANY")
+        );
+    }
+
+    #[test]
     fn rejected_debug_commands_preserve_configuration() {
         let mut config = EvilConfig {
             seed: 42,
@@ -997,6 +879,12 @@ mod tests {
             vec!["STATUS", "unexpected"],
             vec!["INCLUDE", "GET", "["],
             vec!["EXCLUDE", "SET", "["],
+            vec!["STRATEGY"],
+            vec!["STRATEGY", "unknown"],
+            vec!["STRATEGY", "REPLACE", "extra"],
+            vec!["MUTATIONS"],
+            vec!["MUTATIONS", "unknown"],
+            vec!["MUTATIONS", "ONE", "extra"],
         ] {
             let argv = ["DEBUG", "EVIL"]
                 .into_iter()
@@ -1136,6 +1024,80 @@ mod tests {
 
         assert_eq!(first.bytes, second.bytes);
         assert!(!first.mutations.is_empty());
+    }
+
+    #[test]
+    fn one_mutation_selects_original_children_with_exact_seeded_output() {
+        let frame =
+            parse_frame(b"*2\r\n#t\r\n%1\r\n#t\r\n~1\r\n#t\r\n").unwrap();
+        // Seeds 0, 1, and 2 select the array child, nested set child,
+        // and map key respectively for this command/reply hash tuple.
+        for (seed, path, expected) in [
+            (0, "root.0", b"*2\r\n#f\r\n%1\r\n#t\r\n~1\r\n#t\r\n"),
+            (
+                1,
+                "root.1.0.value.0",
+                b"*2\r\n#t\r\n%1\r\n#t\r\n~1\r\n#f\r\n",
+            ),
+            (2, "root.1.0.key", b"*2\r\n#t\r\n%1\r\n#f\r\n~1\r\n#t\r\n"),
+        ] {
+            let config = EvilConfig {
+                seed,
+                mode: EvilMode::Mutate,
+                probability: 100.0,
+                mutation_count: MutationCount::One,
+                ..EvilConfig::default()
+            };
+            let result =
+                mutate_reply(&config, 9, "command", "upstream", &frame);
+            assert_eq!(result.bytes, expected);
+            assert_eq!(result.mutations.len(), 1);
+            assert_eq!(result.mutations[0].path, path);
+            assert_eq!(result.mutations[0].kind, MutationKind::RandomValue);
+        }
+    }
+
+    #[test]
+    fn replacement_subtrees_are_not_mutated_again() {
+        let frame =
+            parse_frame(b"*2\r\n#t\r\n%1\r\n#t\r\n~1\r\n#t\r\n").unwrap();
+        // Seed 2 generates a map containing a nested array. MANY may
+        // corrupt its root length but must not mutate the generated children.
+        let config = EvilConfig {
+            seed: 2,
+            mode: EvilMode::Mutate,
+            probability: 100.0,
+            strategy: MutationStrategy::Replace,
+            ..EvilConfig::default()
+        };
+        let result = mutate_reply(&config, 9, "command", "upstream", &frame);
+        assert_eq!(
+            result.bytes,
+            b"%2\r\n_\r\n*2\r\n_\r\n:518262545842838998\r\n"
+        );
+        assert_eq!(
+            result
+                .mutations
+                .iter()
+                .map(|m| (m.path.as_str(), m.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("root", MutationKind::RandomFrame),
+                ("root", MutationKind::WrongLength),
+            ]
+        );
+
+        // Seed 0 with ONE replaces the root with a complete two-item array.
+        let config = EvilConfig {
+            seed: 0,
+            mutation_count: MutationCount::One,
+            ..config
+        };
+        let result = mutate_reply(&config, 9, "command", "upstream", &frame);
+        assert_eq!(result.bytes, b"*2\r\n#f\r\n#t\r\n");
+        assert_eq!(result.mutations.len(), 1);
+        assert_eq!(result.mutations[0].path, "root");
+        assert_eq!(result.mutations[0].kind, MutationKind::RandomFrame);
     }
 
     #[test]

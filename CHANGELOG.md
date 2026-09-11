@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `DEBUG EVIL STRATEGY <PRESERVE|REPLACE>` to choose scalar mutation
+  within original reply containers or whole-frame replacement, and
+  `DEBUG EVIL MUTATIONS <ONE|MANY>` to select one eligible frame per reply
+  without an additional length fault or mutate multiple frames. Both
+  settings are per connection, reported by `STATUS`, and preserved by reset.
 - Added one-to-one cluster replica listeners after the existing primary port
   assignments. `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER NODES`, and
   redirections use the same primary and replica mapping, preserving node IDs
@@ -41,6 +46,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Defaulted RESP value mutation to `PRESERVE`, allowing `OVERFLOW` to reach
+  values inside arrays, maps, and sets at full probability. `MANY` retains
+  the separate root length-corruption attempt. Selected value mutations
+  always change their target, and replacement subtrees are no longer mutated
+  again. These changes alter seeded `MUTATE` and `OVERFLOW` output; reproduce
+  cases with the same build and configuration.
 - Limited incoming RESP frames to 64 MiB and 128 nesting levels, with
   incremental reads instead of allocation from advertised lengths.
 - Documented build instructions, protocol limitations, probability and filter

@@ -4,6 +4,7 @@ pub mod cluster_rewrite;
 pub mod error;
 pub mod evil;
 pub mod logging;
+mod mutation;
 pub mod protocol_fingerprint;
 pub mod proxy;
 pub mod repro;

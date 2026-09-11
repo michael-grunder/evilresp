@@ -1266,6 +1266,17 @@ mod tests {
         };
 
         let mut first = spawn_proxy_client(target.clone(), state.clone(), 0);
+        for args in [
+            ["DEBUG", "EVIL", "STRATEGY", "REPLACE"],
+            ["DEBUG", "EVIL", "MUTATIONS", "ONE"],
+        ] {
+            first
+                .get_mut()
+                .write_all(&resp_command(&args))
+                .await
+                .unwrap();
+            assert_eq!(read_raw_frame(&mut first).await.unwrap(), b"+OK\r\n");
+        }
         first
             .get_mut()
             .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RANDOM"]))
@@ -1281,6 +1292,7 @@ mod tests {
         let first_status =
             String::from_utf8(read_bulk_string(&mut first).await).unwrap();
         assert!(first_status.contains("mode=RANDOM"));
+        assert!(first_status.contains("strategy=REPLACE mutations=ONE"));
 
         let mut second = spawn_proxy_client(target, state, 1);
         second
@@ -1293,11 +1305,100 @@ mod tests {
             String::from_utf8(read_bulk_string(&mut second).await).unwrap();
         assert!(second_status.contains("mode=OFF"));
         assert!(second_status.contains("seed=0"));
+        assert!(second_status.contains("strategy=PRESERVE mutations=MANY"));
 
         drop(first);
         drop(second);
         upstream.abort();
         let _ = upstream.await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_mutation_preserves_nested_wire_reply_and_next_command() {
+        let path = unique_socket_path("upstream-single-mutation");
+        let listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            // Local mutation controls must never arrive upstream.
+            assert_eq!(
+                read_raw_frame(&mut read).await.unwrap(),
+                resp_command(&["LRANGE", "key", "0", "-1"])
+            );
+            write
+                .write_all(b"*2\r\n_\r\n*1\r\n:9223372036854775807\r\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                read_raw_frame(&mut read).await.unwrap(),
+                resp_command(&["PING"])
+            );
+            write.write_all(b"+PONG\r\n").await.unwrap();
+        });
+        let (client, server) = UnixStream::pair().unwrap();
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
+        };
+        let command_ids = state.command_ids.clone();
+        let proxy = tokio::spawn(proxy_connection(
+            Box::new(server),
+            target,
+            state,
+            0,
+            0,
+        ));
+        let mut client = BufReader::new(client);
+        for args in [
+            ["DEBUG", "EVIL", "MODE", "OVERFLOW"],
+            ["DEBUG", "EVIL", "STRATEGY", "PRESERVE"],
+            ["DEBUG", "EVIL", "MUTATIONS", "ONE"],
+        ] {
+            client
+                .get_mut()
+                .write_all(&resp_command(&args))
+                .await
+                .unwrap();
+            assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+        }
+        assert_eq!(command_ids.load(Ordering::SeqCst), 0);
+        client
+            .get_mut()
+            .write_all(&resp_command(&["LRANGE", "key", "0", "-1"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_raw_frame(&mut client).await.unwrap(),
+            b"*2\r\n_\r\n*1\r\n:-9223372036854775808\r\n"
+        );
+        client
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "OFF"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+        client
+            .get_mut()
+            .write_all(&resp_command(&["PING"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+PONG\r\n");
+        assert_eq!(command_ids.load(Ordering::SeqCst), 2);
+        drop(client);
+        proxy.await.unwrap().unwrap();
+        upstream.await.unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

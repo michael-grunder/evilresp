@@ -552,6 +552,7 @@ fn apply_debug_protocol(
         )),
         Err(error) => {
             warn!(%error, "rejected DEBUG PROTOCOL command");
+            debug!(?argv, "rejected DEBUG PROTOCOL command arguments");
             Frame::SimpleError(format!("ERR {error}"))
         }
     }
@@ -733,6 +734,97 @@ mod tests {
     use std::time::Duration;
 
     static SOCKET_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rejected_debug_protocol_logs_full_arguments_only_when_verbose() {
+        for level in [
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
+        ] {
+            for (args, error_detail) in [
+                (
+                    vec!["DEBUG", "PROTOCOL"],
+                    Some("missing protocol direction"),
+                ),
+                (
+                    vec!["DEBUG", "PROTOCOL", "IN"],
+                    Some("missing protocol hash"),
+                ),
+                (
+                    vec!["DEBUG", "PROTOCOL", "SIDEWAYS"],
+                    Some(
+                        "unknown protocol direction \"SIDEWAYS\"; expected <IN|OUT>",
+                    ),
+                ),
+                (
+                    vec!["DEBUG", "PROTOCOL", "IN", "SHA256"],
+                    Some(
+                        "unknown protocol hash \"SHA256\"; expected <BLAKE3|TLSH>",
+                    ),
+                ),
+                (
+                    vec!["DEBUG", "PROTOCOL", "IN", "BLAKE3", "", "a\n\"b"],
+                    Some("unexpected argument \"\""),
+                ),
+                (vec!["DEBUG", "PROTOCOL", "IN", "BLAKE3"], None),
+            ] {
+                let argv: Vec<String> =
+                    args.into_iter().map(str::to_owned).collect();
+                let buffer = LogBuffer::default();
+                let writer = buffer.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(level)
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                let response =
+                    tracing::subscriber::with_default(subscriber, || {
+                        apply_debug_protocol(
+                            &ProtocolFingerprints::new(),
+                            &argv,
+                        )
+                    });
+                let log = String::from_utf8(buffer.0.lock().unwrap().clone())
+                    .unwrap();
+                if let Some(error_detail) = error_detail {
+                    let Frame::SimpleError(error) = response else {
+                        panic!("expected an error response");
+                    };
+                    assert!(error.contains(error_detail), "{error}");
+                    assert!(log.contains(error_detail), "{log}");
+                    assert!(log.contains("rejected DEBUG PROTOCOL command"));
+                    if level == tracing::Level::INFO {
+                        assert!(!log.contains("argv="));
+                        assert!(!log.contains("a\\n\\\"b"));
+                    } else {
+                        assert!(log.contains(&format!("argv={argv:?}")));
+                    }
+                } else {
+                    assert_eq!(
+                        response,
+                        Frame::BulkString(Some(blake3_hex(b"").into_bytes()))
+                    );
+                    assert!(log.is_empty());
+                }
+            }
+        }
+    }
 
     #[test]
     fn detects_local_commands_case_insensitively() {

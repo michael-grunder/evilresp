@@ -81,6 +81,12 @@ Human-readable colored logs are the default. Increase verbosity with `-v` or
 `-vv`. Logs go to stderr. `RUST_LOG`, when valid, overrides the verbosity
 filter.
 
+Warnings for rejected `DEBUG PROTOCOL` commands identify the invalid argument
+and its valid choices, or report a missing argument or the first extra argument.
+With `-v` or `-vv`, an additional debug log includes the complete parsed
+argument array as `argv=["DEBUG", "PROTOCOL", ...]`, with quoted strings and
+escaped control characters.
+
 ```bash
 cargo run -- --proxy localhost:6379 -v
 ```

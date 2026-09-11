@@ -77,7 +77,7 @@ impl FromStr for ProtocolDirection {
             "IN" => Ok(Self::In),
             "OUT" => Ok(Self::Out),
             _ => Err(AppError::ProtocolFingerprint(format!(
-                "unknown protocol direction {value:?}"
+                "unknown protocol direction {value:?}; expected <IN|OUT>"
             ))),
         }
     }
@@ -106,7 +106,7 @@ impl FromStr for ProtocolHash {
             "BLAKE3" => Ok(Self::Blake3),
             "TLSH" => Ok(Self::Tlsh),
             _ => Err(AppError::ProtocolFingerprint(format!(
-                "unknown protocol hash {value:?}"
+                "unknown protocol hash {value:?}; expected <BLAKE3|TLSH>"
             ))),
         }
     }
@@ -124,16 +124,32 @@ impl fmt::Display for ProtocolHash {
 pub fn parse_debug_protocol(
     argv: &[String],
 ) -> AppResult<(ProtocolDirection, ProtocolHash)> {
-    if argv.len() != 4
+    const USAGE: &str = "expected DEBUG PROTOCOL <IN|OUT> <BLAKE3|TLSH>";
+
+    if argv.len() < 2
         || !argv[0].eq_ignore_ascii_case("DEBUG")
         || !argv[1].eq_ignore_ascii_case("PROTOCOL")
     {
-        return Err(AppError::ProtocolFingerprint(
-            "expected DEBUG PROTOCOL <IN|OUT> <BLAKE3|TLSH>".to_owned(),
-        ));
+        return Err(AppError::ProtocolFingerprint(USAGE.to_owned()));
     }
 
-    Ok((argv[2].parse()?, argv[3].parse()?))
+    let direction = argv.get(2).ok_or_else(|| {
+        AppError::ProtocolFingerprint(format!(
+            "{USAGE}; missing protocol direction"
+        ))
+    })?;
+    let direction = direction.parse()?;
+    let algorithm = argv.get(3).ok_or_else(|| {
+        AppError::ProtocolFingerprint(format!("{USAGE}; missing protocol hash"))
+    })?;
+    let algorithm = algorithm.parse()?;
+    if let Some(extra) = argv.get(4) {
+        return Err(AppError::ProtocolFingerprint(format!(
+            "{USAGE}; unexpected argument {extra:?}"
+        )));
+    }
+
+    Ok((direction, algorithm))
 }
 
 #[derive(Debug)]

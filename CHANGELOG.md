@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added the complete parsed argument array to debug logs for rejected
+  `DEBUG PROTOCOL` commands, visible with `-v` or `-vv`. Error replies and
+  warnings now identify invalid arguments and valid choices, missing arguments,
+  or the first extra argument.
 - Added CLI help examples for TCP and Unix sockets, custom listening addresses,
   verbose logging, and mutation recording.
 - Rewrote `CLUSTER SHARDS` and `CLUSTER NODES` replies to the local proxy

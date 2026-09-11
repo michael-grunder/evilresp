@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinSet;
@@ -17,6 +17,7 @@ use crate::cluster_rewrite::{
     is_cluster_nodes, is_cluster_shards, rewrite_cluster_nodes,
     rewrite_cluster_shards,
 };
+use crate::connection::{ProxyStream, finish_fault};
 use crate::error::{AppError, AppResult};
 use crate::evil::{
     DebugAction, DebugResult, EvilConfig, EvilMode, MutatedReply,
@@ -36,13 +37,7 @@ use crate::topology_evil::{
 use crate::transaction::TransactionCommands;
 use crate::transport::{self, DeliveryPlan};
 
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-
 const MONITOR_BUFFER: usize = 1024;
-
-type ProxyStream = Box<dyn AsyncReadWrite>;
 
 enum ProxyListener {
     Tcp(TcpListener),
@@ -226,6 +221,7 @@ async fn proxy_connection(
     connection_id: u64,
     mut reset_epoch: u64,
 ) -> AppResult<()> {
+    let reset_supported = client.supports_reset();
     let upstream = connect_upstream(&target.upstream).await?;
     let (client_read, mut client_write) = tokio::io::split(client);
     let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
@@ -289,7 +285,12 @@ async fn proxy_connection(
 
         if is_debug_evil(&argv) {
             publish_monitor_command(&state, connection_id, &command_frame);
-            let result = apply_debug_evil(&mut config, &argv, &state.stats);
+            let result = apply_debug_evil(
+                &mut config,
+                &argv,
+                &state.stats,
+                reset_supported,
+            );
             let response = result.frame.encode();
             if result.action == DebugAction::ResetIncrementingState {
                 reset_incrementing_state(&state, &mut reset_epoch).await;
@@ -374,10 +375,25 @@ async fn proxy_connection(
                 None
             };
         let transport_enabled = should_mutate && config.transport.enabled();
-        let (upstream_bytes, response, delivery_seed_hash) = if config.mode
-            == EvilMode::Random
-            && should_mutate
+        let before_plan = if transport_enabled {
+            config
+                .transport
+                .before_plan(config.seed, command_id, &command_hash)
+        } else {
+            None
+        };
+        let (upstream_bytes, response, delivery_seed_hash) = if before_plan
+            .is_some()
         {
+            (
+                None,
+                MutatedReply {
+                    bytes: Vec::new(),
+                    mutations: Vec::new(),
+                },
+                String::new(),
+            )
+        } else if config.mode == EvilMode::Random && should_mutate {
             let topology = if pre_topology.is_some() {
                 pre_topology
             } else if let Some(local_slots) = &state.local_slots {
@@ -491,7 +507,9 @@ async fn proxy_connection(
             (upstream_bytes, MutatedReply { bytes, mutations }, seed_hash)
         };
 
-        let plan = if transport_enabled {
+        let plan = if let Some(plan) = before_plan {
+            plan
+        } else if transport_enabled {
             config.transport.plan(
                 config.seed,
                 command_id,
@@ -517,22 +535,36 @@ async fn proxy_connection(
             )
         });
         let wire_bytes = plan.wire_bytes(response.bytes);
-        let (outcome, result) = transport::deliver(
+        let (mut outcome, mut result) = transport::deliver(
             &mut client_write,
             &mut fingerprints,
             &wire_bytes,
             &plan,
         )
         .await;
-        // Persist successful delivery and partial failures before leaving the
-        // connection or consuming another command index.
-        if (record_needed || result.is_err())
-            && let Some(mut record) = record.take()
-        {
-            record.planned_wire_bytes_hex = Some(hex::encode(&wire_bytes));
-            record.delivery_plan = Some(plan.clone());
-            record.delivery_outcome = Some(outcome);
-            write_repro(&state, record).await;
+        if let Some(fault) = &plan.connection_fault {
+            if result.is_ok() {
+                result = finish_fault(
+                    client_read,
+                    client_write,
+                    &mut fingerprints,
+                    fault,
+                    &mut outcome,
+                )
+                .await;
+            } else {
+                drop(client_read);
+                drop(client_write);
+            }
+            record_delivery(&state, record.take(), &plan, &wire_bytes, outcome)
+                .await;
+            return result.map_err(Into::into);
+        }
+        // Persist successful delivery and partial failures before consuming
+        // another command index.
+        if record_needed || result.is_err() {
+            record_delivery(&state, record.take(), &plan, &wire_bytes, outcome)
+                .await;
         }
         result?;
         if plan.truncate_at.is_some() {
@@ -572,8 +604,20 @@ fn apply_debug_evil(
     config: &mut EvilConfig,
     argv: &[String],
     stats: &Stats,
+    reset_supported: bool,
 ) -> DebugResult {
-    match config.apply_debug_command(argv) {
+    let previous_transport = config.transport.clone();
+    let result = config.apply_debug_command(argv).and_then(|result| {
+        if config.transport.requires_tcp() && !reset_supported {
+            config.transport = previous_transport;
+            Err(AppError::EvilConfig(
+                "FAULT RESET requires a TCP client connection".to_owned(),
+            ))
+        } else {
+            Ok(result)
+        }
+    });
+    match result {
         Ok(result) => {
             // Successful parsing guarantees a subcommand is present.
             if argv[2].eq_ignore_ascii_case("STATUS") {
@@ -613,6 +657,21 @@ fn apply_debug_protocol(
             debug!(?argv, "rejected DEBUG PROTOCOL command arguments");
             Frame::SimpleError(format!("ERR {error}"))
         }
+    }
+}
+
+async fn record_delivery(
+    state: &SharedState,
+    record: Option<ReproRecord>,
+    plan: &DeliveryPlan,
+    wire_bytes: &[u8],
+    outcome: transport::DeliveryOutcome,
+) {
+    if let Some(mut record) = record {
+        record.planned_wire_bytes_hex = Some(hex::encode(wire_bytes));
+        record.delivery_plan = Some(plan.clone());
+        record.delivery_outcome = Some(outcome);
+        write_repro(state, record).await;
     }
 }
 
@@ -789,6 +848,7 @@ mod tests {
     use crate::cli::TcpEndpoint;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+    use tokio::io::AsyncRead;
 
     static SOCKET_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -822,7 +882,7 @@ mod tests {
                 let stats = Stats::default();
                 let argv =
                     ["DEBUG", "EVIL", "MODE", "MUTATE"].map(str::to_owned);
-                let result = apply_debug_evil(&mut config, &argv, &stats);
+                let result = apply_debug_evil(&mut config, &argv, &stats, true);
                 assert_eq!(result.frame.encode(), b"+OK\r\n");
                 let log = String::from_utf8(buffer.0.lock().unwrap().clone())
                     .unwrap();
@@ -835,7 +895,7 @@ mod tests {
 
                 buffer.0.lock().unwrap().clear();
                 let argv = ["DEBUG", "EVIL", "STATUS"].map(str::to_owned);
-                apply_debug_evil(&mut config, &argv, &stats);
+                apply_debug_evil(&mut config, &argv, &stats, true);
                 assert!(buffer.0.lock().unwrap().is_empty());
             });
         }
@@ -892,7 +952,7 @@ mod tests {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             let result = tracing::dispatcher::with_default(&dispatch, || {
-                apply_debug_evil(&mut config, &argv, &state.stats)
+                apply_debug_evil(&mut config, &argv, &state.stats, true)
             });
             if args == "MODE RESET" {
                 assert_eq!(result.action, DebugAction::ResetIncrementingState);
@@ -1380,6 +1440,7 @@ mod tests {
                 "RESET".to_owned(),
             ],
             &state.stats,
+            true,
         );
 
         if result.action == DebugAction::ResetIncrementingState {
@@ -2096,6 +2157,266 @@ mod tests {
             .await
             .unwrap();
         read_raw_frame(client).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn connection_failures_control_execution_reset_and_stop_pipelines() {
+        use tokio::io::AsyncReadExt;
+
+        const REPLY: &[u8] = b"$5\r\nvalue\r\n";
+        for action in ["CLOSE", "RESET"] {
+            for point in ["BEFORE", "AFTER", "REPLY", "3", "RANDOM"] {
+                let path = unique_socket_path("connection-fault");
+                let repro_path = unique_socket_path("connection-fault-repro");
+                let upstream_listener = UnixListener::bind(&path).unwrap();
+                let upstream = tokio::spawn(async move {
+                    let (stream, _) = upstream_listener.accept().await.unwrap();
+                    let (read, mut write) = tokio::io::split(stream);
+                    let mut read = BufReader::new(read);
+                    let mut commands = 0;
+                    while let Ok(bytes) = read_raw_frame(&mut read).await {
+                        assert_eq!(bytes, resp_command(&["GET", "foo"]));
+                        commands += 1;
+                        write.write_all(REPLY).await.unwrap();
+                    }
+                    commands
+                });
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let socket = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (server, _) = listener.accept().await.unwrap();
+                let target = ProxyTarget {
+                    upstream: Endpoint::Unix(path.clone()),
+                    listen: Endpoint::Tcp(
+                        listener
+                            .local_addr()
+                            .unwrap()
+                            .to_string()
+                            .parse()
+                            .unwrap(),
+                    ),
+                };
+                let state = transport_test_state(
+                    ReproWriter::open(&repro_path).await.unwrap(),
+                );
+                let indexes = state.command_ids.clone();
+                let proxy = tokio::spawn(proxy_connection(
+                    Box::new(server),
+                    target,
+                    state,
+                    99,
+                    0,
+                ));
+                let mut client = BufReader::new(socket);
+                assert_eq!(
+                    topology_request(
+                        &mut client,
+                        &[
+                            "DEBUG",
+                            "EVIL",
+                            "TRANSPORT",
+                            "FAULT",
+                            action,
+                            "AT",
+                            point,
+                        ]
+                    )
+                    .await,
+                    b"+OK\r\n"
+                );
+                client
+                    .get_mut()
+                    .write_all(
+                        &[
+                            resp_command(&["GET", "foo"]),
+                            resp_command(&["GET", "foo"]),
+                        ]
+                        .concat(),
+                    )
+                    .await
+                    .unwrap();
+                let mut received = Vec::new();
+                let result = client.read_to_end(&mut received).await;
+                if action == "RESET" {
+                    assert_eq!(
+                        result.unwrap_err().kind(),
+                        ErrorKind::ConnectionReset
+                    );
+                } else {
+                    result.unwrap();
+                }
+                proxy.await.unwrap().unwrap();
+                assert_eq!(
+                    upstream.await.unwrap(),
+                    usize::from(point != "BEFORE")
+                );
+                assert_eq!(indexes.load(Ordering::SeqCst), 1);
+                let records = std::fs::read_to_string(&repro_path).unwrap();
+                assert_eq!(records.lines().count(), 1);
+                let record: serde_json::Value =
+                    serde_json::from_str(records.trim()).unwrap();
+                let fault = &record["delivery_plan"]["connection_fault"];
+                assert_eq!(record["delivery_plan"]["version"], 2);
+                assert_eq!(fault["action"], action.to_ascii_lowercase());
+                assert!(fault["duration_ms"].is_null());
+                let after_bytes =
+                    fault["after_bytes"].as_u64().unwrap() as usize;
+                match point {
+                    "BEFORE" | "AFTER" => assert_eq!(after_bytes, 0),
+                    "REPLY" => assert_eq!(after_bytes, REPLY.len()),
+                    "3" => assert_eq!(after_bytes, 3),
+                    _ => assert!(after_bytes < REPLY.len()),
+                }
+                let planned = &REPLY[..after_bytes];
+                assert!(planned.starts_with(&received));
+                if action == "CLOSE" {
+                    assert_eq!(received, planned);
+                }
+                assert_eq!(
+                    record["planned_wire_bytes_hex"],
+                    hex::encode(planned)
+                );
+                assert_eq!(
+                    record["delivery_outcome"]["bytes_written"],
+                    after_bytes
+                );
+                assert_eq!(
+                    record["delivery_outcome"]["written_bytes_hash"],
+                    deterministic_hash(planned)
+                );
+                assert_eq!(record["delivery_outcome"]["fault_completed"], true);
+                assert_eq!(
+                    record["delivery_outcome"]["shutdown_completed"],
+                    action == "CLOSE"
+                );
+                assert!(record["delivery_outcome"]["error_stage"].is_null());
+                assert_eq!(
+                    record["upstream_response_bytes_hex"].is_null(),
+                    point == "BEFORE"
+                );
+                assert_eq!(
+                    record["mutated_response_bytes_hex"],
+                    hex::encode(if point == "BEFORE" { b"" } else { REPLY })
+                );
+                std::fs::remove_file(path).unwrap();
+                std::fs::remove_file(repro_path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn reset_fault_is_rejected_atomically_on_unix_connections() {
+        let mut config = EvilConfig::default();
+        let stats = Stats::default();
+        let before = config.status();
+        let result = apply_debug_evil(
+            &mut config,
+            &[
+                "DEBUG",
+                "EVIL",
+                "TRANSPORT",
+                "FAULT",
+                "RESET",
+                "AT",
+                "BEFORE",
+            ]
+            .map(str::to_owned),
+            &stats,
+            false,
+        );
+        assert_eq!(result.frame.encode(), b"-ERR invalid evil configuration: FAULT RESET requires a TCP client connection\r\n");
+        assert_eq!(config.status(), before);
+    }
+
+    #[tokio::test]
+    async fn opted_in_stall_records_peer_close_and_never_processes_pipeline() {
+        for point in ["BEFORE", "AFTER"] {
+            let path = unique_socket_path("stall");
+            let repro_path = unique_socket_path("stall-repro");
+            let listener = UnixListener::bind(&path).unwrap();
+            let upstream = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = tokio::io::split(stream);
+                let mut read = BufReader::new(read);
+                let mut commands = 0;
+                while let Ok(bytes) = read_raw_frame(&mut read).await {
+                    assert_eq!(bytes, resp_command(&["GET", "foo"]));
+                    commands += 1;
+                    write.write_all(b"+OK\r\n").await.unwrap();
+                }
+                commands
+            });
+            let target = ProxyTarget {
+                upstream: Endpoint::Unix(path.clone()),
+                listen: Endpoint::Unix(unique_socket_path("unused")),
+            };
+            let state = transport_test_state(
+                ReproWriter::open(&repro_path).await.unwrap(),
+            );
+            let indexes = state.command_ids.clone();
+            let (client, server) = UnixStream::pair().unwrap();
+            let proxy = tokio::spawn(proxy_connection(
+                Box::new(server),
+                target,
+                state,
+                1,
+                0,
+            ));
+            let mut client = BufReader::new(client);
+            assert_eq!(
+                topology_request(
+                    &mut client,
+                    &[
+                        "DEBUG",
+                        "EVIL",
+                        "TRANSPORT",
+                        "FAULT",
+                        "STALL",
+                        "AT",
+                        point,
+                        "DURATION",
+                        "3600000",
+                    ]
+                )
+                .await,
+                b"+OK\r\n"
+            );
+            client
+                .get_mut()
+                .write_all(
+                    &[
+                        resp_command(&["GET", "foo"]),
+                        resp_command(&["GET", "foo"]),
+                    ]
+                    .concat(),
+                )
+                .await
+                .unwrap();
+            // EOF terminates the stall without waiting for its deadline.
+            drop(client);
+            proxy.await.unwrap().unwrap();
+            assert_eq!(upstream.await.unwrap(), usize::from(point == "AFTER"));
+            assert_eq!(indexes.load(Ordering::SeqCst), 1);
+            let text = std::fs::read_to_string(&repro_path).unwrap();
+            assert_eq!(text.lines().count(), 1);
+            let record: serde_json::Value =
+                serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(
+                record["delivery_plan"]["connection_fault"]["action"],
+                "stall"
+            );
+            assert_eq!(
+                record["delivery_plan"]["connection_fault"]["duration_ms"],
+                3_600_000
+            );
+            assert_eq!(record["delivery_outcome"]["stall_end"], "peer_closed");
+            assert_eq!(record["delivery_outcome"]["fault_completed"], true);
+            assert_eq!(record["delivery_outcome"]["bytes_written"], 0);
+            assert_eq!(record["planned_wire_bytes_hex"], "");
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(repro_path).unwrap();
+        }
     }
 
     #[tokio::test]

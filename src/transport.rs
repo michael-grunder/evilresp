@@ -7,6 +7,8 @@ use rand::Rng;
 use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+pub use crate::connection_fault::{ConnectionFaultPlan, FaultAction};
+use crate::connection_fault::{FaultConfig, FaultPoint};
 use crate::error::{AppError, AppResult};
 use crate::evil::{deterministic_hash, parse_probability, rng_for};
 use crate::protocol_fingerprint::{ProtocolDirection, ProtocolFingerprints};
@@ -36,6 +38,7 @@ pub(crate) struct TransportConfig {
     extra: usize,
     chunks: Chunks,
     probability: f64,
+    fault: FaultConfig,
 }
 
 impl Default for TransportConfig {
@@ -45,13 +48,15 @@ impl Default for TransportConfig {
             extra: 0,
             chunks: Chunks::Off,
             probability: 100.0,
+            fault: FaultConfig::default(),
         }
     }
 }
 
 impl TransportConfig {
     pub(crate) fn enabled(&self) -> bool {
-        !matches!(self.truncate, Cut::Off)
+        self.fault.action != FaultAction::Off
+            || !matches!(self.truncate, Cut::Off)
             || self.extra != 0
             || !matches!(self.chunks, Chunks::Off)
     }
@@ -67,7 +72,7 @@ impl TransportConfig {
             ));
         }
         let mut config = self.clone();
-        let mut seen = [false; 4];
+        let mut seen = [false; 7];
         for [key, value] in pairs {
             let index = match key.to_ascii_uppercase().as_str() {
                 "TRUNCATE" => {
@@ -116,9 +121,21 @@ impl TransportConfig {
                     config.probability = parse_probability(value)?;
                     3
                 }
+                "FAULT" => {
+                    config.fault.set_action(value)?;
+                    4
+                }
+                "AT" => {
+                    config.fault.set_point(value)?;
+                    5
+                }
+                "DURATION" => {
+                    config.fault.set_duration(value)?;
+                    6
+                }
                 _ => {
                     return Err(invalid(
-                        "TRANSPORT accepts TRUNCATE, EXTRA, CHUNKS, and PROBABILITY",
+                        "TRANSPORT accepts TRUNCATE, EXTRA, CHUNKS, PROBABILITY, FAULT, AT, and DURATION",
                     ));
                 }
             };
@@ -127,7 +144,33 @@ impl TransportConfig {
             }
             seen[index] = true;
         }
+        if config.fault.action != FaultAction::Off
+            && !matches!(config.truncate, Cut::Off)
+        {
+            return Err(invalid(
+                "FAULT and TRUNCATE cannot both be enabled; use AT for the fault offset",
+            ));
+        }
         Ok(config)
+    }
+
+    pub(crate) fn requires_tcp(&self) -> bool {
+        self.fault.action == FaultAction::Reset
+    }
+
+    pub(crate) fn before_plan(
+        &self,
+        seed: u64,
+        index: u64,
+        hash: &str,
+    ) -> Option<DeliveryPlan> {
+        if self.fault.point != FaultPoint::Before {
+            return None;
+        }
+        let fault = self.fault.plan(self.probability, seed, index, hash, 0)?;
+        let mut plan = DeliveryPlan::plain(0);
+        plan.set_fault(fault);
+        Some(plan)
     }
 
     pub(crate) fn status(&self) -> String {
@@ -146,14 +189,45 @@ impl TransportConfig {
                 .join(","),
         };
         format!(
-            "transport={} transport_probability={:.2} transport_truncate={cut} transport_extra={} transport_chunks={chunks}",
+            "transport={} transport_probability={:.2} transport_truncate={cut} transport_extra={} transport_chunks={chunks} {}",
             if self.enabled() { "ON" } else { "OFF" },
             self.probability,
-            self.extra
+            self.extra,
+            self.fault.status(),
         )
     }
 
     pub(crate) fn plan(
+        &self,
+        seed: u64,
+        command_index: u64,
+        command_hash: &str,
+        reply_hash: &str,
+        response_len: usize,
+    ) -> DeliveryPlan {
+        let mut plan = self.delivery_plan(
+            seed,
+            command_index,
+            command_hash,
+            reply_hash,
+            response_len,
+        );
+        if self.fault.point != FaultPoint::Before {
+            let len = response_len + plan.extra_reply_count * EXTRA_REPLY.len();
+            if let Some(fault) = self.fault.plan(
+                self.probability,
+                seed,
+                command_index,
+                command_hash,
+                len,
+            ) {
+                plan.set_fault(fault);
+            }
+        }
+        plan
+    }
+
+    fn delivery_plan(
         &self,
         seed: u64,
         command_index: u64,
@@ -231,12 +305,15 @@ pub struct DeliveryPlan {
     pub truncate_at: Option<usize>,
     /// Exclusive offsets into the planned wire bytes, including the final end.
     pub chunk_ends: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_fault: Option<ConnectionFaultPlan>,
 }
 
 impl DeliveryPlan {
     pub(crate) fn plain(len: usize) -> Self {
         Self {
             version: 1,
+            connection_fault: None,
             extra_reply_count: 0,
             extra_reply_bytes_hex: hex::encode(EXTRA_REPLY),
             truncate_at: None,
@@ -244,8 +321,18 @@ impl DeliveryPlan {
         }
     }
 
+    fn set_fault(&mut self, fault: ConnectionFaultPlan) {
+        self.version = 2;
+        self.chunk_ends.retain(|end| *end < fault.after_bytes);
+        if fault.after_bytes > 0 {
+            self.chunk_ends.push(fault.after_bytes);
+        }
+        self.connection_fault = Some(fault);
+    }
+
     pub(crate) fn is_fault(&self) -> bool {
-        self.extra_reply_count != 0
+        self.connection_fault.is_some()
+            || self.extra_reply_count != 0
             || self.truncate_at.is_some()
             || self.chunk_ends.len() > 1
     }
@@ -256,6 +343,9 @@ impl DeliveryPlan {
         }
         if let Some(at) = self.truncate_at {
             response.truncate(at);
+        }
+        if let Some(fault) = &self.connection_fault {
+            response.truncate(fault.after_bytes);
         }
         response
     }
@@ -269,6 +359,10 @@ pub struct DeliveryOutcome {
     pub shutdown_completed: bool,
     pub error_stage: Option<&'static str>,
     pub error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fault_completed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_end: Option<&'static str>,
 }
 
 /// Writes only within a planned chunk; short writes finish that chunk before
@@ -312,6 +406,8 @@ pub(crate) async fn deliver<W: AsyncWrite + Unpin>(
         written_bytes_hash: String::new(),
         completed_chunks: 0,
         shutdown_completed: false,
+        fault_completed: plan.connection_fault.as_ref().map(|_| false),
+        stall_end: None,
         error_stage: None,
         error_kind: None,
     };
@@ -361,6 +457,111 @@ mod tests {
         TransportConfig::default()
             .updated(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
             .unwrap()
+    }
+
+    #[test]
+    fn connection_fault_configuration_is_atomic_and_stalling_is_explicit() {
+        let mut config =
+            config(&["FAULT", "RESET", "AT", "BEFORE", "DURATION", "1234"]);
+        assert!(config.requires_tcp());
+        assert!(config.before_plan(7, 0, "command").is_some());
+        let before = config.status();
+        for args in [
+            vec!["FAULT", "RANDOM"],
+            vec!["AT", "INVALID"],
+            vec!["FAULT", "CLOSE", "AT", "-1"],
+            vec!["AT", "+1"],
+            vec!["DURATION", "0"],
+            vec!["DURATION", "3600001"],
+            vec!["DURATION", "forever"],
+            vec!["DURATION", "-1"],
+            vec!["FAULT", "CLOSE", "FAULT", "STALL"],
+            vec!["AT", "BEFORE", "at", "AFTER"],
+            vec!["TRUNCATE", "0"],
+        ] {
+            assert!(
+                config
+                    .updated(
+                        &args.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+                    )
+                    .is_err(),
+                "{args:?}"
+            );
+            assert_eq!(config.status(), before);
+        }
+        config = config
+            .updated(&["FAULT", "CLOSE"].map(str::to_owned))
+            .unwrap();
+        assert!(!config.requires_tcp());
+        let plan = config.before_plan(7, 0, "command").unwrap();
+        assert_eq!(plan.version, 2);
+        assert_eq!(plan.connection_fault.unwrap().duration_ms, None);
+        config = config
+            .updated(&["FAULT", "STALL"].map(str::to_owned))
+            .unwrap();
+        assert_eq!(
+            config
+                .before_plan(7, 0, "command")
+                .unwrap()
+                .connection_fault
+                .unwrap()
+                .duration_ms,
+            Some(1234)
+        );
+        config = config.updated(&["OFF"].map(str::to_owned)).unwrap();
+        assert!(!config.enabled());
+        assert!(config.before_plan(7, 0, "command").is_none());
+    }
+
+    #[test]
+    fn connection_fault_settings_survive_modes_and_reset() {
+        let mut evil = EvilConfig::default();
+        evil.apply_debug_command(
+            &[
+                "DEBUG",
+                "EVIL",
+                "TRANSPORT",
+                "FAULT",
+                "RESET",
+                "AT",
+                "RANDOM",
+                "PROBABILITY",
+                "12.5",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let status = evil.transport.status();
+        let planned = plan(&evil.transport, 32);
+        for mode in ["OFF", "MUTATE", "OVERFLOW", "RANDOM", "RESET"] {
+            evil.apply_debug_command(
+                &["DEBUG", "EVIL", "MODE", mode].map(str::to_owned),
+            )
+            .unwrap();
+            assert_eq!(evil.transport.status(), status);
+            assert_eq!(plan(&evil.transport, 32), planned);
+        }
+        assert!(!EvilConfig::default().transport.enabled());
+    }
+
+    #[test]
+    fn connection_fault_offsets_compose_with_chunks_and_extra_replies() {
+        let config = config(&[
+            "FAULT", "RESET", "AT", "8", "EXTRA", "1", "CHUNKS", "1,3,7,10",
+        ]);
+        let planned = plan(&config, 5);
+        assert_eq!(planned.version, 2);
+        assert_eq!(planned.truncate_at, None);
+        assert_eq!(planned.chunk_ends, [1, 3, 7, 8]);
+        assert_eq!(planned.wire_bytes(b"+OK\r\n".to_vec()), b"+OK\r\n+EV");
+        assert_eq!(planned.connection_fault.unwrap().after_bytes, 8);
+        let disabled = config
+            .updated(&["PROBABILITY", "0"].map(str::to_owned))
+            .unwrap();
+        assert_eq!(plan(&disabled, 5), DeliveryPlan::plain(5));
+        let too_long =
+            config.updated(&["AT", "999"].map(str::to_owned)).unwrap();
+        assert!(plan(&too_long, 5).connection_fault.is_none());
     }
 
     fn plan(config: &TransportConfig, len: usize) -> DeliveryPlan {

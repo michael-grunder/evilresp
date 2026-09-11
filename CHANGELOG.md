@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added opt-in `DEBUG EVIL TRANSPORT FAULT CLOSE|RESET|STALL`, with `AT`
+  selecting before forwarding, after reply preparation, after the complete
+  reply, or a fixed/random byte offset. Faults honor filters/bootstrap bypasses
+  and stop processing buffered commands. TCP resets use abortive close and are
+  rejected atomically on Unix client sockets.
+- Added `DURATION` for explicitly selected stalls only. Stalls suppress the
+  remaining reply, drain incoming data without executing it, and close at the
+  deadline or earlier on peer EOF/error. Close/reset faults never select stalls
+  or introduce artificial delays.
+- Added delivery plan version `2` for selected connection faults, retaining
+  version `1` fields and adding `connection_fault`. Outcomes add optional
+  `fault_completed` and `stall_end`, and `reset`/`stall` error stages.
+  Before-forwarding faults record null upstream fields and empty generated
+  response bytes. Legacy delivery plans and their seeded output remain version
+  `1` when no connection fault is selected.
 - Added focused `DEBUG EVIL TOPOLOGY REDIRECT` faults with independent
   probability, MOVED/ASK selection, wrong-owner/self/replica/next/random or
   explicit endpoint targets, correct/wrong/wild/fixed slots, binary key
@@ -87,6 +102,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Require Tokio 1.53 or later for its explicit zero-linger TCP reset API.
 - Moved individual evil configuration status logs from INFO to DEBUG (`-v`)
   and stopped logging `STATUS` reads as configuration changes.
 - Unified reply delivery after RESP/topology processing. Transport uses a

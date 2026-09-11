@@ -1,6 +1,8 @@
 pub mod cli;
 pub mod cluster;
 pub mod cluster_rewrite;
+mod connection;
+mod connection_fault;
 pub mod error;
 pub mod evil;
 mod framing;

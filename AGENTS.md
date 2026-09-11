@@ -59,6 +59,8 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `repro.rs`                | `--repro-file` JSONL writer and `ReproRecord` schema.                                                                         |
 | `transaction.rs`          | Tracking upstream-acknowledged transaction commands for `EXEC` reply canonicalization.                                      |
 | `transport.rs`            | Transport configuration, deterministic delivery plans, chunk execution, shutdown, and partial-write accounting. |
+| `connection_fault.rs`     | Validated connection-fault choices and deterministic lifecycle plans. |
+| `connection.rs`           | Socket reset support, termination, and explicitly opted-in bounded stalls. |
 
 Add new modules around a responsibility (parsing, model, execution, I/O,
 config), not around an incidental category. Prefer a new focused file over
@@ -105,6 +107,8 @@ them need a test proving they still hold.
   transport RNG separate from RESP mutation. Fingerprints count accepted
   bytes, including partial writes. Truncation ends command processing after
   write-side shutdown; buffered commands must not consume more indexes.
+  Connection faults also terminate processing, with abortive close for TCP
+  resets. Stalling requires explicit `FAULT STALL`; other actions never delay.
 
 ## Code Conventions
 

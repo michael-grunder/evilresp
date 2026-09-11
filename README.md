@@ -158,8 +158,9 @@ Byte fields use hex encoding, and the record's hashes use SHA-256. The field
 `global_seed` is retained for compatibility; it contains the seed configured
 on the connection that produced the record. Upstream bytes and their hash are
 the original response, before cluster rewriting or canonicalization, and are
-`null` in `RANDOM` mode or when a topology redirect is injected before
-forwarding the command. Mutation entries contain `path` and `kind` fields.
+`null` in `RANDOM` mode or when a topology redirect or connection fault
+bypasses forwarding the command. Mutation entries contain `path` and `kind`
+fields.
 Length faults keep `kind: "wrong_length"` and add a `length` object containing
 the applied corruption `kind`, `original` length, and `replacement` length.
 Both lengths are decimal strings, including values beyond integer ranges.
@@ -170,7 +171,9 @@ also reflect preceding value mutation.
 Repro-file write failures are logged and do not stop proxying.
 
 Records retain `mutated_response_bytes_hex` and its hash as the full response
-**before transport faults**. Delivery adds these fields:
+**before transport faults**. For a connection fault at `BEFORE`, no reply
+was obtained or generated: these response fields contain empty bytes and
+their hash. Delivery adds these fields:
 
 - `delivery_plan`: version `1`, `extra_reply_count`, `extra_reply_bytes_hex`,
   `truncate_at` (a byte offset or `null`), and `chunk_ends` (exclusive byte
@@ -180,22 +183,45 @@ Records retain `mutated_response_bytes_hex` and its hash as the full response
   offset. This is the complete intended byte stream, even if delivery failed.
 - `delivery_outcome`: `bytes_written`, SHA-256 `written_bytes_hash`,
   `completed_chunks`, `shutdown_completed`, `error_stage` (`write`, `flush`,
-  `shutdown`, or `null`), and `error_kind` (Rust I/O error kind or `null`).
+  `shutdown`, `reset`, `stall`, or `null`), and `error_kind` (Rust I/O error
+  kind or `null`).
   The written bytes are exactly the first `bytes_written` bytes of the planned
   stream. A completed chunk includes a successful flush.
 
-To replay delivery without regenerating mutations, decode the planned bytes,
-write and flush each slice ending at `chunk_ends`, then shut down the write
+Plans that select a connection fault use version `2` and retain all version
+`1` fields. They add `connection_fault` with `action` (`close`, `reset`, or
+`stall`), `point` (`before`, `after`, `reply`, `random`, or `{"bytes": n}`),
+resolved `after_bytes`, and `duration_ms` (only non-null for an explicit
+stall). `truncate_at` is null for these plans; `after_bytes` limits their
+wire stream. Without a selected connection fault, plans remain version `1`.
+
+For version `2`, delivery outcomes add `fault_completed`, indicating whether
+local termination succeeded, and optionally `stall_end` (`duration_elapsed`
+or `peer_closed`). A read failure during stalling uses `error_stage: "stall"`.
+Reset preparation failures use `error_stage: "reset"`. A reset uses abortive
+socket close without write-side shutdown, so `shutdown_completed` remains
+false even when `fault_completed` is true. Accepted bytes may be discarded
+by the kernel during reset; neither field proves the peer received them.
+
+To replay version `1` delivery without regenerating mutations, decode the
+planned bytes, write and flush each slice ending at `chunk_ends`, then shut down the write
 side if `truncate_at` is non-null. The plan can also reconstruct those bytes:
 append the recorded extra reply the recorded number of times to the original
 mutated response, then truncate. Empty output has no chunks. Transport-only
-records may have an empty `mutations` list and mode `OFF`.
+records may have an empty `mutations` list and mode `OFF`. For version `2`,
+write the planned chunks, then perform `connection_fault.action`: orderly
+shutdown and close, TCP abortive close, or withhold further output for
+`duration_ms` before closing (ending early on peer EOF/error). Do not use an
+orderly shutdown before a reset. To reconstruct version `2` wire bytes from
+the original response and extras, cut them at `after_bytes`.
 
 Records are appended after the delivery attempt, before processing another
 command or returning an I/O error. This captures observed partial-write and
-shutdown failures, but a blocked or cancelled delivery has no completed
-record yet. The deterministic plan describes intended delivery; OS errors
-and how much a peer receives are observations, not seeded fault choices.
+shutdown failures. Connection-fault records are appended after the socket
+is closed, including when a stall ends on peer EOF/error. A pending stall or
+blocked/cancelled delivery has no completed record yet. The deterministic
+plan describes intended delivery; OS errors and how much a peer receives are
+observations, not seeded fault choices.
 
 For a reproducible run, use the same configuration, command order, and
 upstream data. Command indexes are shared across connections, start at zero,
@@ -221,7 +247,7 @@ DEBUG EVIL GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLAT
 DEBUG EVIL FRAMING <AUTO|OFF>
 DEBUG EVIL FRAMING LENGTH [PROBABILITY <0.00-100.00>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]
 DEBUG EVIL TRANSPORT OFF
-DEBUG EVIL TRANSPORT [TRUNCATE <OFF|RANDOM|bytes>] [EXTRA <0..16>] [CHUNKS <OFF|RANDOM|offsets>] [PROBABILITY <0.00-100.00>]
+DEBUG EVIL TRANSPORT [TRUNCATE <OFF|RANDOM|bytes>] [EXTRA <0..16>] [CHUNKS <OFF|RANDOM|offsets>] [PROBABILITY <0.00-100.00>] [FAULT <OFF|CLOSE|RESET|STALL>] [AT <BEFORE|AFTER|REPLY|RANDOM|bytes>] [DURATION <1..3600000>]
 DEBUG EVIL TOPOLOGY <0.00-100.00>
 DEBUG EVIL TOPOLOGY OFF
 DEBUG EVIL TOPOLOGY REDIRECT [PROBABILITY <0.00-100.00>] [KIND <MOVED|ASK|RANDOM>] [TARGET <WRONG_NODE|SELF|REPLICA|NEXT|RANDOM|host:port>] [SLOT <CORRECT|WRONG|WILD|0..16383>] [PHASE <BEFORE|AFTER>] [KEY <argument-index>] [UNTIL <command-index|OFF>]
@@ -428,10 +454,12 @@ Switch to `DEBUG EVIL GENERATOR VIOLATIONS ON` to mix deliberate protocol
 and conversation faults into subsequent generated replies. This retains the
 selected protocol and corpus.
 
-`TRANSPORT` applies after topology rewriting and RESP mutation, including in
-`OFF` and `RANDOM`. It defaults to disabled, uses the same include/exclude
-filters, and never touches local commands or cluster bootstrap queries.
-It does not consume an extra command index or a `MUTATIONS ONE` slot.
+`TRANSPORT` controls reply delivery and established-connection faults,
+including in `OFF` and `RANDOM`. It defaults to disabled, uses the same
+include/exclude filters, and never touches local commands or cluster bootstrap
+queries. It does not consume an extra command index or a `MUTATIONS ONE` slot.
+Reply delivery follows topology rewriting and RESP mutation; a selected
+connection fault at `BEFORE` bypasses forwarding and reply generation.
 
 - `EXTRA n`: append up to 16 copies of the valid RESP2/RESP3 simple reply
   `+EVILRESP\r\n`. Extras have no corresponding upstream command. The
@@ -446,9 +474,45 @@ It does not consume an extra command index or a `MUTATIONS ONE` slot.
   positive integers, with at most 64 boundaries. Offsets at or beyond the
   remaining length are ignored. `RANDOM` chooses one to 64 seeded boundary
   candidates where possible and coalesces duplicates; `OFF` writes one chunk.
-- `PROBABILITY`: independently apply the configured plan with this percentage
-  chance per eligible reply; default `100`. At zero, all transport faults
-  are disabled, regardless of the RESP mutation probability.
+- `PROBABILITY`: percentage chance per eligible command; default `100`.
+  Legacy delivery options (`EXTRA`, `TRUNCATE`, `CHUNKS`) share one draw.
+  Connection faults use a separate independent draw at the same probability.
+  At zero, all transport faults are disabled regardless of RESP probability.
+- `FAULT CLOSE`: request orderly write-side shutdown and close the connection.
+- `FAULT RESET`: perform TCP abortive close (zero linger) without an orderly
+  shutdown, exercising reset-by-peer handling. Rejected on Unix client sockets.
+- `FAULT STALL`: explicitly opt in to withholding the remaining reply until
+  `DURATION` expires, then close. It ends early on client write-side EOF or a
+  read error. Incoming buffered/pipelined data is drained with bounded memory
+  and counted in input fingerprints, but never executed or assigned indexes.
+- `FAULT OFF`: disable connection faults while retaining other transport
+  settings. All connections start with `FAULT OFF`.
+- `AT`: select when the connection fault happens (default `AFTER`), using
+  the table below. `AT RANDOM` randomizes only the byte offset, never the
+  action; it cannot introduce a stall.
+- `DURATION`: stall duration in milliseconds, from `1` to `3600000`, default
+  `10000`. It has no effect unless `FAULT STALL` is explicitly selected.
+
+| `AT` | Behavior |
+| --- | --- |
+| `BEFORE` | Do not forward the selected command or generate its response; send no reply bytes. |
+| `AFTER` | Obtain/generate the reply, then apply the fault without sending any reply bytes. |
+| `REPLY` | Write the complete response plus selected extras, then apply the fault. |
+| `RANDOM` | Write a seeded prefix from zero through total length minus one, then apply the fault (zero for an empty response). |
+| `bytes` | Write that many bytes of the response plus selected extras, then apply the fault. An offset equal to the total length is valid; a larger offset skips the connection fault. |
+
+With ordinary proxying, `AFTER` means the command has already executed
+upstream, so a retry may repeat a write. `RANDOM` mode and before-forwarding
+topology redirects can instead generate a reply without executing upstream.
+All connection faults terminate processing of this connection: buffered
+commands must not consume further indexes, including during an opted-in stall.
+`FAULT` and `TRUNCATE` cannot both be enabled; use `AT bytes` for a connection
+fault at a particular offset. `EXTRA` and `CHUNKS` can combine with connection
+faults; they have no effect when a selected `BEFORE` fault skips the reply.
+
+**Stalling is never selected implicitly.** `CLOSE` and `RESET` introduce no
+artificial delay, regardless of `AT` or `DURATION`. Only `FAULT STALL`
+adds a wait, and it never sends the suppressed remainder after that wait.
 
 Options may appear in any order and are case-insensitive. Supply at least
 one option/value pair; omitted options retain their values, and invalid or
@@ -461,11 +525,15 @@ command index, command hash, and canonicalized response hash used by RESP
 mutation (empty in `RANDOM`). With RESP mutation off, canonicalization is
 used only for the transport seed; relayed bytes retain their order. Transport
 settings do not change the RESP RNG stream or chosen value/framing mutations.
+Connection-fault selection and random offsets use their own domain-separated
+RNG from seed, command index, and command hash, without needing an upstream
+reply. Clock readings and actual socket outcomes never affect those choices.
 
 Each planned chunk is fully written and flushed before the next starts.
 Short writes finish the current chunk; interrupted writes are retried.
 Chunk boundaries specify proxy writes, not TCP packets or client reads:
-socket buffering may split or combine them. No wall-clock delays are used.
+socket buffering may split or combine them. Only an explicit `FAULT STALL`
+uses a wall-clock delay.
 Truncation calls write-side shutdown and ends command processing, so queued
 client commands are not forwarded or assigned indexes. Any write, flush, or
 shutdown failure also ends that connection without retrying the whole reply.
@@ -482,6 +550,29 @@ GET example
 An upstream `$3\r\nfoo\r\n` becomes `$3\r\nfo` followed by EOF. Reconnect
 and configure `TRANSPORT EXTRA 1 CHUNKS RANDOM` to test surplus replies with
 seeded fragmentation instead.
+
+For a 10% chance of reset before executing the command, on a TCP connection:
+
+```text
+DEBUG EVIL TRANSPORT OFF
+DEBUG EVIL TRANSPORT FAULT RESET AT BEFORE PROBABILITY 10
+```
+
+Use `AT AFTER` to test ambiguous execution, `AT 6` to reset after a reply
+prefix, or `FAULT CLOSE AT REPLY` to test replacement of closed pooled
+connections after successful replies. To specifically test timeouts, opt in:
+
+```text
+DEBUG EVIL TRANSPORT OFF
+DEBUG EVIL TRANSPORT FAULT STALL AT AFTER DURATION 30000 PROBABILITY 10
+```
+
+The `DEBUG` configuration reply itself is unaffected. These controls operate
+on already accepted connections and do not simulate TCP handshake refusal or
+exhaust OS file descriptors. A reset can discard bytes accepted by the OS;
+`AT REPLY` describes proxy writes, not guaranteed client receipt. Normal close
+requests orderly shutdown, but the final peer-visible error can still depend
+on socket state, unread data, and the OS.
 
 Mutated replies can intentionally violate RESP framing, so the client may
 disconnect before subsequent commands can run.

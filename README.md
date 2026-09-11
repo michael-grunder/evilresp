@@ -158,7 +158,8 @@ Byte fields use hex encoding, and the record's hashes use SHA-256. The field
 `global_seed` is retained for compatibility; it contains the seed configured
 on the connection that produced the record. Upstream bytes and their hash are
 the original response, before cluster rewriting or canonicalization, and are
-`null` in `RANDOM` mode. Mutation entries contain `path` and `kind` fields.
+`null` in `RANDOM` mode or when a topology redirect is injected before
+forwarding the command. Mutation entries contain `path` and `kind` fields.
 Length faults keep `kind: "wrong_length"` and add a `length` object containing
 the applied corruption `kind`, `original` length, and `replacement` length.
 Both lengths are decimal strings, including values beyond integer ranges.
@@ -222,6 +223,8 @@ DEBUG EVIL FRAMING LENGTH [PROBABILITY <0.00-100.00>] [TARGET <ANY|path>] [KIND 
 DEBUG EVIL TRANSPORT OFF
 DEBUG EVIL TRANSPORT [TRUNCATE <OFF|RANDOM|bytes>] [EXTRA <0..16>] [CHUNKS <OFF|RANDOM|offsets>] [PROBABILITY <0.00-100.00>]
 DEBUG EVIL TOPOLOGY <0.00-100.00>
+DEBUG EVIL TOPOLOGY OFF
+DEBUG EVIL TOPOLOGY REDIRECT [PROBABILITY <0.00-100.00>] [KIND <MOVED|ASK|RANDOM>] [TARGET <WRONG_NODE|SELF|REPLICA|NEXT|RANDOM|host:port>] [SLOT <CORRECT|WRONG|WILD|0..16383>] [PHASE <BEFORE|AFTER>] [KEY <argument-index>] [UNTIL <command-index|OFF>]
 DEBUG EVIL MODE RESET
 DEBUG EVIL CANONICALIZE <ALL|UNORDERED|NONE>
 DEBUG EVIL STATUS
@@ -483,13 +486,110 @@ seeded fragmentation instead.
 Mutated replies can intentionally violate RESP framing, so the client may
 disconnect before subsequent commands can run.
 
-`DEBUG EVIL TOPOLOGY` controls cluster redirection lies independently from RESP
-reply mutation. In cluster mode, topology mutation can inject fake `MOVED` or
-`ASK` redirections for commands that otherwise succeeded, alter real upstream
-redirections, flip redirection kind, choose the wrong slot or server, and emit
-wild slot numbers outside Redis' normal `0..16383` range. These replies are
-valid RESP errors first, then `MUTATE` or `OVERFLOW` can still corrupt their
-RESP shape when those modes are enabled.
+`DEBUG EVIL TOPOLOGY` controls cluster redirection faults independently from
+RESP mutation and transport faults. It only operates in cluster mode, honors
+`INCLUDE`/`EXCLUDE`, and never changes bootstrap `CLUSTER SLOTS`, `SHARDS`, or
+`NODES` replies. Configuration is per connection; configure each connection
+that should inject faults, including connections to redirect destinations.
+New connections start with topology faults disabled.
+
+`DEBUG EVIL TOPOLOGY <probability>` retains the original mixed algorithm and
+seeded output. It can replace ordinary replies with fake `MOVED`/`ASK`, flip
+redirection kind, change destinations among mapped primaries, and change slots
+to valid or arbitrary signed values. The probability is checked separately
+for several mutations, so multiple changes can affect one reply. Except in
+`RANDOM` mode, this happens after the upstream has processed the command.
+
+`DEBUG EVIL TOPOLOGY REDIRECT` selects a focused fault. Each command starts
+from the defaults below; omitted settings do not retain a previous redirect
+configuration. Options are case-insensitive, may appear in any order, and
+must not repeat. Invalid updates leave all topology settings unchanged.
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `PROBABILITY` | `100` | One probability check per eligible command at the selected phase. |
+| `KIND` | `MOVED` | Emit `MOVED`, `ASK`, or a seeded random choice of the two. |
+| `TARGET` | `WRONG_NODE` | Choose the destination as described below. |
+| `SLOT` | `CORRECT` | Use the key's slot, a different valid slot (`WRONG`), an out-of-range signed 32-bit slot (`WILD`), or a fixed slot `0..16383`. |
+| `PHASE` | `BEFORE` | Inject before forwarding, or replace the upstream reply with `AFTER`. |
+| `KEY` | `1` | Argument index containing the key, with command name at index `0`. |
+| `UNTIL` | `OFF` | Stop injecting when the shared command index reaches this exclusive cutoff. |
+
+Destinations:
+
+- `WRONG_NODE`: a mapped primary other than the slot's owner in the startup
+  topology. This can be the current listener if the request is already at
+  the wrong node.
+- `SELF`: the current mapped listener, for redirects that make no progress.
+- `REPLICA`: a mapped replica of the slot's owner.
+- `NEXT`: the next distinct primary in startup topology order, wrapping back
+  to the first. A replica listener redirects to the first primary. Requires
+  at least two primaries; with two primary listeners it produces A/B bouncing.
+- `RANDOM`: a seeded choice among distinct mapped primaries, including the
+  correct owner or the current listener.
+- A literal `host:port` (IPv6 as `[address]:port`): advertise that exact
+  destination, even if it is not in the cluster. This is the explicit exception
+  to keeping redirects inside evilresp. The proxy does not resolve or probe
+  the destination; connection success, refusal, and DNS failures are client
+  observations. Use a controlled endpoint to test those outcomes.
+
+An unavailable target, such as a shard without replicas, skips the fault.
+`CORRECT`, `WRONG`, and `WILD` require a string key at `KEY`; missing or
+non-string arguments skip the fault. Hashing uses the original binary key and
+Redis hash tags. This is positional key selection, not Redis command-key
+introspection: use `KEY 3` for a single-key `EVAL`, for example. `SLOT <number>`
+works without a key and uses that slot for owner/replica lookup. For `WRONG`
+and `WILD`, destinations are selected using the original key's slot before
+changing the advertised slot.
+
+`BEFORE` prevents the selected command from executing upstream. `AFTER`
+replaces any ordinary or redirection reply after execution, so retrying a
+write can execute it again. `RANDOM` mode never forwards eligible commands:
+only `BEFORE` redirects apply there, with normal random generation when no
+redirect applies. In `MUTATE`/`OVERFLOW`, the injected error still passes
+through RESP mutation. Transport faults can also alter its delivery. To
+isolate routing behavior, use `MODE OFF` and `TRANSPORT OFF`.
+
+`ASK` is the error returned to the client; `ASKING` is the command the client
+sends on the destination connection before retrying. `ASKING` remains in the
+default exclude list and is proxied normally.
+
+For wrong-node redirects that keep the slot correct:
+
+```text
+DEBUG EVIL MODE OFF
+DEBUG EVIL TOPOLOGY REDIRECT PROBABILITY 10 KIND MOVED TARGET WRONG_NODE
+```
+
+For a bounded bounce experiment, first reset on one connection, then open or
+reopen the other connections and configure **each** participating connection:
+
+```text
+DEBUG EVIL TOPOLOGY REDIRECT TARGET NEXT UNTIL 3
+```
+
+Starting at command index zero with two primaries and only eligible test
+commands, indexes `0`, `1`, and `2` redirect; index `3` is forwarded normally.
+`UNTIL` is an absolute global command-index boundary, not a per-request retry
+count or a count since configuration. Other clients and excluded ordinary
+commands (including `ASKING`) also advance it. Local commands and bootstrap
+queries do not. Stopping injection permits normal routing/recovery; successful
+recovery still depends on the real cluster, the client's retry budget, and
+other enabled faults.
+
+The cutoff introduces no separate retry counter. `MODE RESET` resets the
+existing command index and thus re-arms a preserved cutoff, while invalidating
+older connections. The same seed, command indexes, command bytes, upstream
+replies for `AFTER`, and mapped topology/current listener produce the same
+redirects. Repro mutations identify the phase as `topology_redirect_before`
+or `topology_redirect_after`; before-forwarding records have null upstream
+response fields. Actual reply bytes and transport outcomes remain recorded
+through the existing repro fields.
+
+`TOPOLOGY OFF` disables both topology forms. A numeric `TOPOLOGY` command
+switches back to the legacy algorithm. `STATUS` retains `topology_probability`
+and adds `topology=LEGACY|REDIRECT`; focused mode also reports all redirect
+options. Topology settings survive RESP mode changes and `MODE RESET`.
 
 `DEBUG EVIL MODE RESET` disables RESP evil mode, sets RESP mutation probability
 to zero, resets the deterministic command index, invalidates older client

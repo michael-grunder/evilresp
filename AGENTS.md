@@ -52,6 +52,7 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `generator.rs`            | Generator configuration, protocol profiles, bounded frame generation, and scalar mutation corpora. |
 | `framing.rs`              | Framing configuration, length-header selection, and corruption metadata; `resp.rs` encodes the selected header override.       |
 | `topology_evil.rs`        | Fake/altered `MOVED`/`ASK` redirections, independent of RESP mutation.                                                        |
+| `topology_config.rs`      | Validated focused redirection options and status formatting. |
 | `cluster.rs`              | Startup `CLUSTER SLOTS` probe, `Topology`, mapping upstream nodes to local listeners.                                          |
 | `cluster_rewrite.rs`      | Rewriting `CLUSTER SLOTS`/`SHARDS`/`NODES` replies and redirections to local listeners.                                        |
 | `protocol_fingerprint.rs` | Per-connection BLAKE3/TLSH fingerprints of client-in and client-out bytes.                                                     |
@@ -73,6 +74,8 @@ them need a test proving they still hold.
   upstream reply bytes)`. The RNG is `ChaCha20Rng` seeded from a SHA-256 digest
   of those inputs (`evil.rs::rng_for`). Never feed connection ids, wall-clock
   time, thread ids, or map iteration order into that path.
+  Topology faults also use the configured target and mapped topology/current
+  listener as explicit inputs, never connection identity or hidden retry state.
 - **Same input, same bytes on the wire.** There is regression coverage for
   identical evil sessions producing identical protocol output; keep it green.
 - **Local commands never reach the upstream.** `DEBUG EVIL`, `DEBUG PROTOCOL`,
@@ -90,10 +93,12 @@ them need a test proving they still hold.
   incrementing global state used for deterministic output must participate in
   this reset. Observability-only connection ids and lifetime monitoring
   counters survive resets and must never feed mutation or transport RNGs.
-- **Cluster redirections always point back at evilresp.** Upstream `MOVED`/
+- **Cluster redirections normally point back at evilresp.** Upstream `MOVED`/
   `ASK` targets and topology replies are rewritten to local listeners; nodes
   with no local listener are removed, not exposed. Discovered primaries and
-  replicas each have a listener, with primary ports allocated first.
+  replicas each have a listener, with primary ports allocated first. Only an
+  explicit `TOPOLOGY REDIRECT TARGET host:port` may advertise a destination
+  outside the mapped listeners; never infer such targets from upstream replies.
 - **The repro JSONL record is a contract.** External tooling parses it. Add
   fields; do not rename or remove existing ones without a changelog entry.
 - **Delivery plans are deterministic; I/O outcomes are observations.** Keep

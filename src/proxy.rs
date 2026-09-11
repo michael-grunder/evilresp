@@ -29,7 +29,10 @@ use crate::protocol_fingerprint::{
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
 use crate::stats::Stats;
-use crate::topology_evil::{maybe_mutate_topology, normalize_redirection};
+use crate::topology_evil::{
+    RedirectContext, configured_redirection, maybe_mutate_topology,
+    normalize_redirection,
+};
 use crate::transaction::TransactionCommands;
 use crate::transport::{self, DeliveryPlan};
 
@@ -354,12 +357,30 @@ async fn proxy_connection(
 
         publish_monitor_command(&state, connection_id, &command_frame);
 
+        let pre_topology =
+            if should_mutate && let Some(local_slots) = &state.local_slots {
+                configured_redirection(
+                    &config,
+                    RedirectContext {
+                        command_index: command_id,
+                        command_hash: &command_hash,
+                        command: &command_frame,
+                        upstream_bytes: None,
+                        local_slots,
+                        listener: target.listen.as_tcp(),
+                    },
+                )
+            } else {
+                None
+            };
         let transport_enabled = should_mutate && config.transport.enabled();
         let (upstream_bytes, response, delivery_seed_hash) = if config.mode
             == EvilMode::Random
             && should_mutate
         {
-            let topology = if let Some(local_slots) = &state.local_slots {
+            let topology = if pre_topology.is_some() {
+                pre_topology
+            } else if let Some(local_slots) = &state.local_slots {
                 maybe_mutate_topology(
                     &config,
                     command_id,
@@ -380,27 +401,48 @@ async fn proxy_connection(
             };
             (None, response, String::new())
         } else {
-            upstream_write.write_all(&command_bytes).await?;
-            upstream_write.flush().await?;
-            let upstream_bytes = read_raw_frame(&mut upstream_read).await?;
-            let exec_commands =
-                transaction_commands.observe(&argv, &upstream_bytes);
-            let relay_bytes =
-                normalize_cluster_redirection(&upstream_bytes, &state)?;
-            let topology = if should_mutate
-                && let Some(local_slots) = &state.local_slots
-            {
-                maybe_mutate_topology(
-                    &config,
-                    command_id,
-                    &command_hash,
-                    &command_frame,
-                    Some(&relay_bytes),
-                    local_slots,
-                )?
-            } else {
-                None
-            };
+            let (upstream_bytes, exec_commands, relay_bytes, topology) =
+                if let Some(topology) = pre_topology {
+                    (None, None, Vec::new(), Some(topology))
+                } else {
+                    upstream_write.write_all(&command_bytes).await?;
+                    upstream_write.flush().await?;
+                    let upstream_bytes =
+                        read_raw_frame(&mut upstream_read).await?;
+                    let exec_commands =
+                        transaction_commands.observe(&argv, &upstream_bytes);
+                    let relay_bytes =
+                        normalize_cluster_redirection(&upstream_bytes, &state)?;
+                    let topology = if should_mutate
+                        && let Some(local_slots) = &state.local_slots
+                    {
+                        if config.topology_redirect.is_some() {
+                            configured_redirection(
+                                &config,
+                                RedirectContext {
+                                    command_index: command_id,
+                                    command_hash: &command_hash,
+                                    command: &command_frame,
+                                    upstream_bytes: Some(&relay_bytes),
+                                    local_slots,
+                                    listener: target.listen.as_tcp(),
+                                },
+                            )
+                        } else {
+                            maybe_mutate_topology(
+                                &config,
+                                command_id,
+                                &command_hash,
+                                &command_frame,
+                                Some(&relay_bytes),
+                                local_slots,
+                            )?
+                        }
+                    } else {
+                        None
+                    };
+                    (Some(upstream_bytes), exec_commands, relay_bytes, topology)
+                };
             let (base_bytes, mut mutations) = match topology {
                 Some(mutated) => (mutated.frame.encode(), mutated.mutations),
                 None => (relay_bytes, Vec::new()),
@@ -446,11 +488,7 @@ async fn proxy_connection(
             } else {
                 base_bytes
             };
-            (
-                Some(upstream_bytes),
-                MutatedReply { bytes, mutations },
-                seed_hash,
-            )
+            (upstream_bytes, MutatedReply { bytes, mutations }, seed_hash)
         };
 
         let plan = if transport_enabled {
@@ -2043,6 +2081,290 @@ mod tests {
         drop(client);
         upstream.await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    async fn topology_request<S>(
+        client: &mut BufReader<S>,
+        args: &[&str],
+    ) -> Vec<u8>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        client
+            .get_mut()
+            .write_all(&resp_command(args))
+            .await
+            .unwrap();
+        read_raw_frame(client).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn focused_topology_phases_control_execution_and_repro_records() {
+        for phase in ["BEFORE", "AFTER"] {
+            let path = unique_socket_path("topology-phase");
+            let repro_path = unique_socket_path("topology-phase-repro");
+            let listener = UnixListener::bind(&path).unwrap();
+            let upstream = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = tokio::io::split(stream);
+                let mut read = BufReader::new(read);
+                let mut writes = 0;
+                while let Ok(bytes) = read_raw_frame(&mut read).await {
+                    // Local configuration must never leak upstream.
+                    assert_eq!(bytes, resp_command(&["INCR", "foo"]));
+                    writes += 1;
+                    write.write_all(b":1\r\n").await.unwrap();
+                }
+                writes
+            });
+            let target = ProxyTarget {
+                upstream: Endpoint::Unix(path.clone()),
+                listen: Endpoint::Unix(unique_socket_path("unused")),
+            };
+            let mut state = transport_test_state(
+                ReproWriter::open(&repro_path).await.unwrap(),
+            );
+            state.local_slots = Some(cluster_slots_frame());
+            let (client, server) = UnixStream::pair().unwrap();
+            let proxy = tokio::spawn(proxy_connection(
+                Box::new(server),
+                target,
+                state,
+                1,
+                0,
+            ));
+            let mut client = BufReader::new(client);
+            assert_eq!(
+                topology_request(
+                    &mut client,
+                    &[
+                        "DEBUG",
+                        "EVIL",
+                        "TOPOLOGY",
+                        "REDIRECT",
+                        "KIND",
+                        "ASK",
+                        "TARGET",
+                        "missing.invalid:7999",
+                        "PHASE",
+                        phase,
+                    ]
+                )
+                .await,
+                b"+OK\r\n"
+            );
+            assert_eq!(
+                topology_request(&mut client, &["INCR", "foo"]).await,
+                b"-ASK 12182 missing.invalid:7999\r\n"
+            );
+
+            // A rejected update must leave the configured fault in place.
+            assert!(
+                topology_request(
+                    &mut client,
+                    &[
+                        "DEBUG", "EVIL", "TOPOLOGY", "REDIRECT", "KIND",
+                        "INVALID",
+                    ]
+                )
+                .await
+                .starts_with(b"-ERR ")
+            );
+            assert_eq!(
+                topology_request(&mut client, &["INCR", "foo"]).await,
+                b"-ASK 12182 missing.invalid:7999\r\n"
+            );
+            assert_eq!(
+                topology_request(
+                    &mut client,
+                    &["DEBUG", "EVIL", "TOPOLOGY", "OFF"]
+                )
+                .await,
+                b"+OK\r\n"
+            );
+            assert_eq!(
+                topology_request(&mut client, &["INCR", "foo"]).await,
+                b":1\r\n"
+            );
+            drop(client);
+            proxy.await.unwrap().unwrap();
+            assert_eq!(
+                upstream.await.unwrap(),
+                if phase == "BEFORE" { 1 } else { 3 }
+            );
+            let records = std::fs::read_to_string(&repro_path).unwrap();
+            let records: Vec<serde_json::Value> = records
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records.len(), 2);
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(record["command_index"], index);
+                assert_eq!(record["selected_evil_mode"], "OFF");
+                assert_eq!(
+                    record["mutations"][0]["kind"],
+                    format!("topology_redirect_{}", phase.to_ascii_lowercase())
+                );
+                assert_eq!(
+                    record["mutated_response_bytes_hex"],
+                    hex::encode(b"-ASK 12182 missing.invalid:7999\r\n")
+                );
+                assert_eq!(
+                    record["upstream_response_bytes_hex"].is_null(),
+                    phase == "BEFORE"
+                );
+                if phase == "AFTER" {
+                    assert_eq!(
+                        record["upstream_response_bytes_hex"],
+                        hex::encode(b":1\r\n")
+                    );
+                }
+            }
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(repro_path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn topology_bounces_across_listeners_recovers_and_replays_after_reset()
+     {
+        let upstream_path = unique_socket_path("topology-bounce");
+        let upstream_listener = UnixListener::bind(&upstream_path).unwrap();
+        let (seen, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let upstream = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            // Two connections per run, with two replay runs.
+            for _ in 0..4 {
+                let (stream, _) = upstream_listener.accept().await.unwrap();
+                let seen = seen.clone();
+                connections.spawn(async move {
+                    let (read, mut write) = tokio::io::split(stream);
+                    let mut read = BufReader::new(read);
+                    while let Ok(bytes) = read_raw_frame(&mut read).await {
+                        seen.send(bytes).unwrap();
+                        write.write_all(b":1\r\n").await.unwrap();
+                    }
+                });
+            }
+            while let Some(result) = connections.join_next().await {
+                result.unwrap();
+            }
+        });
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addresses =
+            [first.local_addr().unwrap(), second.local_addr().unwrap()];
+        let node = |address: std::net::SocketAddr| {
+            Frame::Array(Some(vec![
+                bulk_string(&address.ip().to_string()),
+                Frame::Integer(i64::from(address.port())),
+            ]))
+        };
+        let slots = Frame::Array(Some(vec![
+            Frame::Array(Some(vec![
+                Frame::Integer(0),
+                Frame::Integer(8191),
+                node(addresses[0]),
+            ])),
+            Frame::Array(Some(vec![
+                Frame::Integer(8192),
+                Frame::Integer(16383),
+                node(addresses[1]),
+            ])),
+        ]));
+        let state = SharedState {
+            stats: Arc::new(Stats::default()),
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: Some(slots.clone()),
+            redirection_map: ClusterRedirectionMap::default(),
+        };
+        let mut listeners = JoinSet::new();
+        for (index, listener) in [first, second].into_iter().enumerate() {
+            listeners.spawn(serve_listener(
+                ProxyListener::Tcp(listener),
+                ProxyTarget {
+                    listen: Endpoint::Tcp(
+                        addresses[index].to_string().parse().unwrap(),
+                    ),
+                    upstream: Endpoint::Unix(upstream_path.clone()),
+                },
+                state.clone(),
+            ));
+        }
+        let mut previous = None;
+        for _ in 0..2 {
+            let mut first =
+                BufReader::new(TcpStream::connect(addresses[0]).await.unwrap());
+            assert_eq!(
+                topology_request(
+                    &mut first,
+                    &["DEBUG", "EVIL", "MODE", "RESET"]
+                )
+                .await,
+                b"+OK\r\n"
+            );
+            let second =
+                BufReader::new(TcpStream::connect(addresses[1]).await.unwrap());
+            let mut clients = [first, second];
+            for client in &mut clients {
+                assert_eq!(
+                    topology_request(
+                        client,
+                        &[
+                            "DEBUG", "EVIL", "TOPOLOGY", "REDIRECT", "TARGET",
+                            "NEXT", "UNTIL", "3",
+                        ]
+                    )
+                    .await,
+                    b"+OK\r\n"
+                );
+                assert_eq!(
+                    topology_request(client, &["CLUSTER", "SLOTS"]).await,
+                    slots.encode()
+                );
+            }
+            assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
+            let mut output = Vec::new();
+            for index in 0..4 {
+                let response =
+                    topology_request(&mut clients[index % 2], &["INCR", "foo"])
+                        .await;
+                if index < 3 {
+                    assert_eq!(
+                        response,
+                        format!(
+                            "-MOVED 12182 {}\r\n",
+                            addresses[(index + 1) % 2]
+                        )
+                        .as_bytes()
+                    );
+                    assert!(requests.try_recv().is_err());
+                } else {
+                    assert_eq!(response, b":1\r\n");
+                    assert_eq!(
+                        requests.recv().await.unwrap(),
+                        resp_command(&["INCR", "foo"])
+                    );
+                }
+                output.extend(response);
+            }
+            assert_eq!(state.command_ids.load(Ordering::SeqCst), 4);
+            if let Some(previous) = &previous {
+                assert_eq!(&output, previous);
+            }
+            previous = Some(output);
+        }
+        upstream.await.unwrap();
+        listeners.abort_all();
+        while let Some(result) = listeners.join_next().await {
+            assert!(result.unwrap_err().is_cancelled());
+        }
+        std::fs::remove_file(upstream_path).unwrap();
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ pub mod proxy;
 pub mod repro;
 pub mod resp;
 mod stats;
+mod topology_config;
 pub mod topology_evil;
 mod transaction;
 mod transport;

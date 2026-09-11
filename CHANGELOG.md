@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added focused `DEBUG EVIL TOPOLOGY REDIRECT` faults with independent
+  probability, MOVED/ASK selection, wrong-owner/self/replica/next/random or
+  explicit endpoint targets, correct/wrong/wild/fixed slots, binary key
+  argument selection, and injection before forwarding or after execution.
+  `UNTIL` bounds injection by the shared command index for deterministic
+  bounce/recovery experiments across configured connections. Added
+  `TOPOLOGY OFF`; probability-only commands retain their legacy algorithm.
+- Added topology configuration details to `STATUS` and
+  `topology_redirect_before`/`topology_redirect_after` repro mutation kinds.
+  Before-forwarding redirects have null upstream response fields.
 - Added one INFO statistics summary per second across all listeners, with
   total accepted and currently active clients, successful `DEBUG EVIL`
   configuration commands, status reads, rejections, resets, and selections of

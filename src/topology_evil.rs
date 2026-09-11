@@ -1,11 +1,17 @@
+//! Legacy mixed topology mutation and focused, bounded redirection injection.
+
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 
+use crate::cli::TcpEndpoint;
 use crate::cluster::ClusterRedirectionMap;
 use crate::error::AppResult;
 use crate::evil::{AppliedMutation, EvilConfig, MutationKind};
 use crate::resp::{Frame, parse_frame};
+use crate::topology_config::{
+    RedirectKind, RedirectPhase, RedirectSlot, RedirectTarget,
+};
 
 const CLUSTER_SLOT_COUNT: i32 = 16_384;
 
@@ -36,7 +42,8 @@ pub fn maybe_mutate_topology(
     upstream_bytes: Option<&[u8]>,
     local_slots: &Frame,
 ) -> AppResult<Option<TopologyMutation>> {
-    if config.topology_probability <= 0.0 {
+    if config.topology_probability <= 0.0 || config.topology_redirect.is_some()
+    {
         return Ok(None);
     }
 
@@ -89,6 +96,206 @@ pub fn maybe_mutate_topology(
         frame: redirection.to_frame(),
         mutations,
     }))
+}
+
+pub(crate) struct RedirectContext<'a> {
+    pub command_index: u64,
+    pub command_hash: &'a str,
+    pub command: &'a Frame,
+    pub upstream_bytes: Option<&'a [u8]>,
+    pub local_slots: &'a Frame,
+    pub listener: Option<&'a TcpEndpoint>,
+}
+
+pub(crate) fn configured_redirection(
+    config: &EvilConfig,
+    context: RedirectContext<'_>,
+) -> Option<TopologyMutation> {
+    let redirect = config.topology_redirect.as_ref()?;
+    if config.topology_probability <= 0.0
+        || redirect
+            .until
+            .is_some_and(|end| context.command_index >= end)
+        || (redirect.phase == RedirectPhase::Before)
+            != context.upstream_bytes.is_none()
+    {
+        return None;
+    }
+
+    let upstream_hash = context
+        .upstream_bytes
+        .map(crate::evil::deterministic_hash)
+        .unwrap_or_default();
+    let mut rng = topology_rng(
+        config.seed,
+        context.command_index,
+        context.command_hash,
+        &upstream_hash,
+    );
+    if !should_apply(config.topology_probability, &mut rng) {
+        return None;
+    }
+
+    let correct_slot = match redirect.slot {
+        RedirectSlot::Fixed(slot) => i32::from(slot),
+        _ => command_slot(context.command, redirect.key)?,
+    };
+    let nodes = RedirectNodes::from_slots(context.local_slots, correct_slot);
+    let listener = context.listener.map(TcpEndpoint::connect_addr);
+    let server = match &redirect.target {
+        RedirectTarget::Endpoint(endpoint) => endpoint.connect_addr(),
+        RedirectTarget::SelfNode => {
+            let listener = listener?;
+            if !nodes.all.contains(&listener) {
+                return None;
+            }
+            listener
+        }
+        RedirectTarget::WrongNode => {
+            wrong_server(nodes.owner.as_ref()?, &nodes.primaries, &mut rng)?
+        }
+        RedirectTarget::Replica => choose(&nodes.replicas, &mut rng)?,
+        RedirectTarget::Random => choose(&nodes.primaries, &mut rng)?,
+        RedirectTarget::Next => {
+            let listener = listener?;
+            if nodes.primaries.len() < 2 || !nodes.all.contains(&listener) {
+                return None;
+            }
+            let next = nodes
+                .primaries
+                .iter()
+                .position(|node| node == &listener)
+                .map_or(0, |index| (index + 1) % nodes.primaries.len());
+            nodes.primaries[next].clone()
+        }
+    };
+    let slot = match redirect.slot {
+        RedirectSlot::Correct | RedirectSlot::Fixed(_) => correct_slot,
+        RedirectSlot::Wrong => wrong_valid_slot(correct_slot, &mut rng),
+        RedirectSlot::Wild => {
+            let value = rng.r#gen::<i32>();
+            if (0..CLUSTER_SLOT_COUNT).contains(&value) {
+                -1
+            } else {
+                value
+            }
+        }
+    };
+    let kind = match redirect.kind {
+        RedirectKind::Moved => RedirectionKind::Moved,
+        RedirectKind::Ask => RedirectionKind::Ask,
+        RedirectKind::Random => {
+            if rng.r#gen() {
+                RedirectionKind::Moved
+            } else {
+                RedirectionKind::Ask
+            }
+        }
+    };
+    Some(TopologyMutation {
+        frame: Redirection { kind, slot, server }.to_frame(),
+        mutations: vec![AppliedMutation {
+            path: "topology".to_owned(),
+            kind: match redirect.phase {
+                RedirectPhase::Before => MutationKind::TopologyRedirectBefore,
+                RedirectPhase::After => MutationKind::TopologyRedirectAfter,
+            },
+            length: None,
+        }],
+    })
+}
+
+fn choose(targets: &[String], rng: &mut ChaCha20Rng) -> Option<String> {
+    if targets.is_empty() {
+        None
+    } else {
+        Some(targets[rng.gen_range(0..targets.len())].clone())
+    }
+}
+
+fn command_slot(command: &Frame, key: usize) -> Option<i32> {
+    let bytes = match command {
+        Frame::Array(Some(items)) => match items.get(key)? {
+            Frame::BulkString(Some(bytes)) | Frame::VerbatimString(bytes) => {
+                bytes
+            }
+            Frame::SimpleString(value) => value.as_bytes(),
+            _ => return None,
+        },
+        Frame::Inline(parts) => parts.get(key)?,
+        _ => return None,
+    };
+    Some(redis_slot(bytes))
+}
+
+#[derive(Default)]
+struct RedirectNodes {
+    primaries: Vec<String>,
+    all: Vec<String>,
+    owner: Option<String>,
+    replicas: Vec<String>,
+}
+
+impl RedirectNodes {
+    fn from_slots(slots: &Frame, slot: i32) -> Self {
+        let mut result = Self::default();
+        let Frame::Array(Some(ranges)) = slots else {
+            return result;
+        };
+        for range in ranges {
+            let Frame::Array(Some(parts)) = range else {
+                continue;
+            };
+            let [
+                Frame::Integer(start),
+                Frame::Integer(end),
+                primary,
+                replicas @ ..,
+            ] = parts.as_slice()
+            else {
+                continue;
+            };
+            let Some(primary) = node_endpoint(primary) else {
+                continue;
+            };
+            if !result.primaries.contains(&primary) {
+                result.primaries.push(primary.clone());
+            }
+            let owns_slot = (*start..=*end).contains(&i64::from(slot));
+            if owns_slot {
+                result.owner = Some(primary.clone());
+            }
+            if !result.all.contains(&primary) {
+                result.all.push(primary);
+            }
+            for replica in replicas.iter().filter_map(node_endpoint) {
+                if owns_slot && !result.replicas.contains(&replica) {
+                    result.replicas.push(replica.clone());
+                }
+                if !result.all.contains(&replica) {
+                    result.all.push(replica);
+                }
+            }
+        }
+        result
+    }
+}
+
+fn node_endpoint(node: &Frame) -> Option<String> {
+    let Frame::Array(Some(parts)) = node else {
+        return None;
+    };
+    let host = frame_string(parts.first()?)?;
+    let Frame::Integer(port) = parts.get(1)? else {
+        return None;
+    };
+    Some(
+        TcpEndpoint {
+            host,
+            port: u16::try_from(*port).ok()?,
+        }
+        .connect_addr(),
+    )
 }
 
 /// Rewrite a cluster redirection, or return a local error if its target has
@@ -354,6 +561,210 @@ mod tests {
     use super::*;
     use crate::cli::TcpEndpoint;
     use crate::evil::EvilMode;
+
+    fn focused_slots() -> Frame {
+        fn node(host: &str, port: i64) -> Frame {
+            Frame::Array(Some(vec![
+                Frame::BulkString(Some(host.as_bytes().to_vec())),
+                Frame::Integer(port),
+            ]))
+        }
+        let first = Frame::Array(Some(vec![
+            Frame::Integer(0),
+            Frame::Integer(8191),
+            node("127.0.0.1", 6380),
+        ]));
+        let second = Frame::Array(Some(vec![
+            Frame::Integer(8192),
+            Frame::Integer(16383),
+            node("127.0.0.1", 6381),
+            node("::1", 6382),
+        ]));
+        // Repeated range entries must not weight destination selection.
+        Frame::Array(Some(vec![first, second.clone(), second]))
+    }
+
+    fn focused(
+        options: &str,
+        command: &Frame,
+        index: u64,
+        listener: &str,
+        upstream: Option<&[u8]>,
+    ) -> Option<TopologyMutation> {
+        let mut config = EvilConfig::default();
+        config.seed = 1234;
+        config
+            .apply_debug_command(
+                &format!("DEBUG EVIL TOPOLOGY REDIRECT {options}")
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        configured_redirection(
+            &config,
+            RedirectContext {
+                command_index: index,
+                command_hash: &crate::evil::deterministic_hash(
+                    &command.encode(),
+                ),
+                command,
+                upstream_bytes: upstream,
+                local_slots: &focused_slots(),
+                listener: Some(&listener.parse().unwrap()),
+            },
+        )
+    }
+
+    #[test]
+    fn focused_redirects_choose_exact_kind_slot_and_destination() {
+        let command = parse_frame(b"GET foo\r\n").unwrap();
+        for kind in ["MOVED", "ASK"] {
+            for (target, destination) in [
+                ("WRONG_NODE", "127.0.0.1:6380"),
+                ("SELF", "127.0.0.1:6381"),
+                ("NEXT", "127.0.0.1:6380"),
+                ("REPLICA", "[::1]:6382"),
+                ("unknown.invalid:7999", "unknown.invalid:7999"),
+                ("[::2]:7999", "[::2]:7999"),
+            ] {
+                let options = format!("KIND {kind} TARGET {target}");
+                let mutation =
+                    focused(&options, &command, 9, "127.0.0.1:6381", None)
+                        .unwrap();
+                assert_eq!(
+                    mutation.frame.encode(),
+                    format!("-{kind} 12182 {destination}\r\n").as_bytes()
+                );
+                assert_eq!(mutation.mutations.len(), 1);
+                assert_eq!(
+                    mutation.mutations[0].kind,
+                    MutationKind::TopologyRedirectBefore
+                );
+                assert_eq!(
+                    focused(&options, &command, 9, "127.0.0.1:6381", None)
+                        .unwrap()
+                        .frame,
+                    mutation.frame
+                );
+            }
+        }
+        let nodes = RedirectNodes::from_slots(&focused_slots(), 12182);
+        assert_eq!(nodes.primaries, ["127.0.0.1:6380", "127.0.0.1:6381"]);
+        assert_eq!(nodes.replicas, ["[::1]:6382"]);
+    }
+
+    #[test]
+    fn focused_redirects_respect_phase_probability_cutoff_and_eligibility() {
+        let command = parse_frame(b"GET foo\r\n").unwrap();
+        for options in ["PROBABILITY 0", "UNTIL 9", "UNTIL 0", "PHASE AFTER"] {
+            assert!(
+                focused(options, &command, 9, "127.0.0.1:6381", None).is_none(),
+                "{options}"
+            );
+        }
+        assert!(
+            focused("", &command, 9, "127.0.0.1:6381", Some(b"+OK\r\n"))
+                .is_none()
+        );
+        let mutation = focused(
+            "PHASE AFTER KIND ASK",
+            &command,
+            9,
+            "127.0.0.1:6381",
+            Some(b"-MOVED 12182 127.0.0.1:6381\r\n"),
+        )
+        .unwrap();
+        assert_eq!(mutation.frame.encode(), b"-ASK 12182 127.0.0.1:6380\r\n");
+        assert_eq!(
+            mutation.mutations[0].kind,
+            MutationKind::TopologyRedirectAfter
+        );
+        assert!(
+            focused("UNTIL 10", &command, 9, "127.0.0.1:6381", None).is_some()
+        );
+        for options in ["TARGET SELF", "TARGET NEXT"] {
+            assert!(
+                focused(options, &command, 9, "127.0.0.1:7999", None).is_none()
+            );
+        }
+        let command = parse_frame(b"PING\r\n").unwrap();
+        assert!(focused("", &command, 9, "127.0.0.1:6381", None).is_none());
+        assert_eq!(
+            focused("SLOT 42", &command, 9, "127.0.0.1:6380", None)
+                .unwrap()
+                .frame
+                .encode(),
+            b"-MOVED 42 127.0.0.1:6381\r\n"
+        );
+        let command = parse_frame(b"GET bar\r\n").unwrap();
+        // The shard containing bar has no replica: do not substitute a primary.
+        assert!(
+            focused("TARGET REPLICA", &command, 9, "127.0.0.1:6380", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn correct_slots_use_binary_keys_and_explicit_argument_indexes() {
+        for (key, slot) in [
+            (b"\xff{foo}\x00".as_slice(), 12182),
+            // CRC16/XMODEM over the raw bytes, including non-UTF-8 and NUL.
+            (b"\xfffoo\x00".as_slice(), 2218),
+        ] {
+            let command = Frame::Array(Some(vec![
+                Frame::BulkString(Some(b"GET".to_vec())),
+                Frame::BulkString(Some(key.to_vec())),
+            ]));
+            assert_eq!(
+                focused("TARGET SELF", &command, 9, "127.0.0.1:6381", None)
+                    .unwrap()
+                    .frame
+                    .encode(),
+                format!("-MOVED {slot} 127.0.0.1:6381\r\n").as_bytes()
+            );
+        }
+        let command = parse_frame(b"EVAL script 1 foo\r\n").unwrap();
+        assert_eq!(
+            focused("KEY 3", &command, 9, "127.0.0.1:6381", None)
+                .unwrap()
+                .frame
+                .encode(),
+            b"-MOVED 12182 127.0.0.1:6380\r\n"
+        );
+        assert!(
+            focused("KEY 4", &command, 9, "127.0.0.1:6381", None).is_none()
+        );
+    }
+
+    #[test]
+    fn random_kind_and_bad_slots_are_seeded_and_stay_in_their_categories() {
+        let command = parse_frame(b"GET foo\r\n").unwrap();
+        for options in ["KIND RANDOM TARGET RANDOM", "SLOT WRONG", "SLOT WILD"]
+        {
+            for index in 0..32 {
+                let first =
+                    focused(options, &command, index, "127.0.0.1:6381", None)
+                        .unwrap();
+                let second =
+                    focused(options, &command, index, "127.0.0.1:6381", None)
+                        .unwrap();
+                assert_eq!(first.frame.encode(), second.frame.encode());
+                let parsed = parse_redirection(&first.frame).unwrap();
+                match options {
+                    "SLOT WRONG" => {
+                        assert!((0..16384).contains(&parsed.slot));
+                        assert_ne!(parsed.slot, 12182);
+                    }
+                    "SLOT WILD" => assert!(!(0..16384).contains(&parsed.slot)),
+                    _ => assert!(
+                        ["127.0.0.1:6380", "127.0.0.1:6381"]
+                            .contains(&parsed.server.as_str())
+                    ),
+                }
+            }
+        }
+    }
 
     #[test]
     fn topology_mutation_can_fake_redirection_without_upstream() {

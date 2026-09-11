@@ -14,6 +14,7 @@ use crate::framing::FramingConfig;
 use crate::generator::GeneratorConfig;
 use crate::mutation;
 use crate::resp::Frame;
+use crate::topology_config::{RedirectConfig, parse_topology};
 use crate::transport::TransportConfig;
 
 pub const DEFAULT_EXCLUDED_COMMANDS: &[&str] = &[
@@ -149,6 +150,7 @@ pub struct EvilConfig {
     pub mode: EvilMode,
     pub probability: f64,
     pub topology_probability: f64,
+    pub(crate) topology_redirect: Option<RedirectConfig>,
     pub canonicalization: CanonicalizationMode,
     pub strategy: MutationStrategy,
     pub mutation_count: MutationCount,
@@ -171,6 +173,7 @@ impl Default for EvilConfig {
             mode: EvilMode::Off,
             probability: 0.0,
             topology_probability: 0.0,
+            topology_redirect: None,
             canonicalization: CanonicalizationMode::Unordered,
             strategy: MutationStrategy::Preserve,
             mutation_count: MutationCount::Many,
@@ -334,18 +337,9 @@ impl EvilConfig {
                 Ok(DebugResult::ok())
             }
             "TOPOLOGY" => {
-                let Some(probability) = argv.get(3) else {
-                    return Err(AppError::EvilConfig(
-                        "DEBUG EVIL TOPOLOGY requires a probability".to_owned(),
-                    ));
-                };
-                if argv.len() != 4 {
-                    return Err(AppError::EvilConfig(
-                        "DEBUG EVIL TOPOLOGY does not accept options"
-                            .to_owned(),
-                    ));
-                }
-                self.topology_probability = parse_probability(probability)?;
+                let (probability, redirect) = parse_topology(&argv[3..])?;
+                self.topology_probability = probability;
+                self.topology_redirect = redirect;
                 Ok(DebugResult::ok())
             }
             "STATUS" => {
@@ -403,7 +397,7 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {} {} {}",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {} {} {} {}",
             self.mode,
             self.seed,
             self.probability,
@@ -416,6 +410,10 @@ impl EvilConfig {
             self.framing.status(),
             self.generator.status(),
             self.transport.status(),
+            self.topology_redirect.as_ref().map_or_else(
+                || "topology=LEGACY".to_owned(),
+                RedirectConfig::status,
+            ),
         )
     }
 }
@@ -604,6 +602,8 @@ pub enum MutationKind {
     TopologyWrongSlot,
     TopologyWrongServer,
     TopologyWildSlot,
+    TopologyRedirectBefore,
+    TopologyRedirectAfter,
 }
 
 #[derive(Clone, Debug)]

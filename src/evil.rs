@@ -17,6 +17,66 @@ use crate::resp::Frame;
 use crate::topology_config::{RedirectConfig, parse_topology};
 use crate::transport::TransportConfig;
 
+const DEBUG_EVIL_HELP: &[&str] = &[
+    "DEBUG EVIL <subcommand> [<arg> ...]. Subcommands are:",
+    "CANONICALIZE <ALL|UNORDERED|NONE>",
+    "    Normalize upstream replies before mutation (default UNORDERED).",
+    "EXCLUDE [<command|regex|@attribute> ...]",
+    "    Replace exclusion filters; no arguments clears the list.",
+    "    Filters are case-insensitive; exclusions override inclusions.",
+    "FRAMING <AUTO|OFF>",
+    "    Use automatic root length faults or disable length faults.",
+    "FRAMING LENGTH [PROBABILITY <0..100>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]",
+    "    Attempt one length fault in MUTATE/OVERFLOW, independent of value probability.",
+    "    Omitted options reset to 100, ANY, RANDOM. Paths include root.0 and root.0.value.",
+    "GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLATIONS <OFF|ON>]",
+    "    Configure generated values; supply at least one option/value pair.",
+    "    Omitted options retain their values. VIOLATIONS ON permits malformed values.",
+    "HELP",
+    "    Print this help.",
+    "INCLUDE [<command|regex|@attribute> ...]",
+    "    Replace inclusion filters; no arguments allows all commands unless excluded.",
+    "MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0..100>]",
+    "    OFF disables RESP mutation; RANDOM generates replies without forwarding.",
+    "    MUTATE changes upstream replies; OVERFLOW targets extreme values and lengths.",
+    "    Probability defaults to 100 (0 for OFF); RANDOM ignores probability.",
+    "    Independent topology and transport faults can still apply in OFF mode.",
+    "MODE RESET",
+    "    Disable RESP mutation, zero its probability, and reset the shared command index.",
+    "    Invalidate older connections and reset this connection's protocol fingerprints.",
+    "    Preserve seed and other settings, including topology and transport faults.",
+    "MUTATIONS <ONE|MANY>",
+    "    Select one eligible frame per reply or mutate multiple frames (default MANY).",
+    "SEED <seed>",
+    "    Set the deterministic seed to an unsigned 64-bit integer (default 0).",
+    "STATUS",
+    "    Return the current connection's configuration.",
+    "STRATEGY <PRESERVE|REPLACE>",
+    "    Preserve containers and scalar types or allow frame replacement (default PRESERVE).",
+    "TOPOLOGY <0..100|OFF>",
+    "    Configure legacy cluster redirection faults, or disable all topology faults.",
+    "TOPOLOGY REDIRECT [PROBABILITY <0..100>] [KIND <MOVED|ASK|RANDOM>]",
+    "    [TARGET <WRONG_NODE|SELF|REPLICA|NEXT|RANDOM|host:port>] [SLOT <CORRECT|WRONG|WILD|0..16383>]",
+    "    [PHASE <BEFORE|AFTER>] [KEY <argument-index>] [UNTIL <command-index|OFF>]",
+    "    Inject focused cluster redirects; omitted options reset to defaults.",
+    "    Defaults: 100, MOVED, WRONG_NODE, CORRECT, BEFORE, KEY 1, UNTIL OFF.",
+    "    BEFORE skips upstream execution; AFTER replaces the reply after execution.",
+    "    KEY is zero-based; UNTIL is an exclusive shared command index cutoff.",
+    "TRANSPORT OFF",
+    "    Clear all transport faults and restore transport probability to 100.",
+    "TRANSPORT [TRUNCATE <OFF|RANDOM|bytes>] [EXTRA <0..16>] [CHUNKS <OFF|RANDOM|offsets>]",
+    "    [PROBABILITY <0..100>] [FAULT <OFF|CLOSE|RESET|STALL>]",
+    "    [AT <BEFORE|AFTER|REPLY|RANDOM|bytes>] [DURATION <1..3600000>]",
+    "    Configure delivery faults; supply at least one option/value pair.",
+    "    Omitted options retain their values. Applies independently of RESP mode.",
+    "    TRUNCATE sends a prefix then closes; EXTRA appends unsolicited replies.",
+    "    CHUNKS uses comma-separated increasing positive byte offsets or random splits.",
+    "    FAULT closes, resets TCP, or explicitly stalls, then ends the connection.",
+    "    AT selects before forwarding, before reply bytes, after the full reply, or an offset.",
+    "    DURATION is stall milliseconds (default 10000); only FAULT STALL delays.",
+    "    FAULT and TRUNCATE cannot both be enabled. RESET requires a TCP client.",
+];
+
 pub const DEFAULT_EXCLUDED_COMMANDS: &[&str] = &[
     "AUTH",
     "HELLO",
@@ -341,6 +401,22 @@ impl EvilConfig {
                 self.topology_probability = probability;
                 self.topology_redirect = redirect;
                 Ok(DebugResult::ok())
+            }
+            "HELP" => {
+                if argv.len() != 3 {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL HELP does not accept options".to_owned(),
+                    ));
+                }
+                Ok(DebugResult {
+                    frame: Frame::Array(Some(
+                        DEBUG_EVIL_HELP
+                            .iter()
+                            .map(|line| Frame::SimpleString((*line).to_owned()))
+                            .collect(),
+                    )),
+                    action: DebugAction::None,
+                })
             }
             "STATUS" => {
                 if argv.len() != 3 {
@@ -918,6 +994,7 @@ mod tests {
             vec!["MODE", "RANDOM", "PROBABILITY"],
             vec!["SEED", "7", "unexpected"],
             vec!["STATUS", "unexpected"],
+            vec!["HELP", "unexpected"],
             vec!["INCLUDE", "GET", "["],
             vec!["EXCLUDE", "SET", "["],
             vec!["STRATEGY"],
@@ -1064,6 +1141,61 @@ mod tests {
             ]))
             .unwrap();
         assert!(config.status().contains("generator_protocol=RESP3 generator_corpus=RANDOM generator_violations=OFF"));
+    }
+
+    #[test]
+    fn debug_help_is_read_only_and_case_insensitive() {
+        let mut config = EvilConfig {
+            seed: 42,
+            mode: EvilMode::Overflow,
+            probability: 12.5,
+            ..EvilConfig::default()
+        };
+        let before = config.status();
+        let result = config
+            .apply_debug_command(&strings(["dEbUg", "eViL", "hElP"]))
+            .unwrap();
+        assert_eq!(result.action, DebugAction::None);
+        assert_eq!(config.status(), before);
+        let Frame::Array(Some(lines)) = result.frame else {
+            panic!("expected an array of help lines");
+        };
+        assert_eq!(
+            lines[0],
+            Frame::SimpleString(
+                "DEBUG EVIL <subcommand> [<arg> ...]. Subcommands are:"
+                    .to_owned()
+            )
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| matches!(line, Frame::SimpleString(_)))
+        );
+        for command in [
+            "CANONICALIZE",
+            "EXCLUDE",
+            "FRAMING",
+            "GENERATOR",
+            "HELP",
+            "INCLUDE",
+            "MODE",
+            "MUTATIONS",
+            "SEED",
+            "STATUS",
+            "STRATEGY",
+            "TOPOLOGY",
+            "TRANSPORT",
+        ] {
+            assert!(
+                lines.iter().any(|line| {
+                    matches!(line, Frame::SimpleString(text)
+                    if text.split_whitespace().next() == Some(command)
+                        && !text.starts_with(' '))
+                }),
+                "missing help for {command}"
+            );
+        }
     }
 
     #[test]

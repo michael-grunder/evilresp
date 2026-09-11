@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `DEBUG EVIL HELP` with Redis-style subcommand syntax and descriptions,
+  without changing configuration or consuming a command index.
+
 - Added opt-in `DEBUG EVIL TRANSPORT FAULT CLOSE|RESET|STALL`, with `AT`
   selecting before forwarding, after reply preparation, after the complete
   reply, or a fixed/random byte offset. Faults honor filters/bootstrap bypasses

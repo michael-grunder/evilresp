@@ -105,7 +105,7 @@ every second, combining all listeners (including cluster nodes). Fields are:
   whose upstream connection fails; `clients_active`: connections still handled
   by the proxy, including monitor clients.
 - `evil_updates`: successful `DEBUG EVIL` configuration commands, including
-  repeated settings and `MODE RESET`, excluding `STATUS` reads.
+  repeated settings and `MODE RESET`, excluding `STATUS` and `HELP` reads.
 - `evil_status_reads`, `evil_rejected`, and `evil_resets`: successful status
   reads, rejected `DEBUG EVIL` commands, and successful reset commands.
 - `mode_off`, `mode_random`, `mode_mutate`, and `mode_overflow`: successful
@@ -119,7 +119,7 @@ slightly different instants. Delayed summaries skip missed intervals instead
 of emitting a burst of catch-up logs.
 
 Individual configuration changes, including the full status, are logged at
-DEBUG (`-v` or `-vv`). `STATUS` reads do not log configuration changes.
+DEBUG (`-v` or `-vv`). `STATUS` and `HELP` reads do not log configuration changes.
 Rejected commands still produce warnings.
 
 Warnings for rejected `DEBUG PROTOCOL` commands identify the invalid argument
@@ -239,6 +239,7 @@ connections always start with the default non-evil configuration and must send
 their own `DEBUG EVIL` setup commands.
 
 ```text
+DEBUG EVIL HELP
 DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL STRATEGY <PRESERVE|REPLACE>
@@ -257,6 +258,10 @@ DEBUG EVIL STATUS
 DEBUG EVIL INCLUDE <arg1> ... <argN>
 DEBUG EVIL EXCLUDE <arg1> ... <argN>
 ```
+
+`DEBUG EVIL HELP` returns a Redis-style array of subcommand syntax and
+indented descriptions, suitable for viewing in `redis-cli`. It accepts no
+extra arguments, leaves configuration unchanged, and consumes no command index.
 
 The default seed is `0`. Seeds must be unsigned 64-bit integers, and
 probabilities must be finite numbers between `0` and `100`. Invalid commands

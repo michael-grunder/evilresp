@@ -622,7 +622,7 @@ fn apply_debug_evil(
             // Successful parsing guarantees a subcommand is present.
             if argv[2].eq_ignore_ascii_case("STATUS") {
                 stats.status_read();
-            } else {
+            } else if !argv[2].eq_ignore_ascii_case("HELP") {
                 stats.configuration_updated();
                 if result.action == DebugAction::ResetIncrementingState {
                     stats.reset();
@@ -894,9 +894,11 @@ mod tests {
                 }
 
                 buffer.0.lock().unwrap().clear();
-                let argv = ["DEBUG", "EVIL", "STATUS"].map(str::to_owned);
-                apply_debug_evil(&mut config, &argv, &stats, true);
-                assert!(buffer.0.lock().unwrap().is_empty());
+                for command in ["STATUS", "HELP"] {
+                    let argv = ["DEBUG", "EVIL", command].map(str::to_owned);
+                    apply_debug_evil(&mut config, &argv, &stats, true);
+                    assert!(buffer.0.lock().unwrap().is_empty());
+                }
             });
         }
     }
@@ -942,6 +944,8 @@ mod tests {
             "SEED 42",
             "STATUS",
             "status",
+            "HELP",
+            "help",
             "MODE INVALID",
             "MODE MUTATE PROBABILITY 101",
             "STATUS EXTRA",
@@ -1143,7 +1147,7 @@ mod tests {
                 .unwrap();
         });
 
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
         let target = ProxyTarget {
             upstream: Endpoint::Unix(path.clone()),
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
@@ -1159,6 +1163,7 @@ mod tests {
             local_slots: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
+        let command_ids = Arc::clone(&state.command_ids);
         let proxy = tokio::spawn(proxy_connection(
             Box::new(server),
             target,
@@ -1166,9 +1171,28 @@ mod tests {
             0,
             0,
         ));
-
-        client.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
         let mut read = BufReader::new(client);
+        for args in [
+            vec!["debug", "evil", "help"],
+            vec!["DEBUG", "EVIL", "HELP", "extra"],
+        ] {
+            read.get_mut()
+                .write_all(&resp_command(&args))
+                .await
+                .unwrap();
+            let response =
+                parse_frame(&read_raw_frame(&mut read).await.unwrap()).unwrap();
+            if args.len() == 3 {
+                assert!(matches!(response, Frame::Array(Some(_))));
+            } else {
+                assert!(matches!(response, Frame::SimpleError(_)));
+            }
+            assert_eq!(command_ids.load(Ordering::SeqCst), 0);
+        }
+        read.get_mut()
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
+            .await
+            .unwrap();
         let response = read_raw_frame(&mut read).await.unwrap();
 
         assert_eq!(response, b"+PONG\r\n");

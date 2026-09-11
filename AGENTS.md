@@ -85,7 +85,8 @@ them need a test proving they still hold.
   incrementing global state must participate in this reset.
 - **Cluster redirections always point back at evilresp.** Upstream `MOVED`/
   `ASK` targets and topology replies are rewritten to local listeners; nodes
-  with no local listener (replicas) are removed, not exposed.
+  with no local listener are removed, not exposed. Discovered primaries and
+  replicas each have a listener, with primary ports allocated first.
 - **The repro JSONL record is a contract.** External tooling parses it. Add
   fields; do not rename or remove existing ones without a changelog entry.
 

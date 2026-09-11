@@ -43,23 +43,40 @@ cargo run -- --proxy unix:/tmp/redis.sock --listen unix:/tmp/evilresp.sock
 ```
 
 At startup, `evilresp` probes `CLUSTER SLOTS`. If the upstream is a cluster, it
-maps each primary node to a local listening port and rewrites `CLUSTER SLOTS`,
-`CLUSTER SHARDS`, and `CLUSTER NODES` responses and upstream `MOVED`/`ASK`
-redirections so cluster-aware clients connect back through `evilresp`,
+maps each primary and replica node to a local listening port and rewrites
+`CLUSTER SLOTS`, `CLUSTER SHARDS`, and `CLUSTER NODES` responses and upstream
+`MOVED`/`ASK` redirections so cluster-aware clients connect back through `evilresp`,
 whichever discovery command they use. `CLUSTER SLOTS` is synthesized from the
 startup probe; `CLUSTER SHARDS` and `CLUSTER NODES` are answered by the
-upstream and rewritten, with nodes that have no local listener (replicas)
-removed rather than exposed, and announced hostnames replaced or blanked. The
+upstream and rewritten, with nodes that have no local listener removed rather
+than exposed, and announced hostnames replaced or blanked. The
 three topology queries bypass reply mutation and do not consume a command
 index, so a client can always bootstrap. Cluster proxy mode requires TCP
 endpoints; configuring either endpoint as AF_UNIX uses standalone proxy mode.
 
 Cluster listeners use consecutive ports starting at `--listen`, which must
-be nonzero in cluster mode. Discovery runs once at startup. If it fails
-(including an authentication error), the proxy falls back to standalone mode.
+be nonzero in cluster mode. Primaries are assigned ports first, in their order
+of first appearance in the startup response, followed by replicas in the same
+order. For example, three primaries and three replicas starting at `6380` use
+`6380–6382` for primaries and `6383–6385` for replicas. Repeated nodes across
+slot ranges share a listener; node IDs and primary/replica relationships are
+preserved. Nodes are matched by node ID when available and by full upstream
+endpoint, so different hosts using the same port get separate listeners.
+Topology rewriting can also match an alternative address by port when that
+port identifies only one mapped node. Conflicting node identities or a local
+port range exceeding `65535` stop startup with an error.
+
+Each replica listener forwards to that actual upstream replica, including
+client `READONLY` and `READWRITE` commands. Replica connections start with
+their own default non-evil configuration, just like primary connections.
+
+Discovery runs once at startup. If the probe fails (including an
+authentication error), the proxy falls back to standalone mode.
 In cluster mode, a redirection to a target with no mapped local listener
 returns `ERR evilresp has no local listener for redirection target`. Restart
-the proxy to discover changed topology. Rewriting also happens before RESP
+the proxy to discover changed topology, including changed slot ownership or
+primary/replica roles after failover; the synthesized `CLUSTER SLOTS` reply
+remains a startup snapshot. Rewriting also happens before RESP
 mutation, including when its probability is zero.
 
 ## MONITOR

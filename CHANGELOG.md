@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added one-to-one cluster replica listeners after the existing primary port
+  assignments. `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER NODES`, and
+  redirections use the same primary and replica mapping, preserving node IDs
+  and replica relationships. Topology rewriting also matches discovered node
+  IDs when replies advertise alternative addresses.
 - Added the complete parsed argument array to debug logs for rejected
   `DEBUG PROTOCOL` commands, visible with `-v` or `-vv`. Error replies and
   warnings now identify invalid arguments and valid choices, missing arguments,

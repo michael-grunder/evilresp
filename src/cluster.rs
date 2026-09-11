@@ -55,28 +55,45 @@ pub struct ProxyTarget {
 
 #[derive(Clone, Debug)]
 pub struct LocalSlotRange {
-    pub start: u16,
-    pub end: u16,
-    pub upstream: TcpEndpoint,
-    pub local: SocketAddr,
-    pub node_id: Option<Vec<u8>>,
+    start: u16,
+    end: u16,
+    primary: LocalNode,
+    replicas: Vec<LocalNode>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalNode {
+    upstream: TcpEndpoint,
+    local: SocketAddr,
+    node_id: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ClusterRedirectionMap {
     local_by_upstream: BTreeMap<String, String>,
     local_by_unique_upstream_port: BTreeMap<u16, String>,
+    local_by_node_id: BTreeMap<Vec<u8>, String>,
 }
 
 impl ClusterRedirectionMap {
-    pub fn from_slot_ranges(slots: &[LocalSlotRange]) -> Self {
-        let mappings = slots.iter().map(|slot| {
+    fn from_slot_ranges(slots: &[LocalSlotRange]) -> Self {
+        let nodes = || slots.iter().flat_map(LocalSlotRange::nodes);
+        let mappings = nodes().map(|node| {
             (
-                slot.upstream.clone(),
-                socket_addr_to_endpoint(slot.local).connect_addr(),
+                node.upstream.clone(),
+                socket_addr_to_endpoint(node.local).connect_addr(),
             )
         });
-        Self::from_mappings(mappings)
+        let mut map = Self::from_mappings(mappings);
+        for node in nodes() {
+            if let Some(id) = &node.node_id {
+                map.local_by_node_id.insert(
+                    id.clone(),
+                    socket_addr_to_endpoint(node.local).connect_addr(),
+                );
+            }
+        }
+        map
     }
 
     pub fn from_mappings(
@@ -105,7 +122,18 @@ impl ClusterRedirectionMap {
         Self {
             local_by_upstream,
             local_by_unique_upstream_port,
+            local_by_node_id: BTreeMap::new(),
         }
+    }
+
+    pub fn rewrite_node(
+        &self,
+        node_id: Option<&[u8]>,
+        server: &str,
+    ) -> Option<String> {
+        node_id
+            .and_then(|id| self.local_by_node_id.get(id).cloned())
+            .or_else(|| self.rewrite_server(server))
     }
 
     pub fn rewrite_server(&self, server: &str) -> Option<String> {
@@ -125,20 +153,29 @@ impl ClusterRedirectionMap {
 }
 
 impl LocalSlotRange {
+    fn nodes(&self) -> impl Iterator<Item = &LocalNode> {
+        std::iter::once(&self.primary).chain(&self.replicas)
+    }
+
+    fn to_resp_frame(&self) -> Frame {
+        let mut parts = vec![
+            Frame::Integer(i64::from(self.start)),
+            Frame::Integer(i64::from(self.end)),
+        ];
+        parts.extend(self.nodes().map(LocalNode::to_resp_frame));
+        Frame::Array(Some(parts))
+    }
+}
+
+impl LocalNode {
     fn to_resp_frame(&self) -> Frame {
         let node_id = self.node_id.clone().unwrap_or_else(|| {
             format!("evilresp-{}", self.local.port()).into_bytes()
         });
         Frame::Array(Some(vec![
-            Frame::Integer(i64::from(self.start)),
-            Frame::Integer(i64::from(self.end)),
-            Frame::Array(Some(vec![
-                Frame::BulkString(Some(
-                    self.local.ip().to_string().into_bytes(),
-                )),
-                Frame::Integer(i64::from(self.local.port())),
-                Frame::BulkString(Some(node_id)),
-            ])),
+            Frame::BulkString(Some(self.local.ip().to_string().into_bytes())),
+            Frame::Integer(i64::from(self.local.port())),
+            Frame::BulkString(Some(node_id)),
         ]))
     }
 }
@@ -188,58 +225,97 @@ pub async fn discover(
         }
     };
 
-    if tcp_listen.port() == 0 {
+    map_cluster_slots(slots, tcp_listen)
+}
+
+fn map_cluster_slots(
+    mut slots: Vec<LocalSlotRange>,
+    listen: SocketAddr,
+) -> AppResult<Topology> {
+    if listen.port() == 0 {
         return Err(AppError::Proxy(
             "cluster proxy mode requires a non-zero --listen port".to_owned(),
         ));
     }
 
     let mut local_by_upstream = BTreeMap::<String, SocketAddr>::new();
+    let mut local_by_node_id = BTreeMap::<Vec<u8>, SocketAddr>::new();
+    let mut node_id_by_local = BTreeMap::<SocketAddr, Vec<u8>>::new();
     let mut targets = Vec::new();
-    for slot in &slots {
-        let key = slot.upstream.connect_addr();
-        if local_by_upstream.contains_key(&key) {
+    // Allocate every primary first to preserve existing primary ports.
+    let nodes = slots
+        .iter()
+        .map(|slot| &slot.primary)
+        .chain(slots.iter().flat_map(|slot| &slot.replicas));
+    for node in nodes {
+        let key = node.upstream.connect_addr();
+        let by_endpoint = local_by_upstream.get(&key).copied();
+        let by_id = node
+            .node_id
+            .as_ref()
+            .and_then(|id| local_by_node_id.get(id))
+            .copied();
+        if let (Some(endpoint), Some(id)) = (by_endpoint, by_id)
+            && endpoint != id
+        {
+            return Err(AppError::Proxy(
+                "cluster node ID conflicts with endpoint mapping".to_owned(),
+            ));
+        }
+        if let Some(local) = by_id.or(by_endpoint) {
+            local_by_upstream.insert(key, local);
+            if let Some(id) = &node.node_id {
+                if let Some(existing) = node_id_by_local.get(&local)
+                    && existing != id
+                {
+                    return Err(AppError::Proxy(
+                        "cluster endpoint has conflicting node IDs".to_owned(),
+                    ));
+                }
+                local_by_node_id.insert(id.clone(), local);
+                node_id_by_local.insert(local, id.clone());
+            }
             continue;
         }
 
-        let offset = u16::try_from(local_by_upstream.len()).map_err(|_| {
+        let offset = u16::try_from(targets.len()).map_err(|_| {
             AppError::Proxy(
                 "cluster has more local nodes than u16 ports".to_owned(),
             )
         })?;
-        let port = tcp_listen.port().checked_add(offset).ok_or_else(|| {
+        let port = listen.port().checked_add(offset).ok_or_else(|| {
             AppError::Proxy(format!(
                 "cluster local port mapping from {} overflows u16",
-                tcp_listen.port()
+                listen.port()
             ))
         })?;
-        let mut local = tcp_listen;
+        let mut local = listen;
         local.set_port(port);
         local_by_upstream.insert(key, local);
+        if let Some(id) = &node.node_id {
+            local_by_node_id.insert(id.clone(), local);
+            node_id_by_local.insert(local, id.clone());
+        }
         targets.push(ProxyTarget {
-            upstream: Endpoint::Tcp(slot.upstream.clone()),
+            upstream: Endpoint::Tcp(node.upstream.clone()),
             listen: Endpoint::Tcp(socket_addr_to_endpoint(local)),
         });
     }
 
-    let local_slots = slots
-        .into_iter()
-        .map(|mut slot| {
-            let key = slot.upstream.connect_addr();
-            slot.local = local_by_upstream[&key];
-            slot
-        })
-        .collect::<Vec<_>>();
+    for slot in &mut slots {
+        for node in std::iter::once(&mut slot.primary).chain(&mut slot.replicas)
+        {
+            // Every node endpoint was registered in the allocation pass.
+            node.local = local_by_upstream[&node.upstream.connect_addr()];
+        }
+    }
 
     info!(
         nodes = targets.len(),
         "detected cluster topology and mapped local node listeners"
     );
 
-    Ok(Topology::Cluster {
-        targets,
-        slots: local_slots,
-    })
+    Ok(Topology::Cluster { targets, slots })
 }
 
 async fn fetch_cluster_slots(
@@ -299,31 +375,29 @@ fn parse_slot_range(
 
     let start = as_slot(parts.first(), "start slot")?;
     let end = as_slot(parts.get(1), "end slot")?;
-    let (upstream, node_id) = parse_node(parts.get(2), bootstrap)?;
+    let primary = parse_node(&parts[2], bootstrap)?;
+    let replicas = parts[3..]
+        .iter()
+        .map(|node| parse_node(node, bootstrap))
+        .collect::<AppResult<Vec<_>>>()?;
 
     Ok(LocalSlotRange {
         start,
         end,
-        upstream,
-        local: "127.0.0.1:0"
-            .parse()
-            .expect("static local placeholder must parse"),
-        node_id,
+        primary,
+        replicas,
     })
 }
 
-fn parse_node(
-    node: Option<&Frame>,
-    bootstrap: &TcpEndpoint,
-) -> AppResult<(TcpEndpoint, Option<Vec<u8>>)> {
-    let Some(Frame::Array(Some(parts))) = node else {
+fn parse_node(node: &Frame, bootstrap: &TcpEndpoint) -> AppResult<LocalNode> {
+    let Frame::Array(Some(parts)) = node else {
         return Err(AppError::Proxy(
-            "cluster slot primary node is not an array".to_owned(),
+            "cluster slot node is not an array".to_owned(),
         ));
     };
     if parts.len() < 2 {
         return Err(AppError::Proxy(
-            "cluster slot primary node has fewer than two items".to_owned(),
+            "cluster slot node has fewer than two items".to_owned(),
         ));
     }
 
@@ -362,7 +436,11 @@ fn parse_node(
         _ => None,
     };
 
-    Ok((TcpEndpoint { host, port }, node_id))
+    Ok(LocalNode {
+        upstream: TcpEndpoint { host, port },
+        local: SocketAddr::from(([127, 0, 0, 1], 0)),
+        node_id: node_id.filter(|id| !id.is_empty()),
+    })
 }
 
 fn as_slot(frame: Option<&Frame>, name: &str) -> AppResult<u16> {
@@ -384,7 +462,352 @@ fn socket_addr_to_endpoint(addr: SocketAddr) -> TcpEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster_rewrite::{
+        rewrite_cluster_nodes, rewrite_cluster_shards,
+    };
     use crate::resp::parse_frame;
+    use crate::topology_evil::normalize_redirection;
+
+    fn bulk(value: &str) -> Frame {
+        Frame::BulkString(Some(value.as_bytes().to_vec()))
+    }
+
+    fn node(host: &str, port: i64, id: &str) -> Frame {
+        Frame::Array(Some(vec![bulk(host), Frame::Integer(port), bulk(id)]))
+    }
+
+    fn range(start: i64, end: i64, nodes: Vec<Frame>) -> Frame {
+        let mut parts = vec![Frame::Integer(start), Frame::Integer(end)];
+        parts.extend(nodes);
+        Frame::Array(Some(parts))
+    }
+
+    fn mapped_cluster() -> Topology {
+        let slots = parse_cluster_slots(
+            vec![
+                range(
+                    0,
+                    100,
+                    vec![
+                        node("primary-a", 6379, "p1"),
+                        node("replica-a", 6379, "r1"),
+                        node("replica-b", 6379, "r2"),
+                    ],
+                ),
+                range(
+                    101,
+                    200,
+                    vec![
+                        node("primary-b", 6379, "p2"),
+                        node("replica-c", 6379, "r3"),
+                    ],
+                ),
+                range(
+                    201,
+                    16383,
+                    vec![
+                        node("primary-a", 6379, "p1"),
+                        node("replica-a-alias", 6379, "r1"),
+                        node("replica-b", 6379, "r2"),
+                    ],
+                ),
+            ],
+            &"bootstrap:6379".parse().unwrap(),
+        )
+        .unwrap();
+        map_cluster_slots(slots, "127.0.0.1:6380".parse().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn replicas_follow_primaries_and_repeated_nodes_share_listeners() {
+        let topology = mapped_cluster();
+        let endpoints: Vec<_> = topology
+            .targets()
+            .iter()
+            .map(|target| {
+                (target.upstream.to_string(), target.listen.to_string())
+            })
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("primary-a:6379".to_owned(), "127.0.0.1:6380".to_owned()),
+                ("primary-b:6379".to_owned(), "127.0.0.1:6381".to_owned()),
+                ("replica-a:6379".to_owned(), "127.0.0.1:6382".to_owned()),
+                ("replica-b:6379".to_owned(), "127.0.0.1:6383".to_owned()),
+                ("replica-c:6379".to_owned(), "127.0.0.1:6384".to_owned()),
+            ]
+        );
+        let expected = Frame::Array(Some(vec![
+            range(
+                0,
+                100,
+                vec![
+                    node("127.0.0.1", 6380, "p1"),
+                    node("127.0.0.1", 6382, "r1"),
+                    node("127.0.0.1", 6383, "r2"),
+                ],
+            ),
+            range(
+                101,
+                200,
+                vec![
+                    node("127.0.0.1", 6381, "p2"),
+                    node("127.0.0.1", 6384, "r3"),
+                ],
+            ),
+            range(
+                201,
+                16383,
+                vec![
+                    node("127.0.0.1", 6380, "p1"),
+                    node("127.0.0.1", 6382, "r1"),
+                    node("127.0.0.1", 6383, "r2"),
+                ],
+            ),
+        ]));
+        assert_eq!(topology.local_slots_response().unwrap(), expected);
+        assert_eq!(
+            mapped_cluster().local_slots_response().unwrap().encode(),
+            expected.encode()
+        );
+
+        let map = topology.local_redirection_map();
+        for host in ["replica-a", "replica-a-alias"] {
+            assert_eq!(
+                map.rewrite_server(&format!("{host}:6379")),
+                Some("127.0.0.1:6382".to_owned())
+            );
+        }
+        assert_eq!(map.rewrite_server("unknown:6379"), None);
+        assert_eq!(map.rewrite_server(":6379"), None);
+        assert_eq!(
+            map.rewrite_node(Some(b"r3"), "another-alias:6379"),
+            Some("127.0.0.1:6384".to_owned())
+        );
+        assert_eq!(
+            normalize_redirection(
+                &Frame::SimpleError("MOVED 42 replica-a:6379".to_owned()),
+                &map,
+            ),
+            Some(Frame::SimpleError("MOVED 42 127.0.0.1:6382".to_owned()))
+        );
+    }
+
+    fn shard_node(
+        id: &str,
+        host: &str,
+        port: i64,
+        role: &str,
+        flat: bool,
+    ) -> Frame {
+        let entries = vec![
+            (bulk("id"), bulk(id)),
+            (bulk("ip"), bulk(host)),
+            (bulk("endpoint"), bulk(host)),
+            (bulk("hostname"), bulk(host)),
+            (bulk("port"), Frame::Integer(port)),
+            (bulk("role"), bulk(role)),
+            (bulk("replication-offset"), Frame::Integer(123)),
+            (bulk("health"), bulk("online")),
+        ];
+        if flat {
+            Frame::Array(Some(
+                entries.into_iter().flat_map(|(k, v)| [k, v]).collect(),
+            ))
+        } else {
+            Frame::Map(entries)
+        }
+    }
+
+    fn shard(nodes: Vec<Frame>, flat: bool) -> Frame {
+        let slots =
+            Frame::Array(Some(vec![Frame::Integer(0), Frame::Integer(100)]));
+        let nodes = Frame::Array(Some(nodes));
+        Frame::Array(Some(vec![if flat {
+            Frame::Array(Some(vec![bulk("slots"), slots, bulk("nodes"), nodes]))
+        } else {
+            Frame::Map(vec![(bulk("slots"), slots), (bulk("nodes"), nodes)])
+        }]))
+    }
+
+    #[test]
+    fn all_discovery_replies_use_the_same_replica_mapping_and_keep_roles() {
+        let map = mapped_cluster().local_redirection_map();
+        for flat in [false, true] {
+            let reply = shard(
+                vec![
+                    shard_node("p1", "primary-a", 6379, "master", flat),
+                    shard_node(
+                        "r1",
+                        "alternate-replica-ip",
+                        6379,
+                        "replica",
+                        flat,
+                    ),
+                    shard_node("r2", "replica-b", 6379, "replica", flat),
+                    shard_node(
+                        "unmapped",
+                        "new-replica",
+                        6379,
+                        "replica",
+                        flat,
+                    ),
+                ],
+                flat,
+            );
+            let expected = shard(
+                vec![
+                    shard_node("p1", "127.0.0.1", 6380, "master", flat),
+                    shard_node("r1", "127.0.0.1", 6382, "replica", flat),
+                    shard_node("r2", "127.0.0.1", 6383, "replica", flat),
+                ],
+                flat,
+            );
+            assert_eq!(rewrite_cluster_shards(&reply, &map), expected);
+        }
+
+        let reply = bulk(
+            "p1 primary-a:6379@16379 master - 0 0 1 connected 0-100 201-16383\n\
+            r1 alternate-replica-ip:6379@16379,replica.example slave p1 0 0 1 connected\n\
+            r2 replica-b:6379@16379 slave p1 0 0 1 connected\n\
+            unknown new-replica:6379@16379 slave p1 0 0 1 connected\n",
+        );
+        assert_eq!(
+            rewrite_cluster_nodes(&reply, &map),
+            bulk(
+                "p1 127.0.0.1:6380@16379 master - 0 0 1 connected 0-100 201-16383\n\
+            r1 127.0.0.1:6382@16379, slave p1 0 0 1 connected\n\
+            r2 127.0.0.1:6383@16379 slave p1 0 0 1 connected\n"
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_replicas_fail_discovery_parsing() {
+        for replica in [
+            Frame::Integer(1),
+            Frame::Array(Some(vec![bulk("host")])),
+            node("host", -1, "r1"),
+            node("host", 65536, "r1"),
+            Frame::Array(Some(vec![Frame::Integer(1), Frame::Integer(6379)])),
+            Frame::Array(Some(vec![bulk("host"), bulk("invalid-port")])),
+        ] {
+            assert!(
+                parse_cluster_slots(
+                    vec![range(
+                        0,
+                        16383,
+                        vec![node("primary", 6379, "p1"), replica,]
+                    )],
+                    &"bootstrap:6379".parse().unwrap()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn replicas_count_toward_port_overflow_and_zero_port_is_rejected() {
+        let slots = parse_cluster_slots(
+            vec![range(
+                0,
+                16383,
+                vec![node("primary", 6379, "p1"), node("replica", 6379, "r1")],
+            )],
+            &"bootstrap:6379".parse().unwrap(),
+        )
+        .unwrap();
+        let error = map_cluster_slots(
+            slots.clone(),
+            "127.0.0.1:65535".parse().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("overflows u16"));
+        let error = map_cluster_slots(slots, "127.0.0.1:0".parse().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("non-zero"));
+    }
+
+    #[test]
+    fn replicas_without_ids_use_endpoints_and_unique_port_fallback() {
+        let slots = parse_cluster_slots(
+            vec![range(
+                0,
+                16383,
+                vec![
+                    node("primary", 6379, ""),
+                    node("replica", 6380, ""),
+                    Frame::Array(Some(vec![
+                        bulk("replica"),
+                        Frame::Integer(6380),
+                    ])),
+                ],
+            )],
+            &"bootstrap:6379".parse().unwrap(),
+        )
+        .unwrap();
+        let topology =
+            map_cluster_slots(slots, "[::1]:7000".parse().unwrap()).unwrap();
+        assert_eq!(topology.targets().len(), 2);
+        assert_eq!(
+            topology
+                .local_redirection_map()
+                .rewrite_server("alias:6380"),
+            Some("[::1]:7001".to_owned())
+        );
+        assert_eq!(
+            topology.local_slots_response().unwrap(),
+            Frame::Array(Some(vec![range(
+                0,
+                16383,
+                vec![
+                    node("::1", 7000, "evilresp-7000"),
+                    node("::1", 7001, "evilresp-7001"),
+                    node("::1", 7001, "evilresp-7001"),
+                ]
+            )]))
+        );
+    }
+
+    #[test]
+    fn distinct_node_ids_cannot_share_an_upstream_endpoint() {
+        let slots = parse_cluster_slots(
+            vec![range(
+                0,
+                16383,
+                vec![
+                    node("same-host", 6379, "p1"),
+                    node("same-host", 6379, "r1"),
+                ],
+            )],
+            &"bootstrap:6379".parse().unwrap(),
+        )
+        .unwrap();
+        let error = map_cluster_slots(slots, "127.0.0.1:6380".parse().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicting node IDs"));
+    }
+
+    #[test]
+    fn conflicting_node_id_and_endpoint_mappings_are_rejected() {
+        let slots = parse_cluster_slots(
+            vec![range(
+                0,
+                16383,
+                vec![
+                    node("primary", 6379, "p1"),
+                    node("replica", 6379, "r1"),
+                    node("replica", 6379, "p1"),
+                ],
+            )],
+            &"bootstrap:6379".parse().unwrap(),
+        )
+        .unwrap();
+        let error = map_cluster_slots(slots, "127.0.0.1:6380".parse().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicts"));
+    }
 
     #[test]
     fn parses_cluster_slots_response() {
@@ -408,7 +831,8 @@ mod tests {
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].start, 0);
         assert_eq!(slots[0].end, 16383);
-        assert_eq!(slots[0].upstream.port, 7000);
+        assert_eq!(slots[0].primary.upstream.port, 7000);
+        assert!(slots[0].replicas.is_empty());
     }
 
     #[test]
@@ -427,12 +851,15 @@ mod tests {
             slots: vec![LocalSlotRange {
                 start: 0,
                 end: 16_383,
-                upstream: TcpEndpoint {
-                    host: "127.0.0.1".to_owned(),
-                    port: 7000,
+                primary: LocalNode {
+                    upstream: TcpEndpoint {
+                        host: "127.0.0.1".to_owned(),
+                        port: 7000,
+                    },
+                    local: "127.0.0.1:6380".parse().unwrap(),
+                    node_id: Some(b"node".to_vec()),
                 },
-                local: "127.0.0.1:6380".parse().unwrap(),
-                node_id: Some(b"node".to_vec()),
+                replicas: Vec::new(),
             }],
         };
 

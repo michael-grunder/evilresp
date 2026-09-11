@@ -1456,6 +1456,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovered_replica_listener_proxies_reads_and_topology() {
+        let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let replica = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_replica = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        let replica_addr = replica.local_addr().unwrap();
+        let local_replica_addr = local_replica.local_addr().unwrap();
+        // Reserve the replica listener before discovery; only its preceding
+        // port is used for the primary mapping, with no fixed ports or rebind.
+        let mut local_primary_addr = local_replica_addr;
+        local_primary_addr.set_port(local_replica_addr.port() - 1);
+        let slots = Frame::Array(Some(vec![Frame::Array(Some(vec![
+            Frame::Integer(0),
+            Frame::Integer(16383),
+            Frame::Array(Some(vec![
+                bulk_string("127.0.0.1"),
+                Frame::Integer(i64::from(primary_addr.port())),
+                bulk_string("primary"),
+            ])),
+            Frame::Array(Some(vec![
+                bulk_string("127.0.0.1"),
+                Frame::Integer(i64::from(replica_addr.port())),
+                bulk_string("replica"),
+            ])),
+        ]))]));
+        let probe = tokio::spawn(async move {
+            let (stream, _) = primary.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            assert_eq!(
+                read_raw_frame(&mut stream).await.unwrap(),
+                resp_command(&["CLUSTER", "SLOTS"])
+            );
+            stream.get_mut().write_all(&slots.encode()).await.unwrap();
+        });
+        let topology = discover(
+            primary_addr.to_string().parse().unwrap(),
+            local_primary_addr.to_string().parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        probe.await.unwrap();
+        assert_eq!(topology.targets().len(), 2);
+        let target = topology.targets()[1].clone();
+        assert_eq!(target.upstream.to_string(), replica_addr.to_string());
+        assert_eq!(target.listen.to_string(), local_replica_addr.to_string());
+
+        let shard_reply = |port| {
+            Frame::Array(Some(vec![Frame::Map(vec![
+                (
+                    bulk_string("slots"),
+                    Frame::Array(Some(vec![
+                        Frame::Integer(0),
+                        Frame::Integer(16383),
+                    ])),
+                ),
+                (
+                    bulk_string("nodes"),
+                    Frame::Array(Some(vec![Frame::Map(vec![
+                        (bulk_string("id"), bulk_string("replica")),
+                        (bulk_string("ip"), bulk_string("127.0.0.1")),
+                        (bulk_string("port"), Frame::Integer(i64::from(port))),
+                        (bulk_string("role"), bulk_string("replica")),
+                    ])])),
+                ),
+            ])]))
+        };
+        let upstream_shards = shard_reply(replica_addr.port());
+        let local_shards = shard_reply(local_replica_addr.port());
+        let nodes_reply = |addr| {
+            bulk_string(&format!(
+                "replica {addr}@16379 myself,slave primary 0 0 1 connected\n"
+            ))
+        };
+        let upstream_nodes = nodes_reply(replica_addr);
+        let local_nodes = nodes_reply(local_replica_addr);
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = replica.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            for (command, response) in [
+                (vec!["CLUSTER", "SHARDS"], upstream_shards),
+                (vec!["CLUSTER", "NODES"], upstream_nodes),
+                (vec!["READONLY"], Frame::SimpleString("OK".to_owned())),
+                (vec!["GET", "foo"], bulk_string("replica-value")),
+                (vec!["READWRITE"], Frame::SimpleString("OK".to_owned())),
+                (
+                    vec!["GET", "foo"],
+                    Frame::SimpleError(format!("MOVED 12182 {primary_addr}")),
+                ),
+            ] {
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    resp_command(&command)
+                );
+                stream
+                    .get_mut()
+                    .write_all(&response.encode())
+                    .await
+                    .unwrap();
+            }
+        });
+        let state = SharedState {
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: topology.local_slots_response(),
+            redirection_map: topology.local_redirection_map(),
+        };
+        let server = tokio::spawn(serve_listener(
+            ProxyListener::Tcp(local_replica),
+            target,
+            state.clone(),
+        ));
+        let mut client = BufReader::new(
+            TcpStream::connect(local_replica_addr).await.unwrap(),
+        );
+        client
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RANDOM"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+        for (subcommand, expected) in [
+            ("SLOTS", state.local_slots.clone().unwrap()),
+            ("SHARDS", local_shards),
+            ("NODES", local_nodes),
+        ] {
+            client
+                .get_mut()
+                .write_all(&resp_command(&["CLUSTER", subcommand]))
+                .await
+                .unwrap();
+            assert_eq!(
+                read_raw_frame(&mut client).await.unwrap(),
+                expected.encode()
+            );
+        }
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
+        client
+            .get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "OFF"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
+        for (command, expected) in [
+            (vec!["READONLY"], b"+OK\r\n".to_vec()),
+            (vec!["GET", "foo"], bulk_string("replica-value").encode()),
+            (vec!["READWRITE"], b"+OK\r\n".to_vec()),
+            (
+                vec!["GET", "foo"],
+                format!("-MOVED 12182 {local_primary_addr}\r\n").into_bytes(),
+            ),
+        ] {
+            client
+                .get_mut()
+                .write_all(&resp_command(&command))
+                .await
+                .unwrap();
+            assert_eq!(read_raw_frame(&mut client).await.unwrap(), expected);
+        }
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 4);
+        drop(client);
+        upstream.await.unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn cluster_shards_replies_are_rewritten_to_proxy_ports() {
         let path = unique_socket_path("upstream-cluster-shards");
         let upstream_listener = UnixListener::bind(&path).unwrap();

@@ -6,7 +6,7 @@
 //! `CLUSTER SHARDS` (Relay, redis-py, Lettuce) or `CLUSTER NODES`
 //! (hiredis-cluster, ioredis) receive the upstream reply with every node
 //! address that maps to a local listener rewritten to it. Nodes without a
-//! local listener, currently replicas, are removed from the reply rather
+//! local listener are removed from the reply rather
 //! than leaked as upstream addresses that would let the client bypass the
 //! proxy.
 
@@ -84,6 +84,7 @@ fn rewrite_shard_node(
     map: &ClusterRedirectionMap,
 ) -> Option<Frame> {
     let mut entries = MapEntries::parse(node)?;
+    let id = entries.string("id");
     let port = entries.integer("port")?;
     let host = entries
         .string("ip")
@@ -91,7 +92,7 @@ fn rewrite_shard_node(
         .or_else(|| entries.string("hostname"))
         .unwrap_or_default();
 
-    let Some(local) = local_endpoint(map, &host, port) else {
+    let Some(local) = local_endpoint(map, id.as_deref(), &host, port) else {
         debug!(
             host,
             port, "dropping CLUSTER SHARDS node without a local listener"
@@ -163,7 +164,7 @@ fn rewrite_nodes_line(
     let (socket, bus) = address
         .split_once('@')
         .map_or((address, None), |(socket, bus)| (socket, Some(bus)));
-    let local = map.rewrite_server(socket)?;
+    let local = map.rewrite_node(Some(id.as_bytes()), socket)?;
 
     let mut rewritten = local;
     if let Some(bus) = bus {
@@ -187,6 +188,7 @@ fn rewrite_nodes_line(
 
 fn local_endpoint(
     map: &ClusterRedirectionMap,
+    node_id: Option<&str>,
     host: &str,
     port: i64,
 ) -> Option<TcpEndpoint> {
@@ -200,7 +202,9 @@ fn local_endpoint(
         }
         .connect_addr()
     };
-    map.rewrite_server(&upstream)?.parse().ok()
+    map.rewrite_node(node_id.map(str::as_bytes), &upstream)?
+        .parse()
+        .ok()
 }
 
 /// Key/value pairs of a RESP3 map or of the flat RESP2 array Redis uses in

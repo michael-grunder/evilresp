@@ -11,6 +11,7 @@ pub mod protocol_fingerprint;
 pub mod proxy;
 pub mod repro;
 pub mod resp;
+mod stats;
 pub mod topology_evil;
 mod transaction;
 mod transport;

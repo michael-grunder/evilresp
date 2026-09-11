@@ -98,6 +98,30 @@ Human-readable colored logs are the default. Increase verbosity with `-v` or
 `-vv`. Logs go to stderr. `RUST_LOG`, when valid, overrides the verbosity
 filter.
 
+At the default INFO level, one `proxy statistics` summary is logged about
+every second, combining all listeners (including cluster nodes). Fields are:
+
+- `clients_total`: client connections accepted since startup, including those
+  whose upstream connection fails; `clients_active`: connections still handled
+  by the proxy, including monitor clients.
+- `evil_updates`: successful `DEBUG EVIL` configuration commands, including
+  repeated settings and `MODE RESET`, excluding `STATUS` reads.
+- `evil_status_reads`, `evil_rejected`, and `evil_resets`: successful status
+  reads, rejected `DEBUG EVIL` commands, and successful reset commands.
+- `mode_off`, `mode_random`, `mode_mutate`, and `mode_overflow`: successful
+  explicit selections of each mode. Resets are counted separately, and new
+  clients starting in `OFF` do not count as mode selections. These count
+  configuration commands, not mutated replies or clients currently in a mode.
+
+All totals accumulate for the process lifetime and survive `MODE RESET`;
+`clients_active` is a current count. Concurrent updates can make fields reflect
+slightly different instants. Delayed summaries skip missed intervals instead
+of emitting a burst of catch-up logs.
+
+Individual configuration changes, including the full status, are logged at
+DEBUG (`-v` or `-vv`). `STATUS` reads do not log configuration changes.
+Rejected commands still produce warnings.
+
 Warnings for rejected `DEBUG PROTOCOL` commands identify the invalid argument
 and its valid choices, or report a missing argument or the first extra argument.
 With `-v` or `-vv`, an additional debug log includes the complete parsed

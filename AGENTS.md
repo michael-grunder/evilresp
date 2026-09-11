@@ -43,6 +43,7 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `cli.rs`                  | `clap` args, `Endpoint` (`host:port` or `unix:/path`), `LogMode`.                                                             |
 | `logging.rs`              | `tracing-subscriber` setup: human/colored vs JSON lines, verbosity mapping.                                                   |
+| `stats.rs`                | Process-lifetime monitoring counters and periodic aggregate INFO logs. |
 | `error.rs`                | `AppError` (`thiserror`) and `AppResult<T>`. Add variants here, not ad-hoc types.                                             |
 | `resp.rs`                 | RESP2/RESP3 `Frame` type, parsing, encoding, raw frame reads off a stream.                                                    |
 | `proxy.rs`                | Listener/accept loop, per-connection state, command dispatch, local `DEBUG`/`MONITOR` handling, reset epochs. Largest module. |
@@ -83,10 +84,12 @@ them need a test proving they still hold.
   deliberately, not casually.
 - **Evil config is per client connection.** New connections start non-evil.
   Shared state is limited to what must be global (command index, reset epoch,
-  monitor fan-out, repro writer).
+  monitor fan-out, repro writer, aggregate monitoring counters).
 - **`DEBUG EVIL MODE RESET` bumps the reset epoch.** Connections from an older
   epoch are closed before they can consume a command id. Anything that adds
-  incrementing global state must participate in this reset.
+  incrementing global state used for deterministic output must participate in
+  this reset. Observability-only connection ids and lifetime monitoring
+  counters survive resets and must never feed mutation or transport RNGs.
 - **Cluster redirections always point back at evilresp.** Upstream `MOVED`/
   `ASK` targets and topology replies are rewritten to local listeners; nodes
   with no local listener are removed, not exposed. Discovered primaries and

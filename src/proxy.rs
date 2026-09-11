@@ -28,6 +28,7 @@ use crate::protocol_fingerprint::{
 };
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
+use crate::stats::Stats;
 use crate::topology_evil::{maybe_mutate_topology, normalize_redirection};
 use crate::transaction::TransactionCommands;
 use crate::transport::{self, DeliveryPlan};
@@ -99,6 +100,7 @@ impl Drop for ProxyListener {
 
 #[derive(Clone)]
 struct SharedState {
+    stats: Arc<Stats>,
     repro: Option<ReproWriter>,
     monitor: broadcast::Sender<String>,
     reset_barrier: Arc<RwLock<()>>,
@@ -117,6 +119,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
     let (monitor, _) = broadcast::channel(MONITOR_BUFFER);
     let topology = discover(cli.proxy.clone(), cli.listen).await?;
     let state = SharedState {
+        stats: Arc::new(Stats::default()),
         repro,
         monitor,
         reset_barrier: Arc::new(RwLock::new(())),
@@ -151,6 +154,7 @@ async fn serve_topology(
     }
 
     tokio::select! {
+        _ = state.stats.report() => Ok(()),
         signal = tokio::signal::ctrl_c() => {
             signal?;
             info!("shutdown signal received");
@@ -180,13 +184,20 @@ async fn serve_listener(
         let connection_id = state.connection_ids.fetch_add(1, Ordering::SeqCst);
         debug!(%peer, reset_epoch, connection_id, upstream = %target.upstream, "accepted client");
 
-        tokio::spawn(handle_connection(
-            client,
-            target.clone(),
-            state.clone(),
-            connection_id,
-            reset_epoch,
-        ));
+        let connection = state.stats.client_connected();
+        let target = target.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _connection = connection;
+            handle_connection(
+                client,
+                target,
+                state,
+                connection_id,
+                reset_epoch,
+            )
+            .await;
+        });
     }
 }
 
@@ -275,7 +286,7 @@ async fn proxy_connection(
 
         if is_debug_evil(&argv) {
             publish_monitor_command(&state, connection_id, &command_frame);
-            let result = apply_debug_evil(&mut config, &argv);
+            let result = apply_debug_evil(&mut config, &argv, &state.stats);
             let response = result.frame.encode();
             if result.action == DebugAction::ResetIncrementingState {
                 reset_incrementing_state(&state, &mut reset_epoch).await;
@@ -519,13 +530,29 @@ async fn connect_upstream(endpoint: &Endpoint) -> AppResult<ProxyStream> {
     }
 }
 
-fn apply_debug_evil(config: &mut EvilConfig, argv: &[String]) -> DebugResult {
+fn apply_debug_evil(
+    config: &mut EvilConfig,
+    argv: &[String],
+    stats: &Stats,
+) -> DebugResult {
     match config.apply_debug_command(argv) {
         Ok(result) => {
-            info!(status = %config.status(), "updated evil configuration");
+            // Successful parsing guarantees a subcommand is present.
+            if argv[2].eq_ignore_ascii_case("STATUS") {
+                stats.status_read();
+            } else {
+                stats.configuration_updated();
+                if result.action == DebugAction::ResetIncrementingState {
+                    stats.reset();
+                } else if argv[2].eq_ignore_ascii_case("MODE") {
+                    stats.mode_selected(config.mode);
+                }
+                debug!(status = %config.status(), "updated evil configuration");
+            }
             result
         }
         Err(error) => {
+            stats.command_rejected();
             warn!(%error, "rejected DEBUG EVIL command");
             DebugResult {
                 frame: Frame::SimpleError(format!("ERR {error}")),
@@ -742,6 +769,164 @@ mod tests {
     }
 
     #[test]
+    fn evil_configuration_updates_are_logged_only_when_verbose() {
+        for level in [tracing::Level::INFO, tracing::Level::DEBUG] {
+            let buffer = LogBuffer::default();
+            let writer = buffer.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let mut config = EvilConfig::default();
+                let stats = Stats::default();
+                let argv =
+                    ["DEBUG", "EVIL", "MODE", "MUTATE"].map(str::to_owned);
+                let result = apply_debug_evil(&mut config, &argv, &stats);
+                assert_eq!(result.frame.encode(), b"+OK\r\n");
+                let log = String::from_utf8(buffer.0.lock().unwrap().clone())
+                    .unwrap();
+                if level == tracing::Level::INFO {
+                    assert!(log.is_empty(), "{log}");
+                } else {
+                    assert!(log.contains("updated evil configuration"));
+                    assert!(log.contains("status=mode=MUTATE"));
+                }
+
+                buffer.0.lock().unwrap().clear();
+                let argv = ["DEBUG", "EVIL", "STATUS"].map(str::to_owned);
+                apply_debug_evil(&mut config, &argv, &stats);
+                assert!(buffer.0.lock().unwrap().is_empty());
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_stats_count_updates_modes_and_rejections_across_reset() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let state = SharedState {
+            stats: Arc::new(Stats::default()),
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(2)),
+            command_ids: Arc::new(AtomicU64::new(23)),
+            local_slots: None,
+            redirection_map: ClusterRedirectionMap::default(),
+        };
+        let buffer = LogBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_max_level(tracing::Level::INFO)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let connection = state.stats.client_connected();
+        drop(state.stats.client_connected());
+
+        let mut config = EvilConfig::default();
+        let mut epoch = 0;
+        for args in [
+            "MODE OFF",
+            "mode random",
+            "MODE MUTATE",
+            "MODE MUTATE",
+            "MODE OVERFLOW",
+            "SEED 42",
+            "SEED 42",
+            "STATUS",
+            "status",
+            "MODE INVALID",
+            "MODE MUTATE PROBABILITY 101",
+            "STATUS EXTRA",
+            "MODE RESET",
+        ] {
+            let argv = format!("DEBUG EVIL {args}")
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let result = tracing::dispatcher::with_default(&dispatch, || {
+                apply_debug_evil(&mut config, &argv, &state.stats)
+            });
+            if args == "MODE RESET" {
+                assert_eq!(result.action, DebugAction::ResetIncrementingState);
+                reset_incrementing_state(&state, &mut epoch).await;
+            }
+        }
+        assert_eq!(epoch, 1);
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
+        assert_eq!(config.mode, EvilMode::Off);
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.lines().count(), 3);
+        assert!(logs.lines().all(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["level"] == "WARN"
+                && event["message"] == "rejected DEBUG EVIL command"
+        }));
+        buffer.0.lock().unwrap().clear();
+
+        let mut report = std::pin::pin!(state.stats.report());
+        let mut poll_report = || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                assert!(
+                    report
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            });
+        };
+        poll_report();
+        tokio::time::advance(Duration::from_millis(999)).await;
+        poll_report();
+        assert!(buffer.0.lock().unwrap().is_empty());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        poll_report();
+
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.lines().count(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(logs.trim()).unwrap();
+        assert_eq!(event["level"], "INFO");
+        assert_eq!(event["message"], "proxy statistics");
+        for (field, expected) in [
+            ("clients_total", 2),
+            ("clients_active", 1),
+            ("evil_updates", 8),
+            ("evil_status_reads", 2),
+            ("evil_rejected", 3),
+            ("evil_resets", 1),
+            ("mode_off", 1),
+            ("mode_random", 1),
+            ("mode_mutate", 2),
+            ("mode_overflow", 1),
+        ] {
+            assert_eq!(event[field], expected, "{field}");
+        }
+
+        // A delayed reporter emits one summary, without catch-up bursts.
+        drop(connection);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        poll_report();
+        poll_report();
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.lines().count(), 2);
+        let event: serde_json::Value =
+            serde_json::from_str(logs.lines().last().unwrap()).unwrap();
+        assert_eq!(event["clients_total"], 2);
+        assert_eq!(event["clients_active"], 0);
+        assert_eq!(event["evil_updates"], 8);
+    }
+
+    #[test]
     fn rejected_debug_protocol_logs_full_arguments_only_when_verbose() {
         for level in [
             tracing::Level::INFO,
@@ -866,6 +1051,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -932,6 +1118,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -1049,6 +1236,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -1134,6 +1322,7 @@ mod tests {
         config.probability = 100.0;
 
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -1152,6 +1341,7 @@ mod tests {
                 "MODE".to_owned(),
                 "RESET".to_owned(),
             ],
+            &state.stats,
         );
 
         if result.action == DebugAction::ResetIncrementingState {
@@ -1247,6 +1437,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -1372,6 +1563,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -1433,6 +1625,7 @@ mod tests {
 
     fn transport_test_state(repro: ReproWriter) -> SharedState {
         SharedState {
+            stats: Arc::new(Stats::default()),
             repro: Some(repro),
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -1707,6 +1900,7 @@ mod tests {
                 listen: Endpoint::Unix(unique_socket_path("unused-listen")),
             };
             let state = SharedState {
+                stats: Arc::new(Stats::default()),
                 repro: Some(ReproWriter::open(&repro_path).await.unwrap()),
                 monitor: monitor_sender(),
                 reset_barrier: Arc::new(RwLock::new(())),
@@ -1818,6 +2012,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -1906,6 +2101,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2051,6 +2247,7 @@ mod tests {
             }
         });
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2159,6 +2356,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2264,6 +2462,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2332,6 +2531,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2417,6 +2617,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2544,6 +2745,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2633,6 +2835,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2706,6 +2909,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),
@@ -2929,6 +3133,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
             reset_barrier: Arc::new(RwLock::new(())),

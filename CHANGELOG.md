@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added one INFO statistics summary per second across all listeners, with
+  total accepted and currently active clients, successful `DEBUG EVIL`
+  configuration commands, status reads, rejections, resets, and selections of
+  each mode. Monitoring totals survive `MODE RESET`.
 - Added independent `DEBUG EVIL TRANSPORT` plans for truncation followed by
   write-side shutdown, up to 16 extra replies, explicit or seeded chunk
   boundaries, and per-reply probability. Plans honor filters and bootstrap
@@ -73,6 +77,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- Moved individual evil configuration status logs from INFO to DEBUG (`-v`)
+  and stopped logging `STATUS` reads as configuration changes.
 - Unified reply delivery after RESP/topology processing. Transport uses a
   separate seeded RNG; chunk plans do not guarantee client read boundaries.
   Truncation and delivery errors stop processing buffered commands.

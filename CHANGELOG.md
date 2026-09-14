@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `DEBUG EVIL DEPTH <ANY|INNER>` to control how nesting depth weights
+  mutation targets. `INNER` (the new default) weights each frame by `2^depth`:
+  `MUTATIONS ONE` selects proportionally, `MUTATIONS MANY` keeps the full value
+  probability at the deepest eligible level and halves it per shallower level,
+  `FRAMING LENGTH TARGET ANY` weights length headers the same way, and the
+  `FRAMING AUTO` root fault halves per nesting level. This keeps the outer
+  reply shape valid far more often so mutations reach command-specific reply
+  handlers instead of generic protocol errors. `ANY` restores uniform legacy
+  selection. The setting is per connection, survives mode changes and reset,
+  appears in `HELP` and `STATUS`, and is pinned to `INNER` by `DEBUG CHAOS`.
+
 - Recover from upstream connection/identification failures without closing the
   client: log the failure, return an unmutated error, and attempt reconnection
   once at the next forwarded command. Never replay a command with a lost reply.
@@ -140,6 +151,11 @@ All notable changes to this project will be documented in this file.
   replies, and optional repro JSONL output.
 
 ### Changed
+
+- The new `DEPTH INNER` default changes seeded `MUTATE` and `OVERFLOW` output
+  relative to earlier versions, including replies with a single scalar. Set
+  `DEBUG EVIL DEPTH ANY` with the same build and settings to reproduce older
+  cases byte for byte.
 
 - Require Tokio 1.53 or later for its explicit zero-linger TCP reset API.
 - Moved individual evil configuration status logs from INFO to DEBUG (`-v`)

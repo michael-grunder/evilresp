@@ -2,7 +2,9 @@
 //! persistent mode. Subsequent DEBUG EVIL commands can refine the preset.
 
 use crate::error::{AppError, AppResult};
-use crate::evil::{EvilConfig, EvilMode, MutationCount, MutationStrategy};
+use crate::evil::{
+    EvilConfig, EvilMode, MutationCount, MutationDepth, MutationStrategy,
+};
 use crate::exec_mutation::ExecConfig;
 use crate::framing::FramingConfig;
 use crate::protocol_fingerprint::ProtocolHash;
@@ -73,6 +75,7 @@ pub(crate) fn apply(
     } else {
         MutationCount::One
     };
+    next.depth = MutationDepth::Inner;
     next.framing = FramingConfig::Off;
     next.exec = ExecConfig::default();
     next.transport = TransportConfig::default();
@@ -174,6 +177,7 @@ mod tests {
             "INCLUDE GET EXEC",
             "EXCLUDE EXEC",
             "CANONICALIZE NONE",
+            "DEPTH ANY",
             "GENERATOR PROTOCOL RESP3",
             "TOPOLOGY REDIRECT TARGET example.test:1234",
             "TRANSPORT FAULT STALL DURATION 42",
@@ -196,6 +200,8 @@ mod tests {
         assert!(!config.should_mutate_command(Some("EXEC")));
         assert!(config.status().contains("canonicalize=NONE"));
         assert!(config.generator.status().contains("RESP3"));
+        // Presets pin depth weighting so their output does not depend on it.
+        assert_eq!(config.depth, MutationDepth::Inner);
         assert!(config.topology_redirect.is_none());
         assert!(!config.transport.status().contains("STALL"));
         config
@@ -224,6 +230,7 @@ mod tests {
             assert_eq!(config.mode == EvilMode::Off, t == 0.0);
             assert_eq!(config.mutation_count == MutationCount::Many, t > 25.0);
             assert_eq!(config.strategy == MutationStrategy::Replace, t > 50.0);
+            assert_eq!(config.depth, MutationDepth::Inner);
             assert_eq!(
                 matches!(config.framing, FramingConfig::Length(_)),
                 t > 50.0

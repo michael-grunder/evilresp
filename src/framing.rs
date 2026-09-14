@@ -1,5 +1,7 @@
 //! Select length headers from typed frames and corrupt only their encoding.
 //! Advertised lengths never control allocation or traversal of frame bodies.
+//! `DEPTH INNER` weights `TARGET ANY` toward nested headers and halves the
+//! automatic root fault's probability per nesting level of the reply.
 
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
@@ -7,7 +9,8 @@ use rand_chacha::ChaCha20Rng;
 use crate::error::{AppError, AppResult};
 use crate::evil::{
     AppliedMutation, EvilConfig, EvilMode, LengthCorruption, LengthMutation,
-    MutatedReply, MutationCount, MutationKind, parse_probability,
+    MutatedReply, MutationCount, MutationDepth, MutationKind,
+    parse_probability,
 };
 use crate::resp::Frame;
 
@@ -195,10 +198,14 @@ pub(crate) fn mutate_length(
     let (header, kind, replacement) = match &config.framing {
         FramingConfig::Off => return None,
         FramingConfig::Auto => {
-            // Preserve the legacy draw order and root-only behavior.
-            if config.mutation_count == MutationCount::One
-                || !should_apply(config.probability, rng)
-            {
+            // Preserve the legacy draw order and root-only behavior. INNER
+            // treats the root header like any other depth-weighted target.
+            if config.mutation_count == MutationCount::One {
+                return None;
+            }
+            let probability =
+                config.depth.scale(config.probability, 0, tree_depth(frame));
+            if !should_apply(probability, rng) {
                 return None;
             }
             let original = frame.declared_length()?;
@@ -221,7 +228,8 @@ pub(crate) fn mutate_length(
             if !should_apply(options.probability, rng) {
                 return None;
             }
-            let header = select_header(frame, &options.target, rng)?;
+            let header =
+                select_header(frame, &options.target, config.depth, rng)?;
             let kind = options.kind.unwrap_or_else(|| {
                 const KINDS: [LengthCorruption; 5] = [
                     LengthCorruption::Shorter,
@@ -258,12 +266,16 @@ fn should_apply(probability: f64, rng: &mut ChaCha20Rng) -> bool {
 fn select_header(
     frame: &Frame,
     target: &Target,
+    depth: MutationDepth,
     rng: &mut ChaCha20Rng,
 ) -> Option<Header> {
+    if matches!(target, Target::Any) && depth == MutationDepth::Inner {
+        return select_weighted_header(frame, depth, rng);
+    }
     let mut index = 0;
     let mut candidates = 0_usize;
     let mut selected = None;
-    visit(frame, "root", &mut |frame, path| {
+    visit(frame, "root", 0, &mut |frame, path, _| {
         if let Some(original) = frame.declared_length()
             && target.matches(path)
         {
@@ -282,18 +294,76 @@ fn select_header(
     selected
 }
 
-fn visit(frame: &Frame, path: &str, visitor: &mut impl FnMut(&Frame, &str)) {
-    visitor(frame, path);
+/// Select any length header with probability proportional to its depth
+/// weight, consuming one draw regardless of tree size.
+fn select_weighted_header(
+    frame: &Frame,
+    depth: MutationDepth,
+    rng: &mut ChaCha20Rng,
+) -> Option<Header> {
+    let mut total = 0_u128;
+    visit(frame, "root", 0, &mut |frame, _, level| {
+        if frame.declared_length().is_some() {
+            total += depth.weight(level);
+        }
+    });
+    if total == 0 {
+        return None;
+    }
+    let mut remaining = rng.gen_range(0..total);
+    let mut index = 0;
+    let mut selected = None;
+    visit(frame, "root", 0, &mut |frame, path, level| {
+        if selected.is_none()
+            && let Some(original) = frame.declared_length()
+        {
+            let weight = depth.weight(level);
+            if remaining < weight {
+                selected = Some(Header {
+                    index,
+                    path: path.to_owned(),
+                    original,
+                });
+            } else {
+                remaining -= weight;
+            }
+        }
+        index += 1;
+    });
+    selected
+}
+
+/// Deepest nesting level of any frame in the reply (a scalar root is 0).
+fn tree_depth(frame: &Frame) -> usize {
+    let mut deepest = 0;
+    visit(frame, "root", 0, &mut |_, _, level| {
+        deepest = deepest.max(level)
+    });
+    deepest
+}
+
+fn visit(
+    frame: &Frame,
+    path: &str,
+    depth: usize,
+    visitor: &mut impl FnMut(&Frame, &str, usize),
+) {
+    visitor(frame, path, depth);
     match frame {
         Frame::Array(Some(items)) | Frame::Set(items) | Frame::Push(items) => {
             for (index, item) in items.iter().enumerate() {
-                visit(item, &format!("{path}.{index}"), visitor);
+                visit(item, &format!("{path}.{index}"), depth + 1, visitor);
             }
         }
         Frame::Map(items) | Frame::Attribute(items) => {
             for (index, (key, value)) in items.iter().enumerate() {
-                visit(key, &format!("{path}.{index}.key"), visitor);
-                visit(value, &format!("{path}.{index}.value"), visitor);
+                visit(key, &format!("{path}.{index}.key"), depth + 1, visitor);
+                visit(
+                    value,
+                    &format!("{path}.{index}.value"),
+                    depth + 1,
+                    visitor,
+                );
             }
         }
         _ => {}
@@ -624,6 +694,7 @@ mod tests {
         ] {
             let mut config = config(&["LENGTH"]);
             config.seed = seed;
+            config.depth = MutationDepth::Any;
             let result =
                 mutate_reply(&config, 9, &command_hash, &reply_hash, &original);
             assert_eq!(result.bytes, expected.as_bytes());
@@ -649,5 +720,84 @@ mod tests {
             &mut ChaCha20Rng::seed_from_u64(7),
         );
         assert_ne!(proposed, replacement);
+    }
+
+    #[test]
+    fn inner_depth_weights_any_target_toward_nested_headers() {
+        use crate::evil::mutate_reply;
+        let original =
+            parse_frame(b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n").unwrap();
+        let run = |depth: MutationDepth, seed: u64| {
+            let mut config = config(&["LENGTH", "KIND", "LONGER"]);
+            config.seed = seed;
+            config.depth = depth;
+            mutate_reply(&config, 9, "command", "upstream", &original)
+        };
+
+        // Seed 2 still reaches the root; seed 3 lengthens the first bulk.
+        let result = run(MutationDepth::Inner, 2);
+        assert_eq!(result.bytes, b"*3\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+        assert_eq!(result.mutations[0].path, "root");
+        let result = run(MutationDepth::Inner, 3);
+        assert_eq!(result.bytes, b"*2\r\n$4\r\nfoo\r\n$3\r\nbar\r\n");
+        assert_eq!(result.mutations[0].path, "root.0");
+        assert_eq!(run(MutationDepth::Inner, 3).bytes, result.bytes);
+
+        let root_count = |depth| {
+            (0..100)
+                .filter(|seed| {
+                    let result = run(depth, *seed);
+                    assert_eq!(result.mutations.len(), 1);
+                    result.mutations[0].path == "root"
+                })
+                .count()
+        };
+        // Root weight 1 against two nested headers of weight 2 each.
+        let inner = root_count(MutationDepth::Inner);
+        let any = root_count(MutationDepth::Any);
+        assert!(inner > 0 && (10..=30).contains(&inner), "{inner}");
+        assert!(inner < any, "{inner} {any}");
+    }
+
+    #[test]
+    fn inner_depth_halves_the_automatic_root_fault_per_nesting_level() {
+        let run = |bytes: &[u8], depth: MutationDepth, seed: u64| {
+            let mut config = config(&["AUTO"]);
+            config.probability = 100.0;
+            config.depth = depth;
+            config.seed = seed;
+            crate::evil::mutate_reply(
+                &config,
+                9,
+                "command",
+                "upstream",
+                &parse_frame(bytes).unwrap(),
+            )
+        };
+        let root_faults = |bytes: &[u8], depth| {
+            (0..64)
+                .filter(|seed| {
+                    run(bytes, depth, *seed).mutations.iter().any(|m| {
+                        m.path == "root" && m.kind == MutationKind::WrongLength
+                    })
+                })
+                .count()
+        };
+        // Legacy AUTO always corrupts the root at full probability.
+        assert_eq!(root_faults(b"*1\r\n:1\r\n", MutationDepth::Any), 64);
+        // A scalar root has no nesting to protect.
+        assert_eq!(root_faults(b"$3\r\nfoo\r\n", MutationDepth::Inner), 64);
+        let one_level = root_faults(b"*1\r\n:1\r\n", MutationDepth::Inner);
+        let two_levels =
+            root_faults(b"*1\r\n*1\r\n:1\r\n", MutationDepth::Inner);
+        assert!((20..=44).contains(&one_level), "{one_level}");
+        assert!((6..=26).contains(&two_levels), "{two_levels}");
+        assert!(two_levels < one_level);
+
+        // Seed 0 keeps the outer shell valid while the leaf still changes.
+        let result = run(b"*1\r\n*1\r\n:1\r\n", MutationDepth::Inner, 0);
+        assert_eq!(result.bytes, b"*1\r\n*1\r\n:4294967295\r\n");
+        assert_eq!(result.mutations.len(), 1);
+        assert_eq!(result.mutations[0].path, "root.0.0");
     }
 }

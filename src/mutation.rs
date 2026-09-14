@@ -1,12 +1,14 @@
 //! Apply RESP mutations to original reply trees. Replacement subtrees are
 //! terminal: only original children participate in mutation selection.
+//! `DEPTH INNER` weights every selection toward nested frames so the outer
+//! shell of a reply usually stays valid.
 
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 
 use crate::evil::{
     AppliedMutation, EvilConfig, EvilMode, MutatedReply, MutationCount,
-    MutationKind, MutationStrategy,
+    MutationDepth, MutationKind, MutationStrategy,
 };
 use crate::framing::{FramingConfig, mutate_length};
 use crate::resp::Frame;
@@ -36,23 +38,31 @@ pub(crate) fn mutate(
 
     match config.mutation_count {
         MutationCount::One => {
-            if should_apply(config.probability, rng) {
-                let count = eligible_count(&frame, config);
-                if count > 0 {
-                    let mut selected = rng.gen_range(0..count);
-                    mutate_selected(
-                        &mut frame,
-                        config,
-                        rng,
-                        "root",
-                        &mut selected,
-                        &mut mutations,
-                    );
-                }
+            if should_apply(config.probability, rng)
+                && let Some(mut remaining) = select_weight(&frame, config, rng)
+            {
+                mutate_selected(
+                    &mut frame,
+                    config,
+                    rng,
+                    "root",
+                    0,
+                    &mut remaining,
+                    &mut mutations,
+                );
             }
         }
         MutationCount::Many => {
-            mutate_frame(&mut frame, config, rng, "root", &mut mutations);
+            let max_depth = eligible_max_depth(&frame, config, 0).unwrap_or(0);
+            mutate_frame(
+                &mut frame,
+                config,
+                rng,
+                "root",
+                0,
+                max_depth,
+                &mut mutations,
+            );
         }
     }
 
@@ -88,20 +98,64 @@ fn eligible(frame: &Frame, config: &EvilConfig) -> bool {
     }
 }
 
-fn eligible_count(frame: &Frame, config: &EvilConfig) -> usize {
-    let children = match frame {
+/// Visit each direct child of an aggregate frame; scalars have none.
+fn for_each_child(frame: &Frame, mut visitor: impl FnMut(&Frame)) {
+    match frame {
         Frame::Array(Some(items)) | Frame::Set(items) | Frame::Push(items) => {
-            items.iter().map(|item| eligible_count(item, config)).sum()
+            items.iter().for_each(&mut visitor);
         }
-        Frame::Map(items) | Frame::Attribute(items) => items
-            .iter()
-            .map(|(key, value)| {
-                eligible_count(key, config) + eligible_count(value, config)
-            })
-            .sum(),
-        _ => 0,
+        Frame::Map(items) | Frame::Attribute(items) => {
+            for (key, value) in items {
+                visitor(key);
+                visitor(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Total selection weight of all eligible frames in the tree.
+fn eligible_weight(frame: &Frame, config: &EvilConfig, depth: usize) -> u128 {
+    let mut total = if eligible(frame, config) {
+        config.depth.weight(depth)
+    } else {
+        0
     };
-    usize::from(eligible(frame, config)) + children
+    for_each_child(frame, |child| {
+        total += eligible_weight(child, config, depth + 1);
+    });
+    total
+}
+
+/// Deepest nesting level that holds an eligible frame, if any.
+fn eligible_max_depth(
+    frame: &Frame,
+    config: &EvilConfig,
+    depth: usize,
+) -> Option<usize> {
+    let mut deepest = eligible(frame, config).then_some(depth);
+    for_each_child(frame, |child| {
+        deepest = deepest.max(eligible_max_depth(child, config, depth + 1));
+    });
+    deepest
+}
+
+/// Draw the cumulative weight offset of the frame to mutate. `ANY` keeps the
+/// legacy uniform integer draw so existing seeded output is unchanged.
+fn select_weight(
+    frame: &Frame,
+    config: &EvilConfig,
+    rng: &mut ChaCha20Rng,
+) -> Option<u128> {
+    let total = eligible_weight(frame, config, 0);
+    if total == 0 {
+        return None;
+    }
+    Some(match config.depth {
+        // Every weight is one, so the total is an exact frame count.
+        MutationDepth::Any => rng.gen_range(0..total as usize) as u128,
+        MutationDepth::Inner => rng.gen_range(0..total),
+    })
 }
 
 fn mutate_selected(
@@ -109,11 +163,13 @@ fn mutate_selected(
     config: &EvilConfig,
     rng: &mut ChaCha20Rng,
     path: &str,
-    selected: &mut usize,
+    depth: usize,
+    remaining: &mut u128,
     mutations: &mut Vec<AppliedMutation>,
 ) -> bool {
     if eligible(frame, config) {
-        if *selected == 0 {
+        let weight = config.depth.weight(depth);
+        if *remaining < weight {
             mutations.push(AppliedMutation {
                 path: path.to_owned(),
                 kind: mutate_one(frame, config, rng),
@@ -122,7 +178,7 @@ fn mutate_selected(
             });
             return true;
         }
-        *selected -= 1;
+        *remaining -= weight;
     }
     match frame {
         Frame::Array(Some(items)) | Frame::Set(items) | Frame::Push(items) => {
@@ -132,7 +188,8 @@ fn mutate_selected(
                     config,
                     rng,
                     &format!("{path}.{index}"),
-                    selected,
+                    depth + 1,
+                    remaining,
                     mutations,
                 ) {
                     return true;
@@ -146,14 +203,16 @@ fn mutate_selected(
                     config,
                     rng,
                     &format!("{path}.{index}.key"),
-                    selected,
+                    depth + 1,
+                    remaining,
                     mutations,
                 ) || mutate_selected(
                     value,
                     config,
                     rng,
                     &format!("{path}.{index}.value"),
-                    selected,
+                    depth + 1,
+                    remaining,
                     mutations,
                 ) {
                     return true;
@@ -170,9 +229,16 @@ fn mutate_frame(
     config: &EvilConfig,
     rng: &mut ChaCha20Rng,
     path: &str,
+    depth: usize,
+    max_depth: usize,
     mutations: &mut Vec<AppliedMutation>,
 ) {
-    if eligible(frame, config) && should_apply(config.probability, rng) {
+    if eligible(frame, config)
+        && should_apply(
+            config.depth.scale(config.probability, depth, max_depth),
+            rng,
+        )
+    {
         let kind = mutate_one(frame, config, rng);
         mutations.push(AppliedMutation {
             path: path.to_owned(),
@@ -192,6 +258,8 @@ fn mutate_frame(
                     config,
                     rng,
                     &format!("{path}.{index}"),
+                    depth + 1,
+                    max_depth,
                     mutations,
                 );
             }
@@ -203,6 +271,8 @@ fn mutate_frame(
                     config,
                     rng,
                     &format!("{path}.{index}.key"),
+                    depth + 1,
+                    max_depth,
                     mutations,
                 );
                 mutate_frame(
@@ -210,6 +280,8 @@ fn mutate_frame(
                     config,
                     rng,
                     &format!("{path}.{index}.value"),
+                    depth + 1,
+                    max_depth,
                     mutations,
                 );
             }
@@ -272,12 +344,14 @@ mod tests {
     use super::*;
     use crate::resp::parse_frame;
 
+    /// Legacy uniform selection; INNER tests opt in with `inner`.
     fn config(mode: &str, count: &str, strategy: &str) -> EvilConfig {
         let mut config = EvilConfig::default();
         for args in [
             ["DEBUG", "EVIL", "MODE", mode],
             ["DEBUG", "EVIL", "MUTATIONS", count],
             ["DEBUG", "EVIL", "STRATEGY", strategy],
+            ["DEBUG", "EVIL", "DEPTH", "ANY"],
         ] {
             config
                 .apply_debug_command(&args.map(str::to_owned))
@@ -450,5 +524,135 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn inner(mut config: EvilConfig, framing: &str) -> EvilConfig {
+        for args in [
+            ["DEBUG", "EVIL", "DEPTH", "INNER"],
+            ["DEBUG", "EVIL", "FRAMING", framing],
+        ] {
+            config
+                .apply_debug_command(&args.map(str::to_owned))
+                .unwrap();
+        }
+        config
+    }
+
+    fn seeded(config: &EvilConfig, seed: u64, frame: &Frame) -> MutatedReply {
+        let mut config = config.clone();
+        config.seed = seed;
+        crate::evil::mutate_reply(&config, 9, "command", "upstream", frame)
+    }
+
+    #[test]
+    fn inner_depth_weights_one_selection_toward_nested_frames() {
+        // Two records of (member, score): root weight 1, each record 2,
+        // each leaf 4, so the root holds 1/21 of the selection mass.
+        let original = parse_frame(
+            b"*2\r\n*2\r\n$1\r\na\r\n:1\r\n*2\r\n$1\r\nb\r\n:2\r\n",
+        )
+        .unwrap();
+        let legacy = config("MUTATE", "ONE", "REPLACE");
+        let weighted = inner(legacy.clone(), "OFF");
+
+        // Seed 0 replaces the first record's score with a null bulk string
+        // while both records and the outer array survive.
+        let result = seeded(&weighted, 0, &original);
+        assert_eq!(
+            result.bytes,
+            b"*2\r\n*2\r\n$1\r\na\r\n$-1\r\n*2\r\n$1\r\nb\r\n:2\r\n"
+        );
+        assert_eq!(result.mutations.len(), 1);
+        assert_eq!(result.mutations[0].path, "root.0.1");
+        assert_eq!(result.mutations[0].kind, MutationKind::RandomFrame);
+        assert_eq!(seeded(&weighted, 0, &original).bytes, result.bytes);
+
+        let count = |config: &EvilConfig, predicate: fn(&str) -> bool| {
+            (0..200_u64)
+                .filter(|seed| {
+                    let result = seeded(config, *seed, &original);
+                    assert_eq!(result.mutations.len(), 1);
+                    predicate(&result.mutations[0].path)
+                })
+                .count()
+        };
+        let root = count(&weighted, |path| path == "root");
+        let records = count(&weighted, |path| path.len() == "root.0".len());
+        let leaves = count(&weighted, |path| path.len() == "root.0.0".len());
+        assert_eq!(root + records + leaves, 200);
+        // Every level remains reachable, but leaves dominate and the root is
+        // selected far less often than under uniform legacy selection.
+        assert!(root > 0 && (5..=25).contains(&root), "{root}");
+        assert!(records > 0 && leaves >= 120, "{records} {leaves}");
+        assert!(root < count(&legacy, |path| path == "root"));
+    }
+
+    #[test]
+    fn inner_depth_scales_many_probability_per_level() {
+        // The depth-two boolean keeps the full probability; the depth-one
+        // boolean is mutated half as often under INNER and always under ANY.
+        let original = parse_frame(b"*2\r\n#t\r\n*1\r\n#t\r\n").unwrap();
+        let legacy = config("MUTATE", "MANY", "PRESERVE");
+        let weighted = inner(legacy.clone(), "OFF");
+        let legacy = {
+            let mut legacy = legacy;
+            legacy
+                .apply_debug_command(
+                    &["DEBUG", "EVIL", "FRAMING", "OFF"].map(str::to_owned),
+                )
+                .unwrap();
+            legacy
+        };
+
+        // Seed 5 flips only the nested boolean; seed 0 flips both.
+        assert_eq!(
+            seeded(&weighted, 5, &original).bytes,
+            b"*2\r\n#t\r\n*1\r\n#f\r\n"
+        );
+        assert_eq!(
+            seeded(&weighted, 0, &original).bytes,
+            b"*2\r\n#f\r\n*1\r\n#f\r\n"
+        );
+
+        let mut shallow = 0;
+        for seed in 0..64 {
+            let result = seeded(&weighted, seed, &original);
+            let paths = result
+                .mutations
+                .iter()
+                .map(|m| m.path.as_str())
+                .collect::<Vec<_>>();
+            assert!(paths.contains(&"root.1.0"), "seed {seed}: {paths:?}");
+            assert!(parse_frame(&result.bytes).is_ok());
+            shallow += usize::from(paths.contains(&"root.0"));
+            assert_eq!(
+                seeded(&legacy, seed, &original).bytes,
+                b"*2\r\n#f\r\n*1\r\n#f\r\n"
+            );
+        }
+        assert!((16..=48).contains(&shallow), "{shallow}");
+    }
+
+    #[test]
+    fn scalar_roots_mutate_under_both_depths_with_distinct_seeded_values() {
+        // A scalar reply has one candidate under both settings, yet INNER
+        // draws a wider offset, so seeded values differ between settings.
+        let original = parse_frame(b"$3\r\nfoo\r\n").unwrap();
+        let legacy = config("MUTATE", "ONE", "PRESERVE");
+        let weighted = inner(legacy.clone(), "AUTO");
+        let mut distinct = 0;
+        for seed in 0..8 {
+            let inner = seeded(&weighted, seed, &original);
+            let any = seeded(&legacy, seed, &original);
+            assert_eq!(inner.mutations.len(), 1);
+            assert_eq!(any.mutations.len(), 1);
+            assert_eq!(inner.mutations[0].path, "root");
+            assert_eq!(any.mutations[0].path, "root");
+            assert_ne!(inner.bytes, original.encode());
+            assert_ne!(any.bytes, original.encode());
+            distinct += usize::from(inner.bytes != any.bytes);
+        }
+        assert!(distinct > 0);
+        assert_eq!(EvilConfig::default().depth, MutationDepth::Inner);
     }
 }

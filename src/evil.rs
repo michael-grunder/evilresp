@@ -22,6 +22,9 @@ const DEBUG_EVIL_HELP: &[&str] = &[
     "DEBUG EVIL <subcommand> [<arg> ...]. Subcommands are:",
     "CANONICALIZE <ALL|UNORDERED|NONE>",
     "    Normalize upstream replies before mutation (default UNORDERED).",
+    "DEPTH <ANY|INNER>",
+    "    Weight value and length targets uniformly or toward nested frames (default INNER).",
+    "    INNER doubles a frame's weight per nesting level so outer shells usually survive.",
     "EXCLUDE [<command|regex|@attribute> ...]",
     "    Replace exclusion filters; no arguments clears the list.",
     "    Filters are case-insensitive; exclusions override inclusions.",
@@ -212,6 +215,53 @@ impl MutationCount {
     }
 }
 
+/// How nesting depth influences which original frame a mutation targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationDepth {
+    /// Every eligible frame has equal weight (legacy selection).
+    Any,
+    /// Each nesting level doubles a frame's weight, so a valid outer shell
+    /// with a mutated nested frame is the common outcome.
+    Inner,
+}
+
+impl MutationDepth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "ANY",
+            Self::Inner => "INNER",
+        }
+    }
+
+    /// Relative selection weight of a frame at `depth` (root is depth 0).
+    /// Exact integer weights avoid floating-point drift over large trees.
+    pub(crate) fn weight(self, depth: usize) -> u128 {
+        match self {
+            Self::Any => 1,
+            // Saturate far beyond any realistic reply so sums stay exact.
+            Self::Inner => 1_u128 << depth.min(64),
+        }
+    }
+
+    /// Scale an independent per-frame probability so that the deepest
+    /// eligible frame keeps the full probability and shallower frames are
+    /// proportionally less likely.
+    pub(crate) fn scale(
+        self,
+        probability: f64,
+        depth: usize,
+        max_depth: usize,
+    ) -> f64 {
+        match self {
+            Self::Any => probability,
+            Self::Inner => {
+                let levels = max_depth.saturating_sub(depth).min(64) as i32;
+                probability / 2_f64.powi(levels)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EvilConfig {
     pub seed: u64,
@@ -222,6 +272,7 @@ pub struct EvilConfig {
     pub canonicalization: CanonicalizationMode,
     pub strategy: MutationStrategy,
     pub mutation_count: MutationCount,
+    pub depth: MutationDepth,
     pub(crate) framing: FramingConfig,
     pub(crate) generator: GeneratorConfig,
     pub(crate) exec: ExecConfig,
@@ -246,6 +297,7 @@ impl Default for EvilConfig {
             canonicalization: CanonicalizationMode::Unordered,
             strategy: MutationStrategy::Preserve,
             mutation_count: MutationCount::Many,
+            depth: MutationDepth::Inner,
             framing: FramingConfig::Auto,
             generator: GeneratorConfig::default(),
             exec: ExecConfig::default(),
@@ -394,6 +446,23 @@ impl EvilConfig {
                     };
                 Ok(DebugResult::ok())
             }
+            "DEPTH" => {
+                if argv.len() != 4 {
+                    return Err(AppError::EvilConfig(
+                        "DEBUG EVIL DEPTH requires ANY or INNER".to_owned(),
+                    ));
+                }
+                self.depth = match argv[3].to_ascii_uppercase().as_str() {
+                    "ANY" => MutationDepth::Any,
+                    "INNER" => MutationDepth::Inner,
+                    _ => {
+                        return Err(AppError::EvilConfig(
+                            "DEBUG EVIL DEPTH requires ANY or INNER".to_owned(),
+                        ));
+                    }
+                };
+                Ok(DebugResult::ok())
+            }
             "CANONICALIZE" => {
                 let Some(mode) = argv.get(3) else {
                     return Err(AppError::EvilConfig(
@@ -487,7 +556,7 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} {} {} {} {} {}",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} depth={} {} {} {} {} {}",
             self.mode,
             self.seed,
             self.probability,
@@ -497,6 +566,7 @@ impl EvilConfig {
             self.exclude_filters().join(","),
             self.strategy.as_str(),
             self.mutation_count.as_str(),
+            self.depth.as_str(),
             self.framing.status(),
             self.generator.status(),
             self.transport.status(),
@@ -1007,9 +1077,11 @@ mod tests {
         let mut config = EvilConfig::default();
         assert_eq!(config.strategy, MutationStrategy::Preserve);
         assert_eq!(config.mutation_count, MutationCount::Many);
+        assert_eq!(config.depth, MutationDepth::Inner);
         for args in [
             ["DEBUG", "EVIL", "STRATEGY", "replace"],
             ["DEBUG", "EVIL", "MUTATIONS", "one"],
+            ["DEBUG", "EVIL", "DEPTH", "any"],
             ["DEBUG", "EVIL", "MODE", "OVERFLOW"],
             ["DEBUG", "EVIL", "MODE", "RESET"],
         ] {
@@ -1017,16 +1089,27 @@ mod tests {
         }
         assert_eq!(config.strategy, MutationStrategy::Replace);
         assert_eq!(config.mutation_count, MutationCount::One);
-        assert!(config.status().contains("strategy=REPLACE mutations=ONE"));
+        assert_eq!(config.depth, MutationDepth::Any);
+        assert!(
+            config
+                .status()
+                .contains("strategy=REPLACE mutations=ONE depth=ANY")
+        );
         assert_eq!(EvilConfig::default().strategy, MutationStrategy::Preserve);
         assert_eq!(EvilConfig::default().mutation_count, MutationCount::Many);
+        assert_eq!(EvilConfig::default().depth, MutationDepth::Inner);
         for args in [
             ["DEBUG", "EVIL", "STRATEGY", "preserve"],
             ["DEBUG", "EVIL", "MUTATIONS", "many"],
+            ["DEBUG", "EVIL", "DEPTH", "Inner"],
         ] {
             config.apply_debug_command(&strings(args)).unwrap();
         }
-        assert!(config.status().contains("strategy=PRESERVE mutations=MANY"));
+        assert!(
+            config
+                .status()
+                .contains("strategy=PRESERVE mutations=MANY depth=INNER")
+        );
     }
 
     #[test]
@@ -1057,6 +1140,9 @@ mod tests {
             vec!["MUTATIONS"],
             vec!["MUTATIONS", "unknown"],
             vec!["MUTATIONS", "ONE", "extra"],
+            vec!["DEPTH"],
+            vec!["DEPTH", "unknown"],
+            vec!["DEPTH", "INNER", "extra"],
         ] {
             let argv = ["DEBUG", "EVIL"]
                 .into_iter()
@@ -1228,6 +1314,7 @@ mod tests {
         );
         for command in [
             "CANONICALIZE",
+            "DEPTH",
             "EXCLUDE",
             "EXEC",
             "FRAMING",
@@ -1403,6 +1490,7 @@ mod tests {
                 mode: EvilMode::Mutate,
                 probability: 100.0,
                 mutation_count: MutationCount::One,
+                depth: MutationDepth::Any,
                 ..EvilConfig::default()
             };
             let result =
@@ -1425,6 +1513,7 @@ mod tests {
             mode: EvilMode::Mutate,
             probability: 100.0,
             strategy: MutationStrategy::Replace,
+            depth: MutationDepth::Any,
             ..EvilConfig::default()
         };
         let result = mutate_reply(&config, 9, "command", "upstream", &frame);

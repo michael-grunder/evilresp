@@ -315,7 +315,8 @@ into the existing `DEBUG EVIL` controls; inspect them with `DEBUG EVIL STATUS`
 and refine individual controls afterward. Sending `DEBUG CHAOS` again replaces
 the previous fault settings, including manually configured topology targets,
 EXEC edits, framing and transport faults. It preserves include/exclude filters,
-canonicalization, and the generator protocol, and sets the corpus to `BOUNDARY`.
+canonicalization, and the generator protocol, sets the corpus to `BOUNDARY`,
+and pins `DEPTH INNER` so preset output does not depend on a prior `DEPTH`.
 
 For temperature `t`, the expansion is:
 
@@ -381,6 +382,7 @@ DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL STRATEGY <PRESERVE|REPLACE>
 DEBUG EVIL MUTATIONS <ONE|MANY>
+DEBUG EVIL DEPTH <ANY|INNER>
 DEBUG EVIL EXEC <OFF|RANDOM|REMOVE|DUPLICATE|SWAP> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLATIONS <OFF|ON>]
 DEBUG EVIL FRAMING <AUTO|OFF>
@@ -419,7 +421,7 @@ Modes:
 Selecting a mode resets its probability to `100` (`0` for `OFF`) unless an
 explicit probability is supplied. This controls value mutation; explicit
 framing probability is independent. Mode changes preserve the strategy,
-mutation count, framing, generator, EXEC, and transport settings. `RANDOM` always
+mutation count, depth, framing, generator, EXEC, and transport settings. `RANDOM` always
 generates a reply for eligible commands; its `PROBABILITY` setting currently
 has no effect.
 
@@ -456,6 +458,32 @@ below).
   exists. With no applied mutation, the canonicalized reply is returned
   unchanged and no RESP mutation is recorded.
 
+`DEPTH` controls how nesting depth influences *which* frame a value or
+length mutation targets. Clients usually reject an invalid outer reply before
+any command-specific reply handler runs, so a valid outer shell with one
+mutated nested frame reaches deeper parsing, validation, and cleanup code:
+
+- `INNER` (default): weight every eligible frame by `2^depth`, where the root
+  is depth `0`, each array/set/push element adds one level, and each map or
+  attribute key/value adds one level. In `MUTATIONS ONE`, selection is
+  proportional to weight, so leaves are the usual target, nested containers
+  are next, and the root is rare but still possible. In `MUTATIONS MANY`, the
+  deepest eligible frame keeps the configured value probability and each
+  shallower level halves it. `FRAMING LENGTH TARGET ANY` weights length
+  headers the same way, and the `FRAMING AUTO` root fault halves its
+  probability per nesting level of the reply. A scalar reply is unaffected.
+- `ANY`: every eligible frame has equal weight and every frame uses the full
+  value probability. This is the previous behavior and reproduces earlier
+  seeded output exactly, including the `FRAMING AUTO` root fault.
+
+`DEPTH` never changes *what* a mutation does: strategy, mode, and generator
+settings still decide the replacement. It applies only to `MUTATE` and
+`OVERFLOW`, is per connection, survives mode changes and `MODE RESET`, and
+appears in `STATUS` as `depth`. The `INNER` default changes seeded `MUTATE`
+and `OVERFLOW` output relative to earlier versions, including for scalar
+replies; use `DEPTH ANY` with the same build and settings to reproduce older
+cases.
+
 `FRAMING` separates length faults from value mutation in `MUTATE` and
 `OVERFLOW`:
 
@@ -469,7 +497,8 @@ below).
   target `ANY`, and kind `RANDOM`. Options can appear in any order;
   duplicate options are rejected. `AUTO` and `OFF` accept no options.
 
-`TARGET ANY` uniformly selects from eligible length headers. A specific path
+`TARGET ANY` selects from eligible length headers, uniformly under
+`DEPTH ANY` and weighted toward nested headers under `DEPTH INNER`. A specific path
 selects only that frame: `root`, `root.0` for an array/set/push child, or
 `root.0.key` / `root.0.value` for a map/attribute pair. Compose paths for
 nested frames, for example `root.1.0.value.2`. Indexes are zero-based;
@@ -630,6 +659,25 @@ DEBUG EVIL MODE MUTATE PROBABILITY 10
 GET example
 DEBUG EVIL STATUS
 ```
+
+To break the structure of one nested record while the outer reply stays valid,
+for example a `ZRANGE ... WITHSCORES` member or score, keep the default
+`DEPTH INNER` and allow frame replacement without length faults:
+
+```text
+DEBUG EVIL MODE RESET
+DEBUG EVIL SEED 1234
+DEBUG EVIL INCLUDE ZRANGE
+DEBUG EVIL STRATEGY REPLACE
+DEBUG EVIL MUTATIONS ONE
+DEBUG EVIL FRAMING OFF
+DEBUG EVIL MODE MUTATE PROBABILITY 100
+ZRANGE example:zset 0 -1 WITHSCORES
+```
+
+Vary the seed to move the replaced frame between scores, members, whole
+records, and occasionally the root. Use `DEPTH ANY` to return to uniform
+selection.
 
 To change only the length of a nested reply while retaining its values, use
 the same connection for setup and the command:

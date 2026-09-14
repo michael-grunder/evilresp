@@ -812,6 +812,8 @@ mod tests {
                 ["DEBUG", "EVIL", "MODE", "MUTATE"],
                 ["DEBUG", "EVIL", "MUTATIONS", "ONE"],
                 ["DEBUG", "EVIL", "FRAMING", "OFF"],
+                // Legacy uniform selection keeps these seeds' sizes.
+                ["DEBUG", "EVIL", "DEPTH", "ANY"],
             ] {
                 config
                     .apply_debug_command(&args.map(str::to_owned))

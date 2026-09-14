@@ -20,3 +20,5 @@ mod topology_config;
 pub mod topology_evil;
 mod transaction;
 mod transport;
+mod upstream_connection;
+mod upstream_identity;

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -37,6 +37,7 @@ use crate::topology_evil::{
 };
 use crate::transaction::TransactionCommands;
 use crate::transport::{self, DeliveryPlan};
+use crate::upstream_connection::{UNAVAILABLE_REPLY, UpstreamConnection};
 
 const MONITOR_BUFFER: usize = 1024;
 
@@ -223,11 +224,10 @@ async fn proxy_connection(
     mut reset_epoch: u64,
 ) -> AppResult<()> {
     let reset_supported = client.supports_reset();
-    let upstream = connect_upstream(&target.upstream).await?;
+    let mut upstream =
+        UpstreamConnection::new(target.upstream.clone(), connection_id).await;
     let (client_read, mut client_write) = tokio::io::split(client);
-    let (upstream_read, mut upstream_write) = tokio::io::split(upstream);
     let mut client_read = BufReader::new(client_read);
-    let mut upstream_read = BufReader::new(upstream_read);
     let mut fingerprints = ProtocolFingerprints::new();
     let mut transaction_commands = TransactionCommands::default();
     let mut config = EvilConfig::default();
@@ -339,10 +339,21 @@ async fn proxy_connection(
             && (is_cluster_shards(&argv) || is_cluster_nodes(&argv))
         {
             publish_monitor_command(&state, connection_id, &command_frame);
-            upstream_write.write_all(&command_bytes).await?;
-            upstream_write.flush().await?;
-            let upstream_frame =
-                parse_frame(&read_raw_frame(&mut upstream_read).await?)?;
+            let upstream_bytes =
+                match upstream.exchange(&command_bytes, &argv).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        transaction_commands = TransactionCommands::default();
+                        write_client_bytes(
+                            &mut client_write,
+                            &mut fingerprints,
+                            UNAVAILABLE_REPLY,
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+            let upstream_frame = parse_frame(&upstream_bytes)?;
             let response = if is_cluster_shards(&argv) {
                 rewrite_cluster_shards(&upstream_frame, &state.redirection_map)
             } else {
@@ -436,10 +447,21 @@ async fn proxy_connection(
                 if let Some(topology) = pre_topology {
                     (None, None, Vec::new(), Some(topology))
                 } else {
-                    upstream_write.write_all(&command_bytes).await?;
-                    upstream_write.flush().await?;
                     let upstream_bytes =
-                        read_raw_frame(&mut upstream_read).await?;
+                        match upstream.exchange(&command_bytes, &argv).await {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                transaction_commands =
+                                    TransactionCommands::default();
+                                write_client_bytes(
+                                    &mut client_write,
+                                    &mut fingerprints,
+                                    UNAVAILABLE_REPLY,
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
                     let exec_commands =
                         transaction_commands.observe(&argv, &upstream_bytes);
                     let relay_bytes =
@@ -605,15 +627,6 @@ fn normalize_cluster_redirection(
             .map(|frame| frame.encode())
             .unwrap_or_else(|| upstream_bytes.to_vec()),
     )
-}
-
-async fn connect_upstream(endpoint: &Endpoint) -> AppResult<ProxyStream> {
-    match endpoint {
-        Endpoint::Tcp(endpoint) => {
-            Ok(Box::new(TcpStream::connect(endpoint.connect_addr()).await?))
-        }
-        Endpoint::Unix(path) => Ok(Box::new(UnixStream::connect(path).await?)),
-    }
 }
 
 fn apply_debug_evil(
@@ -893,6 +906,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::io::AsyncRead;
+    use tokio::net::{TcpStream, UnixStream};
 
     static SOCKET_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -1181,6 +1195,8 @@ mod tests {
         let upstream_listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
             let command = read_raw_frame(&mut read).await.unwrap();
@@ -1247,6 +1263,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_loss_keeps_client_config_indexes_and_fingerprints() {
+        for cluster in [false, true] {
+            let path = unique_socket_path("upstream-loss");
+            let listener = UnixListener::bind(&path).unwrap();
+            let failed = if cluster {
+                resp_command(&["CLUSTER", "SHARDS"])
+            } else {
+                resp_command(&["INCR", "counter"])
+            };
+            let expected_failed = failed.clone();
+            let exec_reply = b"*1\r\n*2\r\n+b\r\n+a\r\n";
+            let upstream = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(
+                    crate::upstream_identity::accept_identity(stream).await,
+                );
+                for (command, reply) in [
+                    (resp_command(&["MULTI"]), &b"+OK\r\n"[..]),
+                    (resp_command(&["SMEMBERS", "set"]), b"+QUEUED\r\n"),
+                ] {
+                    assert_eq!(
+                        read_raw_frame(&mut stream).await.unwrap(),
+                        command
+                    );
+                    stream.get_mut().write_all(reply).await.unwrap();
+                }
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    expected_failed
+                );
+                // The command executed, but its reply was cut short.
+                stream.get_mut().write_all(b"$5\r\nab").await.unwrap();
+                drop(stream);
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(
+                    crate::upstream_identity::accept_identity(stream).await,
+                );
+                // Neither the failed command nor local controls are replayed.
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    resp_command(&["PING"])
+                );
+                stream.get_mut().write_all(b"+PONG\r\n").await.unwrap();
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    resp_command(&["EXEC"])
+                );
+                // A hostile replacement returns an array without MULTI.
+                // Old SMEMBERS tracking must not reorder its inner array.
+                stream.get_mut().write_all(exec_reply).await.unwrap();
+            });
+            let state = SharedState {
+                stats: Arc::new(Stats::default()),
+                repro: None,
+                monitor: monitor_sender(),
+                reset_barrier: Arc::new(RwLock::new(())),
+                reset_epoch: Arc::new(AtomicU64::new(0)),
+                connection_ids: Arc::new(AtomicU64::new(0)),
+                command_ids: Arc::new(AtomicU64::new(0)),
+                local_slots: cluster.then(|| Frame::Array(Some(Vec::new()))),
+                redirection_map: ClusterRedirectionMap::default(),
+            };
+            let command_ids = state.command_ids.clone();
+            let target = ProxyTarget {
+                upstream: Endpoint::Unix(path.clone()),
+                listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+            };
+            let mut client = spawn_proxy_client(target, state, 0);
+            let input = [
+                resp_command(&["DEBUG", "EVIL", "SEED", "1234"]),
+                resp_command(&[
+                    "DEBUG",
+                    "EVIL",
+                    "MODE",
+                    "MUTATE",
+                    "PROBABILITY",
+                    "0",
+                ]),
+                resp_command(&["MULTI"]),
+                resp_command(&["SMEMBERS", "set"]),
+                failed,
+                resp_command(&["DEBUG", "EVIL", "STATUS"]),
+                resp_command(&["PING"]),
+                resp_command(&["EXEC"]),
+            ]
+            .concat();
+            client.get_mut().write_all(&input).await.unwrap();
+            let mut output = Vec::new();
+            for expected in
+                [&b"+OK\r\n"[..], b"+OK\r\n", b"+OK\r\n", b"+QUEUED\r\n"]
+            {
+                let reply = read_raw_frame(&mut client).await.unwrap();
+                assert_eq!(reply, expected);
+                output.extend(reply);
+            }
+            let error = read_raw_frame(&mut client).await.unwrap();
+            assert_eq!(error, UNAVAILABLE_REPLY);
+            output.extend(error);
+            let status = read_raw_frame(&mut client).await.unwrap();
+            assert!(String::from_utf8_lossy(&status).contains("1234"));
+            output.extend(status);
+            let pong = read_raw_frame(&mut client).await.unwrap();
+            assert_eq!(pong, b"+PONG\r\n");
+            output.extend(pong);
+            let exec = read_raw_frame(&mut client).await.unwrap();
+            assert_eq!(exec, exec_reply);
+            output.extend(exec);
+            assert_eq!(
+                command_ids.load(Ordering::SeqCst),
+                if cluster { 4 } else { 5 }
+            );
+            for (direction, bytes) in [("IN", input), ("OUT", output)] {
+                client
+                    .get_mut()
+                    .write_all(&resp_command(&[
+                        "DEBUG", "PROTOCOL", direction, "BLAKE3",
+                    ]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    parse_frame(&read_raw_frame(&mut client).await.unwrap())
+                        .unwrap(),
+                    Frame::BulkString(Some(blake3_hex(&bytes).into_bytes()))
+                );
+            }
+            drop(client);
+            upstream.await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn monitor_streams_commands_from_connected_clients() {
         let path = unique_socket_path("upstream-monitor");
         let upstream_listener = UnixListener::bind(&path).unwrap();
@@ -1255,6 +1403,8 @@ mod tests {
                 let Ok((stream, _)) = upstream_listener.accept().await else {
                     break;
                 };
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 tokio::spawn(async move {
                     let (read, mut write) = tokio::io::split(stream);
                     let mut read = BufReader::new(read);
@@ -1399,6 +1549,8 @@ mod tests {
         let upstream = tokio::spawn(async move {
             for _ in 0..10 {
                 let (stream, _) = listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 let mut stream = BufReader::new(stream);
                 assert_eq!(
                     read_raw_frame(&mut stream).await.unwrap(),
@@ -1568,6 +1720,8 @@ mod tests {
         let upstream_listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
             assert_eq!(read_raw_frame(&mut read).await.unwrap(), command);
@@ -1771,9 +1925,10 @@ mod tests {
         let upstream_listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             loop {
-                if upstream_listener.accept().await.is_err() {
+                let Ok((stream, _)) = upstream_listener.accept().await else {
                     break;
-                }
+                };
+                crate::upstream_identity::accept_identity(stream).await;
             }
         });
 
@@ -1885,6 +2040,8 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
             // Local mutation controls must never arrive upstream.
@@ -1979,6 +2136,8 @@ mod tests {
             let upstream = tokio::spawn(async move {
                 for reply in [canonical, scrambled] {
                     let (stream, _) = listener.accept().await.unwrap();
+                    let stream =
+                        crate::upstream_identity::accept_identity(stream).await;
                     let mut stream = BufReader::new(stream);
                     for _ in 0..3 {
                         for (command, response) in [
@@ -2193,6 +2352,8 @@ mod tests {
         let upstream = tokio::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 let mut stream = BufReader::new(stream);
                 assert_eq!(
                     read_raw_frame(&mut stream).await.unwrap(),
@@ -2299,6 +2460,8 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let mut stream = BufReader::new(stream);
             for (command, response) in [
                 (&["GET", "one"][..], &b"+OK\r\n"[..]),
@@ -2414,6 +2577,8 @@ mod tests {
         let upstream = tokio::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 let (read, mut write) = tokio::io::split(stream);
                 let mut read = BufReader::new(read);
                 // All DEBUG settings stay local and the command is unchanged.
@@ -2530,6 +2695,8 @@ mod tests {
         let upstream_listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
             assert_eq!(
@@ -2607,6 +2774,8 @@ mod tests {
                 let upstream_listener = UnixListener::bind(&path).unwrap();
                 let upstream = tokio::spawn(async move {
                     let (stream, _) = upstream_listener.accept().await.unwrap();
+                    let stream =
+                        crate::upstream_identity::accept_identity(stream).await;
                     let (read, mut write) = tokio::io::split(stream);
                     let mut read = BufReader::new(read);
                     let mut commands = 0;
@@ -2773,6 +2942,8 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             let upstream = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 let (read, mut write) = tokio::io::split(stream);
                 let mut read = BufReader::new(read);
                 let mut commands = 0;
@@ -2863,6 +3034,8 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             let upstream = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 let (read, mut write) = tokio::io::split(stream);
                 let mut read = BufReader::new(read);
                 let mut writes = 0;
@@ -2993,6 +3166,8 @@ mod tests {
             // Two connections per run, with two replay runs.
             for _ in 0..4 {
                 let (stream, _) = upstream_listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 let seen = seen.clone();
                 connections.spawn(async move {
                     let (read, mut write) = tokio::io::split(stream);
@@ -3166,6 +3341,8 @@ mod tests {
         let reply = format!("-MOVED 12182 127.0.0.1:{upstream_port}\r\n");
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
             assert_eq!(
@@ -3252,6 +3429,8 @@ mod tests {
         ]))]));
         let probe = tokio::spawn(async move {
             let (stream, _) = primary.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let mut stream = BufReader::new(stream);
             assert_eq!(
                 read_raw_frame(&mut stream).await.unwrap(),
@@ -3302,6 +3481,8 @@ mod tests {
         let local_nodes = nodes_reply(local_replica_addr);
         let upstream = tokio::spawn(async move {
             let (stream, _) = replica.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let mut stream = BufReader::new(stream);
             for (command, response) in [
                 (vec!["CLUSTER", "SHARDS"], upstream_shards),
@@ -3401,6 +3582,8 @@ mod tests {
         let upstream_listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
             assert_eq!(
@@ -3505,6 +3688,8 @@ mod tests {
                 let Ok((stream, _)) = upstream_listener.accept().await else {
                     break;
                 };
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 tokio::spawn(async move {
                     let (read, mut write) = tokio::io::split(stream);
                     let mut read = BufReader::new(read);
@@ -3590,6 +3775,8 @@ mod tests {
             tokio::sync::oneshot::channel();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             tokio::spawn(async move {
                 let (read, _write) = tokio::io::split(stream);
                 let mut read = BufReader::new(read);
@@ -3599,9 +3786,10 @@ mod tests {
             });
 
             loop {
-                if upstream_listener.accept().await.is_err() {
+                let Ok((stream, _)) = upstream_listener.accept().await else {
                     break;
-                }
+                };
+                crate::upstream_identity::accept_identity(stream).await;
             }
         });
 
@@ -3667,6 +3855,8 @@ mod tests {
         let upstream_listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
 
@@ -3788,6 +3978,8 @@ mod tests {
                 let Ok((stream, _)) = upstream_listener.accept().await else {
                     break;
                 };
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
                 tokio::spawn(async move {
                     let (read, mut write) = tokio::io::split(stream);
                     let mut read = BufReader::new(read);
@@ -3883,6 +4075,8 @@ mod tests {
         let upstream_listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
             let mut queued_commands = Vec::<String>::new();
@@ -3958,6 +4152,8 @@ mod tests {
         let upstream_listener = UnixListener::bind(&path).unwrap();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
 
@@ -4156,6 +4352,132 @@ mod tests {
         BufReader::new(client)
     }
 
+    #[tokio::test]
+    async fn identification_retries_after_auth_without_leaking_to_clients() {
+        for (handshake, reply, custom_name) in [
+            (vec!["AUTH", "secret"], &b"+OK\r\n"[..], false),
+            (
+                vec!["HELLO", "2", "AUTH", "user", "secret"],
+                b"*0\r\n",
+                false,
+            ),
+            (
+                vec!["HELLO", "3", "AUTH", "user", "secret", "SETNAME", "app"],
+                b"%0\r\n",
+                true,
+            ),
+        ] {
+            let path = unique_socket_path("identity-auth");
+            let listener = UnixListener::bind(&path).unwrap();
+            let command = resp_command(&handshake);
+            let expected_command = command.clone();
+            let upstream = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let identity_commands = [
+                    resp_command(&["CLIENT", "SETNAME", "evilresp"]),
+                    resp_command(&[
+                        "CLIENT", "SETINFO", "LIB-NAME", "evilresp",
+                    ]),
+                    resp_command(&[
+                        "CLIENT",
+                        "SETINFO",
+                        "LIB-VER",
+                        env!("CARGO_PKG_VERSION"),
+                    ]),
+                ];
+                for command in &identity_commands {
+                    assert_eq!(
+                        &read_raw_frame(&mut stream).await.unwrap(),
+                        command
+                    );
+                    stream
+                        .get_mut()
+                        .write_all(b"-NOAUTH Authentication required\r\n")
+                        .await
+                        .unwrap();
+                }
+                // A failed authentication must not trigger another handshake.
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    resp_command(&["AUTH", "wrong"])
+                );
+                stream
+                    .get_mut()
+                    .write_all(b"-WRONGPASS bad password\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    expected_command
+                );
+                stream.get_mut().write_all(reply).await.unwrap();
+                for command in &identity_commands[usize::from(custom_name)..] {
+                    assert_eq!(
+                        &read_raw_frame(&mut stream).await.unwrap(),
+                        command
+                    );
+                    stream.get_mut().write_all(b"+OK\r\n").await.unwrap();
+                }
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    resp_command(&["PING"])
+                );
+                stream.get_mut().write_all(b"+PONG\r\n").await.unwrap();
+            });
+            let state = SharedState {
+                stats: Arc::new(Stats::default()),
+                repro: None,
+                monitor: monitor_sender(),
+                reset_barrier: Arc::new(RwLock::new(())),
+                reset_epoch: Arc::new(AtomicU64::new(0)),
+                connection_ids: Arc::new(AtomicU64::new(0)),
+                command_ids: Arc::new(AtomicU64::new(0)),
+                local_slots: None,
+                redirection_map: ClusterRedirectionMap::default(),
+            };
+            let command_ids = state.command_ids.clone();
+            let target = ProxyTarget {
+                upstream: Endpoint::Unix(path.clone()),
+                listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+            };
+            let mut client = spawn_proxy_client(target, state, 0);
+            let input = [
+                resp_command(&["AUTH", "wrong"]),
+                command,
+                resp_command(&["PING"]),
+            ]
+            .concat();
+            client.get_mut().write_all(&input).await.unwrap();
+            let mut output = Vec::new();
+            for expected in
+                [&b"-WRONGPASS bad password\r\n"[..], reply, b"+PONG\r\n"]
+            {
+                let actual = read_raw_frame(&mut client).await.unwrap();
+                assert_eq!(actual, expected);
+                output.extend(actual);
+            }
+            assert_eq!(command_ids.load(Ordering::SeqCst), 3);
+            for (direction, bytes) in [("IN", input), ("OUT", output)] {
+                client
+                    .get_mut()
+                    .write_all(&resp_command(&[
+                        "DEBUG", "PROTOCOL", direction, "BLAKE3",
+                    ]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    parse_frame(&read_raw_frame(&mut client).await.unwrap())
+                        .unwrap(),
+                    Frame::BulkString(Some(blake3_hex(&bytes).into_bytes()))
+                );
+            }
+            drop(client);
+            upstream.await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
     async fn write_evil_setup(client: &mut UnixStream) {
         client
             .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "RESET"]))
@@ -4196,6 +4518,8 @@ mod tests {
         let upstream_command = command.to_vec();
         let upstream = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
             let (read, mut write) = tokio::io::split(stream);
             let mut read = BufReader::new(read);
 

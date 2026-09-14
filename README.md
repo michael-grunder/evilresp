@@ -87,6 +87,60 @@ primary/replica roles after failover; the synthesized `CLUSTER SLOTS` reply
 remains a startup snapshot. Rewriting also happens before RESP
 mutation, including when its probability is zero.
 
+Every upstream connection, including the startup discovery probe and Unix
+socket connections, pipelines these identification commands before forwarding
+client traffic:
+
+```text
+CLIENT SETNAME evilresp
+CLIENT SETINFO LIB-NAME evilresp
+CLIENT SETINFO LIB-VER <package-version>
+```
+
+Other processes can recognize proxy connections in upstream `CLIENT LIST` by
+`name=evilresp`, or by `lib-name=evilresp` and `lib-ver=0.1.0` on servers that
+support `CLIENT SETINFO` (Redis 7.2+). Connection cleanup tools can use these
+fields to exempt proxy connections; Redis does not automatically protect them.
+The version is the Cargo package version, without build date or Git metadata.
+
+Server errors, including unsupported commands, `NOAUTH`, and ACL denials, are
+ignored and logged at DEBUG. Rejected fields are retried after a successful
+client `AUTH` or `HELLO`; a successful `HELLO SETNAME` keeps the client's name.
+I/O errors or invalid handshake replies discard the upstream connection because
+its reply stream can no longer be trusted. Identification replies stay internal
+and do not affect command indexes, fingerprints, mutation, or repro records.
+Client commands still pass through unchanged: explicit `CLIENT SETNAME`,
+`CLIENT SETINFO`, `HELLO SETNAME`, or `RESET` can replace or clear these fields.
+Identification is best effort, so cleanup tools must account for missing or
+overridden fields.
+
+If upstream I/O detects a disconnect (including EOF, a reset, or a socket
+timeout), evilresp logs a warning and discards that upstream session, including
+any partial reply. The affected command receives
+`ERR evilresp upstream unavailable; command outcome unknown; upstream session reset; retry on next command`.
+The client connection stays open with its evil configuration, fingerprints,
+and command indexes intact. Commands already sent upstream are never replayed:
+they may have executed even though no complete reply arrived. These error
+replies bypass mutation and transport faults and count toward fingerprints.
+
+The next command requiring forwarding makes one reconnect attempt to the same
+upstream endpoint, including identification. Success is logged at INFO; failure
+is logged at WARN and returns the same error, leaving another attempt for the
+next forwarded command. Initial connection/identification failures use this
+recovery path too. Local commands, generated replies, and before-forwarding
+faults do not trigger reconnects. There is no background retry loop or new
+application-level timeout; blocking commands retain their existing behavior.
+
+A replacement upstream connection is a **fresh server session**. Authentication,
+selected database, RESP version, READONLY mode, subscriptions, WATCH/MULTI state,
+and client-set metadata are not restored. Clients must reestablish any required
+session state after an upstream error; buffered commands continue in order on
+the fresh session. Transaction canonicalization tracking is cleared on failure.
+Ordinary failed commands still consume their command index; cluster bootstrap
+queries remain exempt. Upstream reconnects do not rediscover cluster topology.
+Client disconnects and intentionally injected close/reset/truncation faults
+still end the client connection.
+
 ## MONITOR
 
 `MONITOR` is handled by `evilresp` and is not sent upstream. It returns `OK`

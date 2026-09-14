@@ -8,6 +8,7 @@ use tracing::{debug, info};
 use crate::cli::{Endpoint, TcpEndpoint};
 use crate::error::{AppError, AppResult};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
+use crate::upstream_identity::UpstreamIdentity;
 
 #[derive(Clone, Debug)]
 pub enum Topology {
@@ -324,6 +325,9 @@ async fn fetch_cluster_slots(
     let stream = TcpStream::connect(proxy.connect_addr()).await?;
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
+    UpstreamIdentity::default()
+        .apply(&mut read, &mut write)
+        .await?;
 
     write.write_all(&cluster_slots_command().encode()).await?;
     write.flush().await?;

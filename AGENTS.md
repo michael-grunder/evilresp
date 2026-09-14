@@ -64,6 +64,8 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `transport.rs`            | Transport configuration, deterministic delivery plans, chunk execution, shutdown, and partial-write accounting. |
 | `connection_fault.rs`     | Validated connection-fault choices and deterministic lifecycle plans. |
 | `connection.rs`           | Socket reset support, termination, and explicitly opted-in bounded stalls. |
+| `upstream_identity.rs`    | Best-effort upstream connection naming and library metadata, with retries after authentication. |
+| `upstream_connection.rs`  | Upstream session lifecycle and reconnecting at forwarding boundaries without replaying failed commands. |
 
 Add new modules around a responsibility (parsing, model, execution, I/O,
 config), not around an incidental category. Prefer a new focused file over

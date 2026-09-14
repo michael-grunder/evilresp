@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Recover from upstream connection/identification failures without closing the
+  client: log the failure, return an unmutated error, and attempt reconnection
+  once at the next forwarded command. Never replay a command with a lost reply.
+  Replacement connections repeat identification and start fresh server sessions;
+  client evil settings, fingerprints, and indexes survive, while transaction
+  tracking is cleared. Clients must restore their required upstream session state.
+
+- Upstream connections now identify themselves with `CLIENT SETNAME evilresp`
+  and `CLIENT SETINFO LIB-NAME evilresp` / `LIB-VER <package-version>`, including
+  cluster discovery and Unix sockets. Server rejections are tolerated and
+  rejected fields retried after successful client authentication/HELLO.
+  Handshake traffic stays outside client replies, fingerprints, and command
+  indexes; client identity commands still pass through unchanged.
+
 - Added `DEBUG CHAOS <0..100> [SEED <u64>] [HASH <BLAKE3|TLSH>]`, a per-connection
   temperature preset spanning value, EXEC, framing, topology, and transport
   faults. It preserves the existing seed unless supplied, plus filters,

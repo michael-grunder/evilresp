@@ -1,0 +1,232 @@
+[
+  {
+    "file": "src/adaptivecache.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/adaptivecache_arginfo.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/cache.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/cache.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/cluster.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/cluster_arginfo.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/cms.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/cms.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/command.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/command.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/command_table.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/commands.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/commands.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/crc16.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/events_arginfo.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/heartbeat.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/hyperloglog.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/hyperloglog.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/keylease.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/keys.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/keys.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/liblzf/lzf_c.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/liblzf/lzf_d.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/lock.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/log.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/log.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/pack.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/pack.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/panic.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/php_relay.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/rbtree.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/rbtree.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/reader.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/relay.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/relay_arginfo.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/relay_id.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/reply.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/reply.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/sentinel.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/sentinel_arginfo.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/session.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/shmalloc.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/shmalloc.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/table.c",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/table_arginfo.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  },
+  {
+    "file": "src/xxhash/xxhash.h",
+    "source_matches_html": true,
+    "line_counts_match_summary": true
+  }
+]

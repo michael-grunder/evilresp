@@ -476,7 +476,7 @@ async fn proxy_connection(
                     &command_frame,
                     None,
                     local_slots,
-                )?
+                )
             } else {
                 None
             };
@@ -538,7 +538,7 @@ async fn proxy_connection(
                     let relay_bytes = if is_simulated {
                         upstream_bytes.clone()
                     } else {
-                        normalize_cluster_redirection(&upstream_bytes, &state)?
+                        normalize_cluster_redirection(&upstream_bytes, &state)
                     };
                     let topology = if should_mutate
                         && let Some(local_slots) = &state.local_slots
@@ -563,7 +563,7 @@ async fn proxy_connection(
                                 &command_frame,
                                 Some(&relay_bytes),
                                 local_slots,
-                            )?
+                            )
                         }
                     } else {
                         None
@@ -578,20 +578,33 @@ async fn proxy_connection(
                 && matches!(config.mode, EvilMode::Mutate | EvilMode::Overflow);
             // Transport uses the same canonical input as RESP mutation,
             // even when it runs alone with MODE OFF. Relay bytes stay intact.
+            // The raw reader accepts more than the typed parser (for
+            // example non-UTF-8 simple lines); such replies are relayed
+            // unchanged rather than closing the client connection.
             let canonical = if mutate_values || transport_enabled {
-                let frame = parse_frame(&base_bytes)?;
-                Some(match exec_commands {
-                    Some(commands) => canonicalize_transaction_reply(
-                        config.canonicalization,
-                        &commands,
-                        &frame,
-                    ),
-                    None => canonicalize_reply(
-                        config.canonicalization,
-                        command_name.as_deref(),
-                        &frame,
-                    ),
-                })
+                match parse_frame(&base_bytes) {
+                    Ok(frame) => Some(match exec_commands {
+                        Some(commands) => canonicalize_transaction_reply(
+                            config.canonicalization,
+                            &commands,
+                            &frame,
+                        ),
+                        None => canonicalize_reply(
+                            config.canonicalization,
+                            command_name.as_deref(),
+                            &frame,
+                        ),
+                    }),
+                    Err(error) => {
+                        debug!(
+                            connection_id,
+                            command_id,
+                            %error,
+                            "relaying upstream reply the typed parser rejects"
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -599,22 +612,20 @@ async fn proxy_connection(
                 .as_ref()
                 .map(|frame| deterministic_hash(&frame.encode()))
                 .unwrap_or_default();
-            let bytes = if mutate_values {
-                // mutate_values always prepares a canonical frame above.
-                let frame =
-                    canonical.as_ref().expect("canonical mutation input");
-                let mutated = mutate_command_reply(
-                    &config,
-                    command_id,
-                    command_name.as_deref(),
-                    &command_hash,
-                    &seed_hash,
-                    frame,
-                );
-                mutations.extend(mutated.mutations);
-                mutated.bytes
-            } else {
-                base_bytes
+            let bytes = match &canonical {
+                Some(frame) if mutate_values => {
+                    let mutated = mutate_command_reply(
+                        &config,
+                        command_id,
+                        command_name.as_deref(),
+                        &command_hash,
+                        &seed_hash,
+                        frame,
+                    );
+                    mutations.extend(mutated.mutations);
+                    mutated.bytes
+                }
+                _ => base_bytes,
             };
             (upstream_bytes, MutatedReply { bytes, mutations }, seed_hash)
         };
@@ -688,19 +699,19 @@ async fn proxy_connection(
 fn normalize_cluster_redirection(
     upstream_bytes: &[u8],
     state: &SharedState,
-) -> AppResult<Vec<u8>> {
+) -> Vec<u8> {
     if state.local_slots.is_none()
         || !matches!(upstream_bytes.first(), Some(b'-' | b'!'))
     {
-        return Ok(upstream_bytes.to_vec());
+        return upstream_bytes.to_vec();
     }
 
-    let upstream_frame = parse_frame(upstream_bytes)?;
-    Ok(
-        normalize_redirection(&upstream_frame, &state.redirection_map)
-            .map(|frame| frame.encode())
-            .unwrap_or_else(|| upstream_bytes.to_vec()),
-    )
+    // Redirections are ASCII; an error line the typed parser rejects (for
+    // example non-UTF-8 text from a script) is relayed unchanged.
+    parse_frame(upstream_bytes)
+        .ok()
+        .and_then(|frame| normalize_redirection(&frame, &state.redirection_map))
+        .map_or_else(|| upstream_bytes.to_vec(), |frame| frame.encode())
 }
 
 fn apply_debug_evil(
@@ -1373,6 +1384,111 @@ mod tests {
         let response = read_raw_frame(&mut read).await.unwrap();
 
         assert_eq!(response, b"+PONG\r\n");
+        drop(read);
+        proxy.await.unwrap().unwrap();
+        upstream.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Upstream replies that `read_raw_frame` accepts but `parse_frame`
+    /// rejects (here, a non-UTF-8 error line, as produced by
+    /// `redis.error_reply` with binary data) must be relayed unchanged in
+    /// every mode instead of closing the client connection.
+    #[tokio::test]
+    async fn unparseable_upstream_replies_are_relayed_in_every_mode() {
+        const BINARY_ERROR: &[u8] = b"-ERR \xff\xfe\r\n";
+        let path = unique_socket_path("upstream-binary-error");
+        let upstream_listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let stream =
+                crate::upstream_identity::accept_identity(stream).await;
+            let (read, mut write) = tokio::io::split(stream);
+            let mut read = BufReader::new(read);
+            for _ in 0..3 {
+                let command = read_raw_frame(&mut read).await.unwrap();
+                let reply: &[u8] = if command == b"*1\r\n$4\r\nPING\r\n" {
+                    b"+PONG\r\n"
+                } else {
+                    BINARY_ERROR
+                };
+                write.write_all(reply).await.unwrap();
+            }
+        });
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(unique_socket_path("unused-listen")),
+        };
+        let state = SharedState {
+            stats: Arc::new(Stats::default()),
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            // Cluster mode also inspects every error reply for redirections.
+            local_slots: Some(cluster_slots_frame()),
+            redirection_map: ClusterRedirectionMap::default(),
+        };
+        let proxy = tokio::spawn(proxy_connection(
+            Box::new(server),
+            target,
+            state,
+            0,
+            0,
+        ));
+        let mut read = BufReader::new(client);
+
+        // MODE OFF in cluster mode: the redirection check must not parse.
+        read.get_mut()
+            .write_all(&resp_command(&["GET", "key"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), BINARY_ERROR);
+
+        // MODE MUTATE with transport faults: neither mutation nor the
+        // transport seed may depend on a successful parse.
+        write_evil_setup(read.get_mut()).await;
+        read.get_mut()
+            .write_all(&resp_command(&[
+                "DEBUG",
+                "EVIL",
+                "TRANSPORT",
+                "CHUNKS",
+                "RANDOM",
+            ]))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            assert_eq!(read_simple_string(&mut read).await, "OK");
+        }
+        read.get_mut()
+            .write_all(&resp_command(&["GET", "key"]))
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), BINARY_ERROR);
+
+        // The connection is still usable afterwards.
+        read.get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "OFF"]))
+            .await
+            .unwrap();
+        read.get_mut()
+            .write_all(&resp_command(&["DEBUG", "EVIL", "TRANSPORT", "OFF"]))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(read_simple_string(&mut read).await, "OK");
+        }
+        read.get_mut()
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_raw_frame(&mut read).await.unwrap(), b"+PONG\r\n");
+
         drop(read);
         proxy.await.unwrap().unwrap();
         upstream.await.unwrap();

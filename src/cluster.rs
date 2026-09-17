@@ -215,7 +215,15 @@ pub async fn discover(
 ) -> AppResult<Topology> {
     let (tcp_proxy, tcp_listen) = match (proxy.as_tcp(), listen.as_tcp()) {
         (Some(proxy), Some(listen)) => {
-            (proxy.clone(), listen.connect_addr().parse::<SocketAddr>()?)
+            let socket_addr =
+                listen.connect_addr().parse::<SocketAddr>().map_err(|_| {
+                    AppError::Proxy(format!(
+                        "--listen {listen} must use a numeric IP address \
+                         (for example 127.0.0.1:6380 or [::1]:6380) when the \
+                         upstream is TCP, so cluster node ports can be derived"
+                    ))
+                })?;
+            (proxy.clone(), socket_addr)
         }
         _ => {
             debug!(

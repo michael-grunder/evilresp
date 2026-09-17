@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 
 use crate::cli::TcpEndpoint;
 use crate::cluster::ClusterRedirectionMap;
-use crate::error::AppResult;
 use crate::evil::{AppliedMutation, EvilConfig, MutationKind};
 use crate::resp::{Frame, parse_frame};
 use crate::topology_config::{
@@ -41,10 +40,10 @@ pub fn maybe_mutate_topology(
     command: &Frame,
     upstream_bytes: Option<&[u8]>,
     local_slots: &Frame,
-) -> AppResult<Option<TopologyMutation>> {
+) -> Option<TopologyMutation> {
     if config.topology_probability <= 0.0 || config.topology_redirect.is_some()
     {
-        return Ok(None);
+        return None;
     }
 
     let upstream_hash = upstream_bytes
@@ -54,19 +53,16 @@ pub fn maybe_mutate_topology(
         topology_rng(config.seed, command_index, command_hash, &upstream_hash);
     let targets = redirection_targets(local_slots);
     if targets.is_empty() {
-        return Ok(None);
+        return None;
     }
 
-    let upstream = match upstream_bytes {
-        Some(bytes) => parse_redirection(&parse_frame(bytes)?),
-        None => None,
-    };
+    let upstream = upstream_bytes.and_then(parse_redirection_bytes);
 
     let (mut redirection, mut mutations) = match upstream {
         Some(redirection) => (redirection, Vec::new()),
         None => {
             if !should_apply(config.topology_probability, &mut rng) {
-                return Ok(None);
+                return None;
             }
 
             (
@@ -90,13 +86,13 @@ pub fn maybe_mutate_topology(
     );
 
     if mutations.is_empty() {
-        return Ok(None);
+        return None;
     }
 
-    Ok(Some(TopologyMutation {
+    Some(TopologyMutation {
         frame: redirection.to_frame(),
         mutations,
-    }))
+    })
 }
 
 pub(crate) struct RedirectContext<'a> {
@@ -318,6 +314,16 @@ pub fn normalize_redirection(
     Some(redirection.to_matching_frame(frame))
 }
 
+/// Parse a raw upstream reply as a redirection. Only error replies can be
+/// redirections, and replies the strict parser rejects (for example a
+/// non-UTF-8 error line) are never redirections; neither is a failure.
+fn parse_redirection_bytes(bytes: &[u8]) -> Option<Redirection> {
+    if !matches!(bytes.first(), Some(b'-' | b'!')) {
+        return None;
+    }
+    parse_redirection(&parse_frame(bytes).ok()?)
+}
+
 fn parse_redirection(frame: &Frame) -> Option<Redirection> {
     let value = match frame {
         Frame::SimpleError(value) => value.as_str(),
@@ -345,10 +351,9 @@ fn fake_redirection(
     targets: &[String],
     rng: &mut ChaCha20Rng,
 ) -> Redirection {
-    let slot = command
-        .argv_lossy()
-        .get(1)
-        .map(|key| redis_slot(key.as_bytes()))
+    // Hash the raw key bytes: a lossy UTF-8 view would give binary keys a
+    // slot that no real node reports for them.
+    let slot = command_slot(command, 1)
         .unwrap_or_else(|| rng.gen_range(0..CLUSTER_SLOT_COUNT));
     let server = targets[rng.gen_range(0..targets.len())].clone();
     let kind = if rng.r#gen() {
@@ -786,7 +791,6 @@ mod tests {
         let mutated = maybe_mutate_topology(
             &config, 9, "command", &command, None, &slots,
         )
-        .unwrap()
         .unwrap();
 
         let encoded = mutated.frame.encode();
@@ -819,7 +823,6 @@ mod tests {
             Some(b"-MOVED 12182 127.0.0.1:7000\r\n"),
             &slots,
         )
-        .unwrap()
         .unwrap();
 
         assert_ne!(mutated.frame.encode(), b"-MOVED 12182 127.0.0.1:7000\r\n");
@@ -829,6 +832,38 @@ mod tests {
                 .iter()
                 .any(|mutation| mutation.kind == MutationKind::TopologyWildSlot)
         );
+    }
+
+    #[test]
+    fn unparseable_error_replies_are_not_redirections() {
+        // The raw reader accepts these; the typed parser does not.
+        assert!(parse_redirection_bytes(b"-ERR \xff\xfe\r\n").is_none());
+        assert!(parse_redirection_bytes(b"!5\r\nE\xff\xfeR\r\n").is_none());
+        // Only error prefixes are inspected at all.
+        assert!(parse_redirection_bytes(b"+MOVED 1 h:1\r\n").is_none());
+        assert_eq!(
+            parse_redirection_bytes(b"-MOVED 12182 127.0.0.1:7000\r\n")
+                .map(|redirection| redirection.to_string())
+                .as_deref(),
+            Some("MOVED 12182 127.0.0.1:7000")
+        );
+    }
+
+    #[test]
+    fn fake_redirection_hashes_raw_key_bytes() {
+        let key = b"\xff\xfe";
+        let lossy = String::from_utf8_lossy(key);
+        assert_ne!(redis_slot(key), redis_slot(lossy.as_bytes()));
+        let command = Frame::Array(Some(vec![
+            Frame::BulkString(Some(b"GET".to_vec())),
+            Frame::BulkString(Some(key.to_vec())),
+        ]));
+        let targets = vec!["127.0.0.1:7000".to_owned()];
+        let mut rng = topology_rng(0, 0, "", "");
+
+        let redirection = fake_redirection(&command, &targets, &mut rng);
+
+        assert_eq!(redirection.slot, redis_slot(key));
     }
 
     #[test]

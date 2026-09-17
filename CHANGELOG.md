@@ -177,6 +177,12 @@ All notable changes to this project will be documented in this file.
   connections. While active, bootstrap topology queries return the simulated
   topology instead of the startup snapshot; they still bypass mutation and do
   not consume a command index.
+- Canonicalization sorts compute each frame's encoding once instead of on
+  every comparison, so large unordered replies (`HGETALL`, `SMEMBERS`, RESP3
+  maps and sets) cost O(n) encodes rather than O(n log n). Output is unchanged.
+- Startup now reports a descriptive error when a TCP `--listen` endpoint uses
+  a hostname instead of a numeric IP address, rather than a bare address
+  parse error.
 
 - The new `DEPTH INNER` default changes seeded `MUTATE` and `OVERFLOW` output
   relative to earlier versions, including replies with a single scalar. Set
@@ -228,6 +234,17 @@ All notable changes to this project will be documented in this file.
   server capabilities on connect.
 
 ### Fixed
+
+- Upstream replies that the raw frame reader accepts but the typed parser
+  rejects (for example a non-UTF-8 error line from `redis.error_reply`) are
+  now relayed unchanged in every mode instead of closing the client
+  connection. This affected `MODE OFF` in cluster mode (every error reply is
+  inspected for redirections), `MUTATE`/`OVERFLOW`, transport faults, and
+  legacy `TOPOLOGY` faults. Such replies are never mutated; transport plans
+  still apply, seeded from an empty reply hash.
+- Legacy `TOPOLOGY` fake redirections now hash the raw key bytes for the slot,
+  matching focused redirects. Binary (non-UTF-8) keys previously used a lossy
+  UTF-8 view of the key and reported a slot no node owns for that key.
 
 - Count successful partial client writes in protocol fingerprints, including
   when a later write fails. Retry interrupted writes and reject zero-progress

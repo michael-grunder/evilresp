@@ -935,7 +935,7 @@ fn canonicalize_unordered_containers(frame: &mut Frame) {
             for item in items.iter_mut() {
                 canonicalize_unordered_containers(item);
             }
-            items.sort_by_key(sort_key);
+            items.sort_by_cached_key(sort_key);
         }
         _ => {}
     }
@@ -946,7 +946,7 @@ fn canonicalize_array_items(frame: &mut Frame) {
         for item in items.iter_mut() {
             canonicalize_unordered_containers(item);
         }
-        items.sort_by_key(sort_key);
+        items.sort_by_cached_key(sort_key);
     }
 }
 
@@ -964,11 +964,7 @@ fn canonicalize_array_pairs(frame: &mut Frame) {
         .map(|[key, value]| (key.clone(), value.clone()))
         .collect::<Vec<_>>();
     let remainder = remainder.to_vec();
-    pairs.sort_by(|left, right| {
-        sort_key(&left.0)
-            .cmp(&sort_key(&right.0))
-            .then_with(|| sort_key(&left.1).cmp(&sort_key(&right.1)))
-    });
+    pairs.sort_by_cached_key(pair_sort_key);
 
     items.clear();
     for (key, value) in pairs {
@@ -982,7 +978,7 @@ fn canonicalize_frame_items(items: &mut [Frame]) {
     for item in items.iter_mut() {
         canonicalize_all_containers(item);
     }
-    items.sort_by_key(sort_key);
+    items.sort_by_cached_key(sort_key);
 }
 
 fn canonicalize_frame_pairs(items: &mut [(Frame, Frame)]) {
@@ -990,11 +986,7 @@ fn canonicalize_frame_pairs(items: &mut [(Frame, Frame)]) {
         canonicalize_all_containers(key);
         canonicalize_all_containers(value);
     }
-    items.sort_by(|left, right| {
-        sort_key(&left.0)
-            .cmp(&sort_key(&right.0))
-            .then_with(|| sort_key(&left.1).cmp(&sort_key(&right.1)))
-    });
+    items.sort_by_cached_key(pair_sort_key);
 }
 
 fn canonicalize_unordered_frame_pairs(items: &mut [(Frame, Frame)]) {
@@ -1002,15 +994,19 @@ fn canonicalize_unordered_frame_pairs(items: &mut [(Frame, Frame)]) {
         canonicalize_unordered_containers(key);
         canonicalize_unordered_containers(value);
     }
-    items.sort_by(|left, right| {
-        sort_key(&left.0)
-            .cmp(&sort_key(&right.0))
-            .then_with(|| sort_key(&left.1).cmp(&sort_key(&right.1)))
-    });
+    items.sort_by_cached_key(pair_sort_key);
 }
 
+// Keys are computed once per element (`sort_by_cached_key`), not per
+// comparison: canonicalizing a large HGETALL/SMEMBERS reply would otherwise
+// re-encode every frame O(n log n) times. Equal keys are byte-identical
+// frames, so sort stability cannot affect the canonical output.
 fn sort_key(frame: &Frame) -> Vec<u8> {
     frame.encode()
+}
+
+fn pair_sort_key(pair: &(Frame, Frame)) -> (Vec<u8>, Vec<u8>) {
+    (pair.0.encode(), pair.1.encode())
 }
 
 pub(crate) fn rng_for(

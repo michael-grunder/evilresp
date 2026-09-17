@@ -1,6 +1,6 @@
 //! Legacy mixed topology mutation and focused, bounded redirection injection.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 
@@ -170,7 +170,7 @@ pub(crate) fn configured_redirection(
         RedirectSlot::Correct | RedirectSlot::Fixed(_) => correct_slot,
         RedirectSlot::Wrong => wrong_valid_slot(correct_slot, &mut rng),
         RedirectSlot::Wild => {
-            let value = rng.r#gen::<i32>();
+            let value = rng.random::<i32>();
             if (0..CLUSTER_SLOT_COUNT).contains(&value) {
                 -1
             } else {
@@ -182,7 +182,7 @@ pub(crate) fn configured_redirection(
         RedirectKind::Moved => RedirectionKind::Moved,
         RedirectKind::Ask => RedirectionKind::Ask,
         RedirectKind::Random => {
-            if rng.r#gen() {
+            if rng.random() {
                 RedirectionKind::Moved
             } else {
                 RedirectionKind::Ask
@@ -207,7 +207,7 @@ fn choose(targets: &[String], rng: &mut ChaCha20Rng) -> Option<String> {
     if targets.is_empty() {
         None
     } else {
-        Some(targets[rng.gen_range(0..targets.len())].clone())
+        Some(targets[rng.random_range(0..targets.len())].clone())
     }
 }
 
@@ -354,9 +354,9 @@ fn fake_redirection(
     // Hash the raw key bytes: a lossy UTF-8 view would give binary keys a
     // slot that no real node reports for them.
     let slot = command_slot(command, 1)
-        .unwrap_or_else(|| rng.gen_range(0..CLUSTER_SLOT_COUNT));
-    let server = targets[rng.gen_range(0..targets.len())].clone();
-    let kind = if rng.r#gen() {
+        .unwrap_or_else(|| rng.random_range(0..CLUSTER_SLOT_COUNT));
+    let server = targets[rng.random_range(0..targets.len())].clone();
+    let kind = if rng.random() {
         RedirectionKind::Moved
     } else {
         RedirectionKind::Ask
@@ -408,7 +408,7 @@ fn apply_redirection_mutations(
     }
 
     if should_apply(probability, rng) {
-        redirection.slot = rng.r#gen::<i32>();
+        redirection.slot = rng.random::<i32>();
         mutations.push(AppliedMutation {
             path: "topology.slot".to_owned(),
             kind: MutationKind::TopologyWildSlot,
@@ -419,7 +419,7 @@ fn apply_redirection_mutations(
 }
 
 fn wrong_valid_slot(current: i32, rng: &mut ChaCha20Rng) -> i32 {
-    let mut slot = rng.gen_range(0..CLUSTER_SLOT_COUNT);
+    let mut slot = rng.random_range(0..CLUSTER_SLOT_COUNT);
     if slot == current {
         slot = (slot + 1) % CLUSTER_SLOT_COUNT;
     }
@@ -437,7 +437,7 @@ fn wrong_server(
         .collect::<Vec<_>>();
     if !alternatives.is_empty() {
         return Some(
-            alternatives[rng.gen_range(0..alternatives.len())].clone(),
+            alternatives[rng.random_range(0..alternatives.len())].clone(),
         );
     }
 
@@ -548,7 +548,7 @@ fn crc16_xmodem(bytes: &[u8]) -> u16 {
 }
 
 fn should_apply(probability: f64, rng: &mut ChaCha20Rng) -> bool {
-    probability > 0.0 && rng.gen_range(0.0..100.0) < probability
+    probability > 0.0 && rng.random_range(0.0..100.0) < probability
 }
 
 fn topology_rng(

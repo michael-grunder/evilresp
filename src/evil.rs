@@ -1490,16 +1490,16 @@ mod tests {
     fn one_mutation_selects_original_children_with_exact_seeded_output() {
         let frame =
             parse_frame(b"*2\r\n#t\r\n%1\r\n#t\r\n~1\r\n#t\r\n").unwrap();
-        // Seeds 0, 1, and 2 select the array child, nested set child,
+        // Seeds 0, 2, and 1 select the array child, nested set child,
         // and map key respectively for this command/reply hash tuple.
         for (seed, path, expected) in [
             (0, "root.0", b"*2\r\n#f\r\n%1\r\n#t\r\n~1\r\n#t\r\n"),
             (
-                1,
+                2,
                 "root.1.0.value.0",
                 b"*2\r\n#t\r\n%1\r\n#t\r\n~1\r\n#f\r\n",
             ),
-            (2, "root.1.0.key", b"*2\r\n#t\r\n%1\r\n#f\r\n~1\r\n#t\r\n"),
+            (1, "root.1.0.key", b"*2\r\n#t\r\n%1\r\n#f\r\n~1\r\n#t\r\n"),
         ] {
             let config = EvilConfig {
                 seed,
@@ -1522,10 +1522,10 @@ mod tests {
     fn replacement_subtrees_are_not_mutated_again() {
         let frame =
             parse_frame(b"*2\r\n#t\r\n%1\r\n#t\r\n~1\r\n#t\r\n").unwrap();
-        // Seed 1 generates an array containing nested arrays. MANY may
+        // Seed 5 generates an array containing nested arrays. MANY may
         // corrupt its root length but must not mutate the generated children.
         let config = EvilConfig {
-            seed: 1,
+            seed: 5,
             mode: EvilMode::Mutate,
             probability: 100.0,
             strategy: MutationStrategy::Replace,
@@ -1535,7 +1535,7 @@ mod tests {
         let result = mutate_reply(&config, 9, "command", "upstream", &frame);
         assert_eq!(
             result.bytes,
-            b"*5\r\n*4\r\n*-1\r\n:9223372036854775807\r\n+-1\r\n*-1\r\n*1\r\n:2147483648\r\n*-1\r\n-ERR -1\r\n"
+            b"*5\r\n$20\r\n-9223372036854775809\r\n*4\r\n-ERR \r\n$-1\r\n$-1\r\n+-1\r\n$-1\r\n$-1\r\n"
         );
         assert_eq!(
             result
@@ -1549,14 +1549,14 @@ mod tests {
             ]
         );
 
-        // Seed 107 with ONE replaces the root with a complete four-item array.
+        // Seed 249 with ONE replaces the root with a complete four-item array.
         let config = EvilConfig {
-            seed: 107,
+            seed: 249,
             mutation_count: MutationCount::One,
             ..config
         };
         let result = mutate_reply(&config, 9, "command", "upstream", &frame);
-        assert_eq!(result.bytes, b"*4\r\n$-1\r\n$-1\r\n-ERR -1\r\n*-1\r\n");
+        assert_eq!(result.bytes, b"*4\r\n+18446744073709551616\r\n*0\r\n*1\r\n+18446744073709551616\r\n*-1\r\n");
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.mutations[0].path, "root");
         assert_eq!(result.mutations[0].kind, MutationKind::RandomFrame);

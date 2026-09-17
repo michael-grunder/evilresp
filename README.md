@@ -339,9 +339,11 @@ blocked/cancelled delivery has no completed record yet. The deterministic
 plan describes intended delivery; OS errors and how much a peer receives are
 observations, not seeded fault choices.
 
-For a reproducible run, use the same configuration, command order, and
-upstream data. Command indexes are shared across connections, start at zero,
-and count ordinary commands even in `OFF` mode or when excluded by a filter.
+For a reproducible run, use the same build, configuration, command order, and
+upstream data. The upgrade to `rand` 0.10 changes seeded sampling results from
+builds using `rand` 0.8, including mutation and delivery choices. Command
+indexes are shared across connections, start at zero, and count ordinary
+commands even in `OFF` mode or when excluded by a filter.
 Local commands and cluster-mode topology queries do not consume indexes.
 Concurrent clients can interleave differently between runs; serialize their
 commands when reproducing a failure. RESP mutation uses ChaCha20 seeded from
@@ -524,8 +526,8 @@ mutated nested frame reaches deeper parsing, validation, and cleanup code:
   headers the same way, and the `FRAMING AUTO` root fault halves its
   probability per nesting level of the reply. A scalar reply is unaffected.
 - `ANY`: every eligible frame has equal weight and every frame uses the full
-  value probability. This is the previous behavior and reproduces earlier
-  seeded output exactly, including the `FRAMING AUTO` root fault.
+  value probability, including the `FRAMING AUTO` root fault. This restores
+  uniform selection; exact seeded output still depends on the build.
 
 `DEPTH` never changes *what* a mutation does: strategy, mode, and generator
 settings still decide the replacement. It applies only to `MUTATE` and

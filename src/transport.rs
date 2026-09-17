@@ -3,7 +3,7 @@
 
 use std::io::{self, ErrorKind};
 
-use rand::Rng;
+use rand::RngExt;
 use serde::Serialize;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -246,14 +246,14 @@ impl TransportConfig {
             &format!("transport:v1:{command_hash}"),
             reply_hash,
         );
-        if !rng.gen_bool(self.probability / 100.0) {
+        if !rng.random_bool(self.probability / 100.0) {
             return plan;
         }
         plan.extra_reply_count = self.extra;
         let total = response_len + self.extra * EXTRA_REPLY.len();
         plan.truncate_at = match self.truncate {
             Cut::At(n) if n < total => Some(n),
-            Cut::Random if total > 0 => Some(rng.gen_range(0..total)),
+            Cut::Random if total > 0 => Some(rng.random_range(0..total)),
             _ => None,
         };
         let len = plan.truncate_at.unwrap_or(total);
@@ -263,10 +263,10 @@ impl TransportConfig {
                 offsets.iter().copied().filter(|n| *n < len).collect()
             }
             Chunks::Random if len > 1 => {
-                let count = rng.gen_range(1..=MAX_BOUNDARIES.min(len - 1));
+                let count = rng.random_range(1..=MAX_BOUNDARIES.min(len - 1));
                 // Bounded draws; duplicate offsets are coalesced deterministically.
                 let mut offsets = (0..count)
-                    .map(|_| rng.gen_range(1..len))
+                    .map(|_| rng.random_range(1..len))
                     .collect::<Vec<_>>();
                 offsets.sort_unstable();
                 offsets.dedup();
@@ -690,9 +690,12 @@ mod tests {
         let first = plan(&config, 17);
         assert_eq!(first, plan(&config, 17));
         // Fixed seed exercises random truncation and chunk boundary selection.
-        // Seed 17 cuts after the first extra reply and splits the prefix ten ways.
-        assert_eq!(first.truncate_at, Some(28));
-        assert_eq!(first.chunk_ends, [2, 5, 12, 13, 15, 21, 23, 24, 25, 28]);
+        // Seed 17 cuts within the first extra reply and splits the prefix 16 ways.
+        assert_eq!(first.truncate_at, Some(25));
+        assert_eq!(
+            first.chunk_ends,
+            [1, 2, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15, 18, 19, 22, 25]
+        );
         for seed in 0..128 {
             let p = config.plan(seed, 9, "command", "upstream", 17);
             let bytes = p.wire_bytes(vec![b'x'; 17]);

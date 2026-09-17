@@ -3,7 +3,7 @@
 //! `DEPTH INNER` weights `TARGET ANY` toward nested headers and halves the
 //! automatic root fault's probability per nesting level of the reply.
 
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
 
 use crate::error::{AppError, AppResult};
@@ -238,7 +238,7 @@ pub(crate) fn mutate_length(
                     LengthCorruption::Boundary,
                     LengthCorruption::Overflow,
                 ];
-                KINDS[rng.gen_range(0..KINDS.len())]
+                KINDS[rng.random_range(0..KINDS.len())]
             });
             let replacement = corrupt_length(header.original, kind, rng);
             (header, kind, replacement)
@@ -260,7 +260,7 @@ pub(crate) fn mutate_length(
 }
 
 fn should_apply(probability: f64, rng: &mut ChaCha20Rng) -> bool {
-    probability > 0.0 && rng.gen_range(0.0..100.0) < probability
+    probability > 0.0 && rng.random_range(0.0..100.0) < probability
 }
 
 fn select_header(
@@ -281,7 +281,7 @@ fn select_header(
         {
             candidates += 1;
             // Reservoir selection uses constant candidate storage.
-            if candidates == 1 || rng.gen_range(0..candidates) == 0 {
+            if candidates == 1 || rng.random_range(0..candidates) == 0 {
                 selected = Some(Header {
                     index,
                     path: path.to_owned(),
@@ -310,7 +310,7 @@ fn select_weighted_header(
     if total == 0 {
         return None;
     }
-    let mut remaining = rng.gen_range(0..total);
+    let mut remaining = rng.random_range(0..total);
     let mut index = 0;
     let mut selected = None;
     visit(frame, "root", 0, &mut |frame, path, level| {
@@ -402,7 +402,7 @@ fn corrupt_length(
                 "-9223372036854775809",
                 "340282366920938463463374607431768211456",
             ];
-            VALUES[rng.gen_range(0..VALUES.len())].to_owned()
+            VALUES[rng.random_range(0..VALUES.len())].to_owned()
         }
     }
 }
@@ -412,7 +412,7 @@ fn choose_different(
     values: &[i128],
     rng: &mut ChaCha20Rng,
 ) -> String {
-    let index = rng.gen_range(0..values.len());
+    let index = rng.random_range(0..values.len());
     let value = if values[index] == original {
         values[(index + 1) % values.len()]
     } else {
@@ -637,14 +637,14 @@ mod tests {
         // These seeds exercise invalid negatives, 32/64-bit boundaries,
         // and decimal overflow, including a value beyond u128::MAX.
         for (kind, seed, expected) in [
-            ("NEGATIVE", 0, "-9223372036854775808"),
+            ("NEGATIVE", 1, "-9223372036854775808"),
             ("NEGATIVE", 2, "-2"),
-            ("NEGATIVE", 5, "-3"),
-            ("BOUNDARY", 0, "18446744073709551615"),
+            ("NEGATIVE", 0, "-3"),
+            ("BOUNDARY", 1, "18446744073709551615"),
             ("BOUNDARY", 4, "4294967296"),
             ("OVERFLOW", 0, "-9223372036854775809"),
             ("OVERFLOW", 1, "340282366920938463463374607431768211456"),
-            ("OVERFLOW", 2, "18446744073709551616"),
+            ("OVERFLOW", 8, "18446744073709551616"),
         ] {
             let mut config =
                 config(&["LENGTH", "TARGET", "root.1", "KIND", kind]);
@@ -670,23 +670,23 @@ mod tests {
             parse_frame(b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n").unwrap();
         let command_hash = deterministic_hash(b"MGET a b\r\n");
         let reply_hash = deterministic_hash(&original.encode());
-        // Seeds 0, 1, and 3 select a root boundary, nested overflow,
+        // Seeds 100, 77, and 11 select a root boundary, nested overflow,
         // and nested off-by-one respectively.
         for (seed, path, kind, expected) in [
             (
-                0,
+                100,
                 "root",
                 LengthCorruption::Boundary,
                 "*1\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
             ),
             (
-                1,
+                77,
                 "root.0",
                 LengthCorruption::Overflow,
                 "*2\r\n$18446744073709551616\r\nfoo\r\n$3\r\nbar\r\n",
             ),
             (
-                3,
+                11,
                 "root.0",
                 LengthCorruption::Longer,
                 "*2\r\n$4\r\nfoo\r\n$3\r\nbar\r\n",
@@ -734,8 +734,8 @@ mod tests {
             mutate_reply(&config, 9, "command", "upstream", &original)
         };
 
-        // Seed 2 still reaches the root; seed 3 lengthens the first bulk.
-        let result = run(MutationDepth::Inner, 2);
+        // Seed 6 still reaches the root; seed 3 lengthens the first bulk.
+        let result = run(MutationDepth::Inner, 6);
         assert_eq!(result.bytes, b"*3\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
         assert_eq!(result.mutations[0].path, "root");
         let result = run(MutationDepth::Inner, 3);
@@ -796,7 +796,7 @@ mod tests {
 
         // Seed 0 keeps the outer shell valid while the leaf still changes.
         let result = run(b"*1\r\n*1\r\n:1\r\n", MutationDepth::Inner, 0);
-        assert_eq!(result.bytes, b"*1\r\n*1\r\n:4294967295\r\n");
+        assert_eq!(result.bytes, b"*1\r\n*1\r\n:-2147483648\r\n");
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.mutations[0].path, "root.0.0");
     }

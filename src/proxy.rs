@@ -1144,6 +1144,7 @@ mod tests {
                 connection_ids: Arc::new(AtomicU64::new(id + 1)),
                 command_ids: Arc::new(AtomicU64::new(0)),
                 local_slots: None,
+                cluster_sim: None,
                 redirection_map: ClusterRedirectionMap::default(),
             };
             let target = ProxyTarget {
@@ -3344,6 +3345,7 @@ mod tests {
                 command_ids: Arc::new(AtomicU64::new(0)),
                 local_slots: None,
                 cluster_sim: None,
+                cluster_sim: None,
                 redirection_map: ClusterRedirectionMap::default(),
             };
             let command_ids = state.command_ids.clone();
@@ -5182,6 +5184,7 @@ mod tests {
                 connection_ids: Arc::new(AtomicU64::new(0)),
                 command_ids: Arc::new(AtomicU64::new(0)),
                 local_slots: None,
+                cluster_sim: None,
                 cluster_sim: None,
                 redirection_map: ClusterRedirectionMap::default(),
             };

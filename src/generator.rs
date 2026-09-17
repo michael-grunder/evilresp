@@ -1,7 +1,7 @@
 //! Bounded RESP generation and scalar corpora. Protocol selection constrains
 //! generated trees; it does not negotiate or translate upstream replies.
 
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
 
 use crate::error::{AppError, AppResult};
@@ -179,11 +179,11 @@ impl GeneratorConfig {
     }
 
     fn boundary(&self, rng: &mut ChaCha20Rng) -> bool {
-        self.corpus == Corpus::Boundary && rng.gen_ratio(7, 10)
+        self.corpus == Corpus::Boundary && rng.random_ratio(7, 10)
     }
 
     fn violate(&self, rng: &mut ChaCha20Rng) -> bool {
-        self.violations && rng.gen_ratio(1, 5)
+        self.violations && rng.random_ratio(1, 5)
     }
 
     pub(crate) fn frame(&self, rng: &mut ChaCha20Rng) -> Frame {
@@ -231,7 +231,7 @@ impl GeneratorConfig {
         } else {
             kinds.len()
         };
-        self.build(kinds[rng.gen_range(0..available)], rng, depth)
+        self.build(kinds[rng.random_range(0..available)], rng, depth)
     }
 
     fn build(&self, kind: Kind, rng: &mut ChaCha20Rng, depth: usize) -> Frame {
@@ -245,7 +245,7 @@ impl GeneratorConfig {
             Kind::NullBlob => Frame::BulkString(None),
             Kind::NullArray => Frame::Array(None),
             Kind::Null => Frame::Null,
-            Kind::Boolean => Frame::Boolean(rng.r#gen()),
+            Kind::Boolean => Frame::Boolean(rng.random()),
             Kind::Double => Frame::Double(self.double(rng, false)),
             Kind::BigNumber => Frame::BigNumber(self.big_number(rng, false)),
             Kind::BulkError => Frame::BulkError(self.bulk_error(rng)),
@@ -292,7 +292,7 @@ impl GeneratorConfig {
         if self.boundary(rng) {
             *pick(&[0, 1, MAX_ITEMS], rng)
         } else {
-            rng.gen_range(0..=MAX_ITEMS)
+            rng.random_range(0..=MAX_ITEMS)
         }
     }
 
@@ -300,7 +300,7 @@ impl GeneratorConfig {
         if self.boundary(rng) {
             *pick(INTEGERS, rng)
         } else {
-            rng.r#gen()
+            rng.random()
         }
     }
 
@@ -325,10 +325,10 @@ impl GeneratorConfig {
 
     fn blob(&self, rng: &mut ChaCha20Rng) -> Vec<u8> {
         if !self.boundary(rng) {
-            let len = rng.gen_range(0..=256);
-            return (0..len).map(|_| rng.r#gen()).collect();
+            let len = rng.random_range(0..=256);
+            return (0..len).map(|_| rng.random()).collect();
         }
-        if rng.gen_ratio(1, 4) {
+        if rng.random_ratio(1, 4) {
             return pick(BIG_NUMBERS, rng).as_bytes().to_vec();
         }
         let len = *pick(SIZES, rng);
@@ -344,7 +344,7 @@ impl GeneratorConfig {
         if overflow || self.boundary(rng) {
             pick(DOUBLES, rng).to_string()
         } else {
-            let value = f64::from_bits(rng.r#gen());
+            let value = f64::from_bits(rng.random());
             if value.is_finite() {
                 value.to_string()
             } else {
@@ -360,8 +360,8 @@ impl GeneratorConfig {
         if overflow || self.boundary(rng) {
             pick(BIG_NUMBERS, rng).to_string()
         } else {
-            let sign = if rng.r#gen() { "-" } else { "" };
-            format!("{sign}{}", rng.r#gen::<u128>())
+            let sign = if rng.random() { "-" } else { "" };
+            format!("{sign}{}", rng.random::<u128>())
         }
     }
 
@@ -388,7 +388,7 @@ impl GeneratorConfig {
         let sideband = depth < MAX_DEPTH;
         let kinds = if sideband { 5 } else { 3 };
         let kinds = kinds + usize::from(self.protocol == Protocol::Resp2);
-        match rng.gen_range(0..kinds) {
+        match rng.random_range(0..kinds) {
             0 => Frame::Double("1e".to_owned()),
             1 => Frame::BigNumber("12x".to_owned()),
             2 => Frame::VerbatimString(b"bad".to_vec()),
@@ -413,7 +413,7 @@ impl GeneratorConfig {
         match frame {
             Frame::Integer(value) => {
                 let next = if overflow {
-                    if rng.r#gen() { i64::MAX } else { i64::MIN }
+                    if rng.random() { i64::MAX } else { i64::MIN }
                 } else {
                     self.integer(rng)
                 };
@@ -495,13 +495,13 @@ fn invalid(message: &str) -> AppError {
 }
 
 fn pick<'a, T>(items: &'a [T], rng: &mut ChaCha20Rng) -> &'a T {
-    &items[rng.gen_range(0..items.len())]
+    &items[rng.random_range(0..items.len())]
 }
 
 fn ascii(rng: &mut ChaCha20Rng, max: usize) -> String {
-    let len = rng.gen_range(0..=max);
+    let len = rng.random_range(0..=max);
     (0..len)
-        .map(|_| char::from(rng.gen_range(0x21_u8..=0x7e)))
+        .map(|_| char::from(rng.random_range(0x21_u8..=0x7e)))
         .collect()
 }
 
@@ -517,7 +517,7 @@ fn different_number(next: String, current: &str) -> String {
 
 fn overflow_text(current: &[u8], rng: &mut ChaCha20Rng) -> String {
     let values = [i64::MAX.to_string(), u64::MAX.to_string()];
-    let index = usize::from(rng.r#gen::<bool>());
+    let index = usize::from(rng.random::<bool>());
     if values[index].as_bytes() == current {
         values[1 - index].clone()
     } else {
@@ -728,54 +728,50 @@ mod tests {
         // Seeds select every ordinary root type. Hex fixtures include binary
         // blob contents, and distinguish empty containers from RESP2 nulls.
         for (protocol, seed, expected) in [
-            ("RESP2", 0, "242d310d0a"),
-            ("RESP2", 1, "2b0d0a"),
-            ("RESP2", 2, "2d455252202d310d0a"),
-            ("RESP2", 6, "2a300d0a"),
-            ("RESP2", 9, "3a323134373438333634360d0a"),
-            (
-                "RESP2",
-                14,
-                "2435360d0a330167bca7e62e1efc841bb3c625299be5897932d681f3120d7d8ce873d8fd1e687e26d32a87c558157b02581ee5f202c820410e87bfca850d0a",
-            ),
-            ("RESP2", 20, "2a2d310d0a"),
+            ("RESP2", 13, "242d310d0a"),
+            ("RESP2", 117, "2b0d0a"),
+            ("RESP2", 31, "2d455252202d310d0a"),
+            ("RESP2", 1, "2a300d0a"),
+            ("RESP2", 148, "3a323134373438333634360d0a"),
+            ("RESP2", 26, "24320d0a78a40d0a"),
+            ("RESP2", 15, "2a2d310d0a"),
             (
                 "RESP3",
-                0,
+                116,
                 "3d33370d0a7478743a0d0a00242a0d0a00242a0d0a00242a0d0a00242a0d0a00242a0d0a00242a0d0a000d0a",
             ),
-            ("RESP3", 1, "2d455252200d0a"),
+            ("RESP3", 56, "2d455252200d0a"),
             (
                 "RESP3",
-                2,
+                961,
                 "2433320d0affffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0d0a",
             ),
-            ("RESP3", 5, "2b323134373438333634380d0a"),
-            ("RESP3", 6, "7e300d0a"),
-            ("RESP3", 7, "5f0d0a"),
+            ("RESP3", 149, "2b323134373438333634380d0a"),
+            ("RESP3", 5, "7e300d0a"),
+            ("RESP3", 30, "5f0d0a"),
             (
                 "RESP3",
-                8,
+                77,
                 "283334303238323336363932303933383436333436333337343630373433313736383231313435350d0a",
             ),
             (
                 "RESP3",
-                18,
+                173,
                 "2c322e32323530373338353835303732303134652d3330380d0a",
             ),
-            ("RESP3", 19, "2a300d0a"),
-            ("RESP3", 23, "23740d0a"),
+            ("RESP3", 15, "2a300d0a"),
+            ("RESP3", 3, "23740d0a"),
             (
                 "RESP3",
-                28,
-                "25310d0a24350d0a6b65793a300d0a2a340d0a2b31383434363734343037333730393535313631360d0a5f0d0a3a343239343936373239360d0a5f0d0a",
+                280,
+                "25320d0a24350d0a6b65793a300d0a282d3135363832363534373537373132313039393139393238303836383831353637303833373032330d0a24350d0a6b65793a310d0a25300d0a",
             ),
             (
                 "RESP3",
-                33,
-                "2132340d0a455252202d393232333337323033363835343737353830390d0a",
+                38,
+                "2132340d0a4552522031383434363734343037333730393535313631360d0a",
             ),
-            ("RESP3", 50, "3a2d323134373438333634390d0a"),
+            ("RESP3", 129, "3a2d323134373438333634390d0a"),
         ] {
             let mut config = EvilConfig::default();
             config
@@ -801,18 +797,18 @@ mod tests {
         let original = Frame::BulkString(Some(b"upstream".to_vec()));
         // Seeds select zero, one byte, and the three sizes around 4 KiB.
         for (seed, size, pattern) in [
-            (1, 4095, b"a".as_slice()),
-            (2, 1, b"\r\n\0$*"),
-            (6, 4097, b"a"),
-            (8, 4096, b"\r\n\0$*"),
-            (11, 0, b"a"),
+            (257, 4095, b"a".as_slice()),
+            (43, 1, b"\r\n\0$*"),
+            (192, 4097, b"a"),
+            (131, 4096, b"\r\n\0$*"),
+            (33, 0, b"a"),
         ] {
             let mut config = EvilConfig::default();
             for args in [
                 ["DEBUG", "EVIL", "MODE", "MUTATE"],
                 ["DEBUG", "EVIL", "MUTATIONS", "ONE"],
                 ["DEBUG", "EVIL", "FRAMING", "OFF"],
-                // Legacy uniform selection keeps these seeds' sizes.
+                // These fixtures use uniform frame selection.
                 ["DEBUG", "EVIL", "DEPTH", "ANY"],
             ] {
                 config
@@ -837,17 +833,17 @@ mod tests {
         // These seeds explicitly select each violation branch, including
         // a well-formed RESP3 boolean under the RESP2 profile.
         for (protocol, seed, expected) in [
-            ("RESP2", 4, "#t\r\n"),
-            ("RESP2", 5, ",1e\r\n"),
-            ("RESP2", 7, "=3\r\nbad\r\n"),
-            ("RESP2", 13, ">1\r\n$7\r\nmessage\r\n"),
-            ("RESP2", 27, "(12x\r\n"),
-            ("RESP2", 35, "|1\r\n+meta\r\n:1\r\n"),
-            ("RESP3", 4, "|1\r\n+meta\r\n:1\r\n"),
-            ("RESP3", 5, ",1e\r\n"),
-            ("RESP3", 7, "=3\r\nbad\r\n"),
-            ("RESP3", 11, ">1\r\n$7\r\nmessage\r\n"),
-            ("RESP3", 27, "(12x\r\n"),
+            ("RESP2", 50, "#t\r\n"),
+            ("RESP2", 7, ",1e\r\n"),
+            ("RESP2", 34, "=3\r\nbad\r\n"),
+            ("RESP2", 11, ">1\r\n$7\r\nmessage\r\n"),
+            ("RESP2", 13, "(12x\r\n"),
+            ("RESP2", 4, "|1\r\n+meta\r\n:1\r\n"),
+            ("RESP3", 50, "|1\r\n+meta\r\n:1\r\n"),
+            ("RESP3", 7, ",1e\r\n"),
+            ("RESP3", 11, "=3\r\nbad\r\n"),
+            ("RESP3", 4, ">1\r\n$7\r\nmessage\r\n"),
+            ("RESP3", 13, "(12x\r\n"),
         ] {
             let mut config = EvilConfig::default();
             config

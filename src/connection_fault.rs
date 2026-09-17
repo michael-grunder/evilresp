@@ -1,6 +1,6 @@
 //! Deterministic connection-fault configuration and plans; no socket I/O.
 
-use rand::Rng;
+use rand::RngExt;
 use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
@@ -119,14 +119,14 @@ impl FaultConfig {
             &format!("connection-fault:v1:{command_hash}"),
             "",
         );
-        if !rng.gen_bool(probability / 100.0) {
+        if !rng.random_bool(probability / 100.0) {
             return None;
         }
         let after_bytes = match self.point {
             FaultPoint::Before | FaultPoint::After => 0,
             FaultPoint::Reply => response_len,
             FaultPoint::Random if response_len > 0 => {
-                rng.gen_range(0..response_len)
+                rng.random_range(0..response_len)
             }
             FaultPoint::Random => 0,
             FaultPoint::Bytes(n) if n <= response_len => n,

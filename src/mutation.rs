@@ -3,7 +3,7 @@
 //! `DEPTH INNER` weights every selection toward nested frames so the outer
 //! shell of a reply usually stays valid.
 
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
 
 use crate::evil::{
@@ -140,8 +140,8 @@ fn eligible_max_depth(
     deepest
 }
 
-/// Draw the cumulative weight offset of the frame to mutate. `ANY` keeps the
-/// legacy uniform integer draw so existing seeded output is unchanged.
+/// Draw the cumulative weight offset of the frame to mutate. `ANY` uses a
+/// uniform frame index; `INNER` uses the wider cumulative depth weight.
 fn select_weight(
     frame: &Frame,
     config: &EvilConfig,
@@ -153,8 +153,8 @@ fn select_weight(
     }
     Some(match config.depth {
         // Every weight is one, so the total is an exact frame count.
-        MutationDepth::Any => rng.gen_range(0..total as usize) as u128,
-        MutationDepth::Inner => rng.gen_range(0..total),
+        MutationDepth::Any => rng.random_range(0..total as usize) as u128,
+        MutationDepth::Inner => rng.random_range(0..total),
     })
 }
 
@@ -291,7 +291,7 @@ fn mutate_frame(
 }
 
 fn should_apply(probability: f64, rng: &mut ChaCha20Rng) -> bool {
-    probability > 0.0 && rng.gen_range(0.0..100.0) < probability
+    probability > 0.0 && rng.random_range(0.0..100.0) < probability
 }
 
 fn mutate_one(
@@ -555,9 +555,9 @@ mod tests {
         let legacy = config("MUTATE", "ONE", "REPLACE");
         let weighted = inner(legacy.clone(), "OFF");
 
-        // Seed 0 replaces the first record's score with a null bulk string
+        // Seed 13 replaces the first record's score with a null bulk string
         // while both records and the outer array survive.
-        let result = seeded(&weighted, 0, &original);
+        let result = seeded(&weighted, 13, &original);
         assert_eq!(
             result.bytes,
             b"*2\r\n*2\r\n$1\r\na\r\n$-1\r\n*2\r\n$1\r\nb\r\n:2\r\n"
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.mutations[0].path, "root.0.1");
         assert_eq!(result.mutations[0].kind, MutationKind::RandomFrame);
-        assert_eq!(seeded(&weighted, 0, &original).bytes, result.bytes);
+        assert_eq!(seeded(&weighted, 13, &original).bytes, result.bytes);
 
         let count = |config: &EvilConfig, predicate: fn(&str) -> bool| {
             (0..200_u64)

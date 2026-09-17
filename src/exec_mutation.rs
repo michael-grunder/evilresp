@@ -1,7 +1,7 @@
 //! Focused, correctly framed edits to the outer EXEC result array. A selected
 //! edit replaces generic RESP mutation so other result contents survive.
 
-use rand::Rng;
+use rand::RngExt;
 
 use crate::error::{AppError, AppResult};
 use crate::evil::{
@@ -114,17 +114,17 @@ pub(crate) fn mutate_reply(
         &format!("exec:{command_hash}"),
         upstream_hash,
     );
-    if rng.gen_range(0.0..100.0) >= config.exec.probability {
+    if rng.random_range(0.0..100.0) >= config.exec.probability {
         return None;
     }
     let action = if config.exec.action == ExecAction::Random {
         let actions =
             [ExecAction::Remove, ExecAction::Duplicate, ExecAction::Swap];
-        actions[rng.gen_range(0..if can_swap { 3 } else { 2 })]
+        actions[rng.random_range(0..if can_swap { 3 } else { 2 })]
     } else {
         config.exec.action
     };
-    let index = rng.gen_range(0..items.len());
+    let index = rng.random_range(0..items.len());
     let mut result = items.clone();
     let mut other_index = None;
     let kind = match action {
@@ -141,7 +141,7 @@ pub(crate) fn mutate_reply(
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| **item != items[index]);
-            let selected = rng.gen_range(0..candidates.clone().count());
+            let selected = rng.random_range(0..candidates.clone().count());
             // can_swap guarantees a distinct partner for every first index.
             let (other, _) = candidates.nth(selected)?;
             result.swap(index, other);

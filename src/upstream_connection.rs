@@ -1,23 +1,37 @@
 //! Replace failed upstream sessions at the next forwarding boundary.
-//! Never retry a command: a missing reply does not imply it did not execute.
+//! Read unsolicited events independently without replaying failed commands.
 
-use tokio::io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use std::collections::VecDeque;
+use std::future::pending;
+
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::net::{TcpStream, UnixStream};
 use tracing::{info, warn};
 
 use crate::cli::Endpoint;
 use crate::connection::ProxyStream;
-use crate::error::AppResult;
-use crate::resp::read_raw_frame;
+use crate::error::{AppError, AppResult};
+use crate::pubsub::Subscriptions;
+use crate::push::PushDelivery;
 use crate::upstream_identity::UpstreamIdentity;
+use crate::upstream_reader::UpstreamReader;
 
 pub(crate) const UNAVAILABLE_REPLY: &[u8] =
     b"-ERR evilresp upstream unavailable; command outcome unknown; upstream session reset; retry on next command\r\n";
 
+pub(crate) enum Exchange {
+    Reply(Vec<u8>),
+    Subscription,
+    Unavailable(AppError),
+}
+
 struct Session {
-    read: BufReader<ReadHalf<ProxyStream>>,
+    read: UpstreamReader,
     write: WriteHalf<ProxyStream>,
     identity: UpstreamIdentity,
+    subscriptions: Subscriptions,
+    held: Option<AppResult<Vec<u8>>>,
+    pending_identity: VecDeque<usize>,
 }
 
 impl Session {
@@ -28,31 +42,36 @@ impl Session {
             }
             Endpoint::Unix(path) => Box::new(UnixStream::connect(path).await?),
         };
-        let (read, write) = tokio::io::split(stream);
-        let mut session = Self {
-            read: BufReader::new(read),
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = BufReader::new(read);
+        let mut identity = UpstreamIdentity::default();
+        identity.apply(&mut read, &mut write).await?;
+        Ok(Self {
+            read: UpstreamReader::new(read),
             write,
-            identity: UpstreamIdentity::default(),
-        };
-        session
-            .identity
-            .apply(&mut session.read, &mut session.write)
-            .await?;
-        Ok(session)
+            identity,
+            subscriptions: Subscriptions::default(),
+            held: None,
+            pending_identity: VecDeque::new(),
+        })
     }
 
-    async fn exchange(
-        &mut self,
-        command: &[u8],
-        argv: &[String],
-    ) -> AppResult<Vec<u8>> {
-        self.write.write_all(command).await?;
-        self.write.flush().await?;
-        let reply = read_raw_frame(&mut self.read).await?;
-        if self.identity.retry_after(argv, &reply) {
-            self.identity.apply(&mut self.read, &mut self.write).await?;
+    async fn next(&mut self) -> AppResult<Vec<u8>> {
+        Ok(match self.held.take() {
+            Some(frame) => frame?,
+            None => self.read.next().await?,
+        })
+    }
+
+    async fn identity_step(&mut self) -> AppResult<Option<Vec<u8>>> {
+        let bytes = self.next().await?;
+        if !self.subscriptions.is_event(&bytes, None)
+            && let Some(index) = self.pending_identity.pop_front()
+        {
+            self.identity.observe(index, &bytes)?;
+            return Ok(None);
         }
-        Ok(reply)
+        Ok(Some(bytes))
     }
 }
 
@@ -79,11 +98,7 @@ impl UpstreamConnection {
         }
     }
 
-    pub(crate) async fn exchange(
-        &mut self,
-        command: &[u8],
-        argv: &[String],
-    ) -> AppResult<Vec<u8>> {
+    async fn send(&mut self, command: &[u8]) -> AppResult<()> {
         if self.session.is_none() {
             match Session::connect(&self.endpoint).await {
                 Ok(session) => {
@@ -99,21 +114,162 @@ impl UpstreamConnection {
                 }
             }
         }
-        // The initial session or the successful reconnect is present here.
-        let result = self
-            .session
-            .as_mut()
-            .expect("connected upstream")
-            .exchange(command, argv)
-            .await;
-        if let Err(error) = &result {
-            // Drop both halves and any partial reply before another command.
-            self.session = None;
-            warn!(connection_id = self.connection_id,
-                upstream = %self.endpoint, %error,
-                "upstream connection lost; retrying on next forwarded command");
+        let session = self.connected();
+        session.write.write_all(command).await?;
+        session.write.flush().await?;
+        Ok(())
+    }
+
+    fn connected(&mut self) -> &mut Session {
+        // Used only after a successful send and before discarding the session.
+        self.session.as_mut().expect("connected upstream")
+    }
+
+    fn discard(&mut self, error: &AppError) {
+        self.session = None;
+        warn!(connection_id = self.connection_id,
+            upstream = %self.endpoint, %error,
+            "upstream connection lost; retrying on next forwarded command");
+    }
+
+    /// Cancellation-safe. Ordinary frames and EOF stay held for the next
+    /// exchange, preserving recovery at forwarding boundaries without emitting
+    /// an unsolicited command error or reconnecting an idle client.
+    pub(crate) async fn next_push(&mut self) -> Vec<u8> {
+        let Some(session) = &mut self.session else {
+            return pending().await;
+        };
+        loop {
+            if session.held.is_none() {
+                match session.identity_step().await {
+                    Ok(None) => continue,
+                    Ok(Some(bytes)) => session.held = Some(Ok(bytes)),
+                    Err(error) => session.held = Some(Err(error)),
+                }
+            }
+            if let Some(Ok(bytes)) = &session.held
+                && session.subscriptions.is_event(bytes, None)
+            {
+                session.subscriptions.observe(bytes, None);
+                // The event was just checked above.
+                return session.held.take().unwrap().unwrap();
+            }
+            return pending().await;
         }
-        result
+    }
+
+    /// Upstream failures become Unavailable; event-delivery failures propagate
+    /// to close the client rather than masquerading as an upstream failure.
+    pub(crate) async fn forward<W: AsyncWrite + Unpin>(
+        &mut self,
+        command: &[u8],
+        argv: &[String],
+        push: &mut PushDelivery<'_, W>,
+    ) -> AppResult<Exchange> {
+        // Finish metadata retries after the preceding client reply has been
+        // delivered, preserving PUSH ordering without buffering events.
+        while let Some(session) = &mut self.session {
+            if session.held.as_ref().is_some_and(Result::is_err) {
+                // The held frame was just checked to be an error.
+                let error = session.held.take().unwrap().unwrap_err();
+                self.discard(&error);
+                return Ok(Exchange::Unavailable(error));
+            }
+            if session.pending_identity.is_empty() {
+                break;
+            }
+            match session.identity_step().await {
+                Ok(Some(bytes)) => {
+                    session.subscriptions.observe(&bytes, None);
+                    push.deliver(bytes).await?;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.discard(&error);
+                    return Ok(Exchange::Unavailable(error));
+                }
+            }
+        }
+        if let Err(error) = self.send(command).await {
+            self.discard(&error);
+            return Ok(Exchange::Unavailable(error));
+        }
+        let mut subscription = self.connected().subscriptions.pending(argv);
+        let reply = loop {
+            let bytes = match self.connected().next().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.discard(&error);
+                    return Ok(Exchange::Unavailable(error));
+                }
+            };
+            if self
+                .connected()
+                .subscriptions
+                .is_event(&bytes, subscription.as_ref())
+            {
+                let completed = self
+                    .connected()
+                    .subscriptions
+                    .observe(&bytes, subscription.as_mut());
+                push.deliver(bytes).await?;
+                if completed {
+                    return Ok(Exchange::Subscription);
+                }
+            } else {
+                break bytes;
+            }
+        };
+        self.connected().subscriptions.observe_reply(argv, &reply);
+        if self.connected().identity.retry_after(argv, &reply) {
+            let commands = self.connected().identity.pending_commands();
+            for (_, command) in &commands {
+                if let Err(error) = self.send(&command.encode()).await {
+                    self.discard(&error);
+                    return Ok(Exchange::Unavailable(error));
+                }
+            }
+            self.connected().pending_identity =
+                commands.into_iter().map(|(index, _)| index).collect();
+        }
+        Ok(Exchange::Reply(reply))
+    }
+
+    #[cfg(test)]
+    async fn exchange(
+        &mut self,
+        command: &[u8],
+        argv: &[String],
+    ) -> AppResult<Vec<u8>> {
+        let mut writer = Vec::new();
+        let mut fingerprints =
+            crate::protocol_fingerprint::ProtocolFingerprints::new();
+        let config = crate::evil::EvilConfig::default();
+        let mut index = 0;
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        match self
+            .forward(
+                command,
+                argv,
+                &mut PushDelivery {
+                    writer: &mut writer,
+                    fingerprints: &mut fingerprints,
+                    config: &config,
+                    index: &mut index,
+                    connection_id: 0,
+                    epoch: 0,
+                    current_epoch: &epoch,
+                    repro: None,
+                },
+            )
+            .await?
+        {
+            Exchange::Reply(bytes) => Ok(bytes),
+            Exchange::Unavailable(error) => Err(error),
+            Exchange::Subscription => {
+                Err(AppError::Proxy("expected ordinary reply".to_owned()))
+            }
+        }
     }
 }
 
@@ -131,6 +287,7 @@ mod tests {
     use crate::cli::TcpEndpoint;
     use crate::connection::ProxyIo;
     use crate::error::AppError;
+    use crate::resp::read_raw_frame;
     use crate::upstream_identity::accept_identity;
 
     const PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
@@ -290,9 +447,12 @@ mod tests {
                 endpoint: Endpoint::Unix("/unused".into()),
                 connection_id: 0,
                 session: Some(Session {
-                    read: BufReader::new(read),
+                    read: UpstreamReader::new(read),
                     write,
                     identity: UpstreamIdentity::default(),
+                    subscriptions: Subscriptions::default(),
+                    held: None,
+                    pending_identity: VecDeque::new(),
                 }),
             };
             let error = upstream.exchange(PING, &[]).await.unwrap_err();

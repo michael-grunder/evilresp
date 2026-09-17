@@ -25,6 +25,25 @@ All notable changes to this project will be documented in this file.
   on the real upstream owner of the slot, with key positions from the upstream
   `COMMAND` table and `COMMAND GETKEYS`. `DEBUG EVIL CLUSTER STATUS` reports
   the current stage; `DEBUG EVIL CLUSTER OFF` restores normal proxying.
+- Deliver asynchronous RESP3 PUSH events, including client-tracking
+  invalidations, to idle clients and between ordinary replies without consuming
+  a reply slot or shared command index. Support RESP2/RESP3 subscriptions,
+  multi-channel acknowledgements, and unsubscribe-without-arguments. Preserve
+  partially read frames while servicing traffic in the other direction and
+  bound upstream read-ahead with backpressure.
+- Add opt-in `DEBUG EVIL PUSH OFF|PAYLOAD|FRAME [PROBABILITY <0..100>]`.
+  PAYLOAD protects event kinds/routing fields and acknowledgements; FRAME
+  permits whole-event value/framing corruption. Events use independent
+  per-client indexes and domain-separated deterministic RNG, survive upstream
+  reconnects, and reset with `MODE RESET`. PUSH settings appear in HELP/STATUS
+  and survive mode changes, resets, and CHAOS presets; OFF mode disables them.
+- Event repro records add a `push` object with event index, original kind, and
+  target. Existing command fields are retained as empty/zero placeholders for
+  these explicitly tagged events. Ordinary command records are unchanged.
+  Event delivery counts accepted bytes in fingerprints and records partial
+  failures. Metadata retries after authentication preserve PUSH/reply order;
+  failures detected after the authentication reply are reported on the next
+  forwarded command.
 
 - Added `DEBUG EVIL DEPTH <ANY|INNER>` to control how nesting depth weights
   mutation targets. `INNER` (the new default) weights each frame by `2^depth`:

@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use tokio::io::AsyncWrite;
 use tracing::{debug, info};
 
 use crate::cli::{Endpoint, TcpEndpoint};
@@ -25,8 +26,11 @@ use crate::cluster_sim_route::{Decision, RouteRequest, route};
 use crate::cluster_sim_timeline::{SimConfig, Timeline};
 use crate::command_keys::{CommandInfo, CommandTable, Keys, parse_getkeys};
 use crate::error::{AppError, AppResult};
+use crate::push::PushDelivery;
 use crate::resp::{Frame, parse_frame};
-use crate::upstream_connection::{UNAVAILABLE_REPLY, UpstreamConnection};
+use crate::upstream_connection::{
+    Exchange, UNAVAILABLE_REPLY, UpstreamConnection,
+};
 
 const REAL_OWNER_UNAVAILABLE: &[u8] =
     b"-ERR evilresp cluster simulation could not reach the real slot owner\r\n";
@@ -117,12 +121,13 @@ impl ClusterSim {
 
     /// Handle `DEBUG EVIL CLUSTER ...`. The command table is loaded once
     /// through the configuring connection's upstream.
-    pub(crate) async fn apply_debug(
+    pub(crate) async fn apply_debug<W: AsyncWrite + Unpin>(
         &self,
         argv: &[String],
         default_seed: u64,
         next_index: u64,
         upstream: &mut UpstreamConnection,
+        push: &mut PushDelivery<'_, W>,
     ) -> AppResult<Frame> {
         let Some(subcommand) = argv.get(3) else {
             return Err(invalid("CLUSTER expects OFF|STATUS|SCENARIO"));
@@ -142,7 +147,7 @@ impl ClusterSim {
                     self.addresses.len(),
                     self.real_primaries,
                 )?;
-                let commands = self.command_table(upstream).await;
+                let commands = self.command_table(upstream, push).await?;
                 self.set_active(Some(Arc::new(Active { timeline, commands })));
                 Ok(ok())
             }
@@ -153,26 +158,26 @@ impl ClusterSim {
         }
     }
 
-    async fn command_table(
+    async fn command_table<W: AsyncWrite + Unpin>(
         &self,
         upstream: &mut UpstreamConnection,
-    ) -> Arc<CommandTable> {
+        push: &mut PushDelivery<'_, W>,
+    ) -> AppResult<Arc<CommandTable>> {
         if let Some(table) = self.cached_commands() {
-            return table;
+            return Ok(table);
         }
         let command = encode_command(&[b"COMMAND".to_vec()]);
-        let table =
-            match upstream.exchange(&command, &["COMMAND".to_owned()]).await {
-                Ok(bytes) => parse_frame(&bytes)
-                    .ok()
-                    .and_then(|frame| CommandTable::parse(&frame)),
-                Err(_) => None,
-            };
+        let table = parse_frame(
+            &exchange_reply(upstream, &command, &["COMMAND".to_owned()], push)
+                .await?,
+        )
+        .ok()
+        .and_then(|frame| CommandTable::parse(&frame));
         let Some(table) = table else {
             debug!(
                 "COMMAND unavailable; cluster simulation uses COMMAND GETKEYS"
             );
-            return Arc::new(CommandTable::default());
+            return Ok(Arc::new(CommandTable::default()));
         };
         let table = Arc::new(table);
         *self
@@ -180,7 +185,7 @@ impl ClusterSim {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(table.clone());
-        table
+        Ok(table)
     }
 
     fn cached_commands(&self) -> Option<Arc<CommandTable>> {
@@ -282,11 +287,12 @@ pub(crate) struct SimConnection {
     prelude: Vec<Vec<u8>>,
 }
 
-pub(crate) struct ExchangeContext<'a> {
+pub(crate) struct ExchangeContext<'a, 'p, W> {
     pub sim: &'a ClusterSim,
     pub own_upstream: &'a Endpoint,
     pub upstream: &'a mut UpstreamConnection,
     pub command_index: u64,
+    pub push: &'a mut PushDelivery<'p, W>,
 }
 
 impl SimConnection {
@@ -352,9 +358,9 @@ impl SimConnection {
 
     /// Run one ordinary command through the simulation. `None` means the
     /// simulation is inactive and the caller forwards normally.
-    pub(crate) async fn exchange(
+    pub(crate) async fn exchange<W: AsyncWrite + Unpin>(
         &mut self,
-        mut ctx: ExchangeContext<'_>,
+        mut ctx: ExchangeContext<'_, '_, W>,
         frame: &Frame,
         bytes: &[u8],
         argv: &[String],
@@ -418,13 +424,11 @@ impl SimConnection {
 
         let info = active.commands.lookup(&raw).cloned();
         if info.as_ref().is_some_and(|info| info.pubsub) {
-            return Some(forward_own(ctx.upstream, bytes, argv).await);
+            return None;
         }
         let keys = match self.keys(&mut ctx, info.as_ref(), &raw).await {
             Ok(keys) => keys,
-            Err(_) => {
-                return Some(Ok(SimOutcome::Reply(UNAVAILABLE_REPLY.to_vec())));
-            }
+            Err(error) => return Some(Err(error)),
         };
         let write = info.as_ref().is_none_or(|info| info.write);
         let loading = info.as_ref().is_some_and(|info| info.loading);
@@ -473,9 +477,9 @@ impl SimConnection {
         })
     }
 
-    async fn keys(
+    async fn keys<W: AsyncWrite + Unpin>(
         &mut self,
-        ctx: &mut ExchangeContext<'_>,
+        ctx: &mut ExchangeContext<'_, '_, W>,
         info: Option<&CommandInfo>,
         raw: &[Vec<u8>],
     ) -> AppResult<Vec<Vec<u8>>> {
@@ -489,18 +493,21 @@ impl SimConnection {
         let mut argv = vec![b"COMMAND".to_vec(), b"GETKEYS".to_vec()];
         argv.extend(raw.iter().cloned());
         let names = ["COMMAND".to_owned(), "GETKEYS".to_owned()];
-        let reply = ctx
-            .upstream
-            .exchange(&encode_command(&argv), &names)
-            .await?;
+        let reply = exchange_reply(
+            ctx.upstream,
+            &encode_command(&argv),
+            &names,
+            ctx.push,
+        )
+        .await?;
         Ok(parse_frame(&reply)
             .map(|frame| parse_getkeys(&frame))
             .unwrap_or_default())
     }
 
-    async fn exec(
+    async fn exec<W: AsyncWrite + Unpin>(
         &mut self,
-        ctx: &mut ExchangeContext<'_>,
+        ctx: &mut ExchangeContext<'_, '_, W>,
         active: &Active,
         stage: usize,
         node: usize,
@@ -550,22 +557,16 @@ impl SimConnection {
         commands.push((exec, vec!["EXEC".to_owned()]));
         let mut last = Vec::new();
         for (bytes, argv) in commands {
-            let reply = self.send(ctx, target.as_ref(), &bytes, &argv).await;
-            match reply {
-                Ok(reply) => last = reply,
-                Err(_) => {
-                    return Ok(SimOutcome::Reply(UNAVAILABLE_REPLY.to_vec()));
-                }
-            }
+            last = self.send(ctx, target.as_ref(), &bytes, &argv).await?;
         }
         Ok(SimOutcome::Reply(last))
     }
 
     /// Execute on the real owner of `slot`, following real redirections a
     /// bounded number of times so real resharding never leaks to clients.
-    async fn forward(
+    async fn forward<W: AsyncWrite + Unpin>(
         &mut self,
-        ctx: &mut ExchangeContext<'_>,
+        ctx: &mut ExchangeContext<'_, '_, W>,
         slot: Option<u16>,
         bytes: &[u8],
         argv: &[String],
@@ -576,26 +577,15 @@ impl SimConnection {
         for _ in 0..=MAX_REAL_REDIRECTS {
             if asking {
                 let command = encode_command(&[b"ASKING".to_vec()]);
-                if self
-                    .send(
-                        ctx,
-                        target.as_ref(),
-                        &command,
-                        &["ASKING".to_owned()],
-                    )
-                    .await
-                    .is_err()
-                {
-                    return Ok(SimOutcome::Reply(UNAVAILABLE_REPLY.to_vec()));
-                }
+                self.send(
+                    ctx,
+                    target.as_ref(),
+                    &command,
+                    &["ASKING".to_owned()],
+                )
+                .await?;
             }
-            let reply = match self.send(ctx, target.as_ref(), bytes, argv).await
-            {
-                Ok(reply) => reply,
-                Err(_) => {
-                    return Ok(SimOutcome::Reply(UNAVAILABLE_REPLY.to_vec()));
-                }
-            };
+            let reply = self.send(ctx, target.as_ref(), bytes, argv).await?;
             match real_redirection(&reply) {
                 Some((ask, endpoint)) => {
                     asking = ask;
@@ -607,9 +597,9 @@ impl SimConnection {
         Ok(SimOutcome::Reply(REAL_OWNER_UNAVAILABLE.to_vec()))
     }
 
-    async fn send(
+    async fn send<W: AsyncWrite + Unpin>(
         &mut self,
-        ctx: &mut ExchangeContext<'_>,
+        ctx: &mut ExchangeContext<'_, '_, W>,
         target: Option<&TcpEndpoint>,
         bytes: &[u8],
         argv: &[String],
@@ -617,7 +607,7 @@ impl SimConnection {
         let own = ctx.own_upstream.as_tcp().map(TcpEndpoint::connect_addr);
         let Some(target) = target.filter(|t| Some(t.connect_addr()) != own)
         else {
-            return ctx.upstream.exchange(bytes, argv).await;
+            return exchange_reply(ctx.upstream, bytes, argv, ctx.push).await;
         };
         let key = target.connect_addr();
         if !self.backing.contains_key(&key) {
@@ -630,12 +620,12 @@ impl SimConnection {
                 let names = parse_frame(command)
                     .map(|frame| frame.argv_lossy())
                     .unwrap_or_default();
-                session.exchange(command, &names).await?;
+                exchange_reply(&mut session, command, &names, ctx.push).await?;
             }
             self.backing.insert(key.clone(), session);
         }
         let session = self.backing.get_mut(&key).expect("inserted above");
-        let result = session.exchange(bytes, argv).await;
+        let result = exchange_reply(session, bytes, argv, ctx.push).await;
         if result.is_err() {
             // Recreate with the prelude rather than reconnect without it.
             self.backing.remove(&key);
@@ -675,17 +665,19 @@ impl SimConnection {
     }
 }
 
-async fn forward_own(
+async fn exchange_reply<W: AsyncWrite + Unpin>(
     upstream: &mut UpstreamConnection,
     bytes: &[u8],
     argv: &[String],
-) -> AppResult<SimOutcome> {
-    Ok(SimOutcome::Reply(
-        match upstream.exchange(bytes, argv).await {
-            Ok(reply) => reply,
-            Err(_) => UNAVAILABLE_REPLY.to_vec(),
-        },
-    ))
+    push: &mut PushDelivery<'_, W>,
+) -> AppResult<Vec<u8>> {
+    match upstream.forward(bytes, argv, push).await? {
+        Exchange::Reply(reply) => Ok(reply),
+        Exchange::Unavailable(_) => Ok(UNAVAILABLE_REPLY.to_vec()),
+        Exchange::Subscription => {
+            Err(AppError::Proxy("expected ordinary reply".to_owned()))
+        }
+    }
 }
 
 /// A real `MOVED`/`ASK` from the backing cluster: `(is_ask, endpoint)`.

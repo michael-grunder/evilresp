@@ -178,6 +178,7 @@ mod tests {
             "EXCLUDE EXEC",
             "CANONICALIZE NONE",
             "DEPTH ANY",
+            "PUSH PAYLOAD PROBABILITY 17",
             "GENERATOR PROTOCOL RESP3",
             "TOPOLOGY REDIRECT TARGET example.test:1234",
             "TRANSPORT FAULT STALL DURATION 42",
@@ -195,6 +196,7 @@ mod tests {
             ProtocolHash::Tlsh
         );
         assert_eq!(config.seed, u64::MAX);
+        assert_eq!(config.push.status(), "push=PAYLOAD push_probability=17.00");
         assert!(config.should_mutate_command(Some("GET")));
         assert!(!config.should_mutate_command(Some("SET")));
         assert!(!config.should_mutate_command(Some("EXEC")));

@@ -32,6 +32,38 @@ fn commands() -> [Frame; 3] {
 }
 
 impl UpstreamIdentity {
+    pub(crate) fn pending_commands(&self) -> Vec<(usize, Frame)> {
+        commands()
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| self.pending[*index])
+            .collect()
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        index: usize,
+        reply: &[u8],
+    ) -> AppResult<()> {
+        match parse_frame(reply)? {
+            Frame::SimpleString(reply) if reply == "OK" => {
+                self.pending[index] = false
+            }
+            Frame::SimpleError(error) => {
+                debug!(index, %error, "upstream identification rejected");
+            }
+            Frame::BulkError(error) => {
+                debug!(index, ?error, "upstream identification rejected");
+            }
+            reply => {
+                return Err(AppError::Proxy(format!(
+                    "upstream identification returned unexpected frame {reply:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn apply<R, W>(
         &mut self,
         read: &mut R,
@@ -41,35 +73,13 @@ impl UpstreamIdentity {
         R: AsyncBufRead + Unpin + Send,
         W: AsyncWrite + Unpin,
     {
-        let commands = commands();
-        for (pending, command) in self.pending.iter().zip(&commands) {
-            if *pending {
-                write.write_all(&command.encode()).await?;
-            }
+        let commands = self.pending_commands();
+        for (_, command) in &commands {
+            write.write_all(&command.encode()).await?;
         }
         write.flush().await?;
-        for (pending, command) in self.pending.iter_mut().zip(&commands) {
-            if !*pending {
-                continue;
-            }
-            match parse_frame(&read_raw_frame(read).await?)? {
-                Frame::SimpleString(reply) if reply == "OK" => *pending = false,
-                Frame::SimpleError(error) => {
-                    debug!(?command, %error, "upstream identification rejected");
-                }
-                Frame::BulkError(error) => {
-                    debug!(
-                        ?command,
-                        ?error,
-                        "upstream identification rejected"
-                    );
-                }
-                reply => {
-                    return Err(AppError::Proxy(format!(
-                        "upstream identification returned unexpected frame {reply:?}"
-                    )));
-                }
-            }
+        for (index, _) in commands {
+            self.observe(index, &read_raw_frame(read).await?)?;
         }
         Ok(())
     }

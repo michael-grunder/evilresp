@@ -14,6 +14,7 @@ use crate::exec_mutation::ExecConfig;
 use crate::framing::FramingConfig;
 use crate::generator::GeneratorConfig;
 use crate::mutation;
+use crate::push::PushConfig;
 use crate::resp::Frame;
 use crate::topology_config::{RedirectConfig, parse_topology};
 use crate::transport::TransportConfig;
@@ -64,6 +65,10 @@ const DEBUG_EVIL_HELP: &[&str] = &[
     "    Select one eligible frame per reply or mutate multiple frames (default MANY).",
     "SEED <seed>",
     "    Set the deterministic seed to an unsigned 64-bit integer (default 0).",
+    "PUSH <OFF|PAYLOAD|FRAME> [PROBABILITY <0..100>]",
+    "    Opt into independent event mutation in MUTATE/OVERFLOW (default OFF).",
+    "    PAYLOAD protects event kinds, channels, and subscription acknowledgements.",
+    "    FRAME permits whole-event value/framing mutation, including acknowledgements.",
     "STATUS",
     "    Return the current connection's configuration.",
     "STRATEGY <PRESERVE|REPLACE>",
@@ -284,6 +289,7 @@ pub struct EvilConfig {
     pub(crate) generator: GeneratorConfig,
     pub(crate) exec: ExecConfig,
     pub(crate) transport: TransportConfig,
+    pub(crate) push: PushConfig,
     include: Vec<FilterSpec>,
     exclude: Vec<FilterSpec>,
 }
@@ -309,6 +315,7 @@ impl Default for EvilConfig {
             generator: GeneratorConfig::default(),
             exec: ExecConfig::default(),
             transport: TransportConfig::default(),
+            push: PushConfig::default(),
             include: Vec::new(),
             exclude,
         }
@@ -402,6 +409,10 @@ impl EvilConfig {
             }
             "EXEC" => {
                 self.exec = ExecConfig::parse(&argv[3..])?;
+                Ok(DebugResult::ok())
+            }
+            "PUSH" => {
+                self.push = PushConfig::parse(&argv[3..])?;
                 Ok(DebugResult::ok())
             }
             "TRANSPORT" => {
@@ -563,7 +574,7 @@ impl EvilConfig {
 
     pub fn status(&self) -> String {
         format!(
-            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} depth={} {} {} {} {} {}",
+            "mode={} seed={} probability={:.2} topology_probability={:.2} canonicalize={} include=[{}] exclude=[{}] strategy={} mutations={} depth={} {} {} {} {} {} {}",
             self.mode,
             self.seed,
             self.probability,
@@ -582,6 +593,7 @@ impl EvilConfig {
                 RedirectConfig::status,
             ),
             self.exec.status(),
+            self.push.status(),
         )
     }
 }
@@ -1326,6 +1338,7 @@ mod tests {
             "INCLUDE",
             "MODE",
             "MUTATIONS",
+            "PUSH",
             "SEED",
             "STATUS",
             "STRATEGY",

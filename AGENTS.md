@@ -72,6 +72,9 @@ is a thin binary that parses the CLI, initializes logging, and calls
 | `connection.rs`           | Socket reset support, termination, and explicitly opted-in bounded stalls. |
 | `upstream_identity.rs`    | Best-effort upstream connection naming and library metadata, with retries after authentication. |
 | `upstream_connection.rs`  | Upstream session lifecycle and reconnecting at forwarding boundaries without replaying failed commands. |
+| `upstream_reader.rs`      | Bounded background frame reads that preserve partial frames across command/event selection. |
+| `pubsub.rs`               | Subscription acknowledgement tracking and protocol-aware RESP2 event classification. |
+| `push.rs`                 | Opt-in event mutation, independent event indexes, fingerprinted delivery, and event repro records. |
 
 Add new modules around a responsibility (parsing, model, execution, I/O,
 config), not around an incidental category. Prefer a new focused file over
@@ -89,12 +92,21 @@ them need a test proving they still hold.
   time, thread ids, or map iteration order into that path.
   Topology faults also use the configured target and mapped topology/current
   listener as explicit inputs, never connection identity or hidden retry state.
+  PUSH/Pub/Sub mutation instead uses `(seed, per-client event index,
+  SHA256("evilresp:push:v1"), SHA256(original event bytes))`, with no
+  canonicalization or command association. Every delivered event consumes an
+  event index; reconnects preserve it and `MODE RESET` restarts it.
 - **Same input, same bytes on the wire.** There is regression coverage for
   identical evil sessions producing identical protocol output; keep it green.
 - **Local commands never reach the upstream.** `DEBUG EVIL`, `DEBUG CHAOS`,
   `DEBUG PROTOCOL`, and `MONITOR` are answered by evilresp itself. (Enabling a
   cluster scenario sends one internal `COMMAND` upstream to load key specs;
   its reply never reaches the client.)
+- **Events never consume ordinary reply slots or shared command indexes.**
+  PUSH and RESP2 Pub/Sub events are delivered while idle and between replies.
+  Track subscription completion from original acknowledgements, never mutated
+  bytes. RESP3 ordinary arrays remain replies even while subscribed. PUSH
+  mutation is opt-in and independent of command filters and transport faults.
 - **Clients can always bootstrap.** `CLUSTER SLOTS`, `CLUSTER SHARDS`, and
   `CLUSTER NODES` bypass reply mutation and do not consume a command index
   in cluster mode. While a cluster simulation is active they (and

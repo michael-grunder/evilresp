@@ -31,6 +31,7 @@ use crate::evil::{
 use crate::protocol_fingerprint::{
     ProtocolDirection, ProtocolFingerprints, parse_debug_protocol,
 };
+use crate::push::PushDelivery;
 use crate::repro::{ReproRecord, ReproWriter};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
 use crate::stats::Stats;
@@ -40,7 +41,9 @@ use crate::topology_evil::{
 };
 use crate::transaction::TransactionCommands;
 use crate::transport::{self, DeliveryPlan};
-use crate::upstream_connection::{UNAVAILABLE_REPLY, UpstreamConnection};
+use crate::upstream_connection::{
+    Exchange, UNAVAILABLE_REPLY, UpstreamConnection,
+};
 
 const MONITOR_BUFFER: usize = 1024;
 
@@ -241,9 +244,31 @@ async fn proxy_connection(
         &target.listen,
         connection_id,
     );
+    let mut push_index = 0;
 
     loop {
-        let command_bytes = match read_raw_frame(&mut client_read).await {
+        let result = {
+            let command = read_raw_frame(&mut client_read);
+            tokio::pin!(command);
+            loop {
+                tokio::select! {
+                    result = &mut command => break result,
+                    bytes = upstream.next_push() => {
+                        PushDelivery {
+                            writer: &mut client_write,
+                            fingerprints: &mut fingerprints,
+                            config: &config,
+                            index: &mut push_index,
+                            connection_id,
+                            epoch: reset_epoch,
+                            current_epoch: &state.reset_epoch,
+                            repro: state.repro.as_ref(),
+                        }.deliver(bytes).await?;
+                    }
+                }
+            }
+        };
+        let command_bytes = match result {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(());
@@ -314,9 +339,23 @@ async fn proxy_connection(
                 .is_some_and(|sub| sub.eq_ignore_ascii_case("CLUSTER"))
         {
             publish_monitor_command(&state, connection_id, &command_frame);
-            let response =
-                apply_debug_cluster(&state, &argv, config.seed, &mut upstream)
-                    .await;
+            let response = apply_debug_cluster(
+                &state,
+                &argv,
+                config.seed,
+                &mut upstream,
+                &mut PushDelivery {
+                    writer: &mut client_write,
+                    fingerprints: &mut fingerprints,
+                    config: &config,
+                    index: &mut push_index,
+                    connection_id,
+                    epoch: reset_epoch,
+                    current_epoch: &state.reset_epoch,
+                    repro: state.repro.as_ref(),
+                },
+            )
+            .await?;
             write_client_frame(&mut client_write, &mut fingerprints, &response)
                 .await?;
             continue;
@@ -335,6 +374,7 @@ async fn proxy_connection(
                 reset_incrementing_state(&state, &mut reset_epoch).await;
                 client_write.write_all(&response).await?;
                 fingerprints.reset();
+                push_index = 0;
             } else {
                 write_client_bytes(
                     &mut client_write,
@@ -385,20 +425,36 @@ async fn proxy_connection(
             && (is_cluster_shards(&argv) || is_cluster_nodes(&argv))
         {
             publish_monitor_command(&state, connection_id, &command_frame);
-            let upstream_bytes =
-                match upstream.exchange(&command_bytes, &argv).await {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        transaction_commands = TransactionCommands::default();
-                        write_client_bytes(
-                            &mut client_write,
-                            &mut fingerprints,
-                            UNAVAILABLE_REPLY,
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
+            let upstream_bytes = match upstream
+                .forward(
+                    &command_bytes,
+                    &argv,
+                    &mut PushDelivery {
+                        writer: &mut client_write,
+                        fingerprints: &mut fingerprints,
+                        config: &config,
+                        index: &mut push_index,
+                        connection_id,
+                        epoch: reset_epoch,
+                        current_epoch: &state.reset_epoch,
+                        repro: state.repro.as_ref(),
+                    },
+                )
+                .await?
+            {
+                Exchange::Reply(bytes) => bytes,
+                Exchange::Subscription => continue,
+                Exchange::Unavailable(_error) => {
+                    transaction_commands = TransactionCommands::default();
+                    write_client_bytes(
+                        &mut client_write,
+                        &mut fingerprints,
+                        UNAVAILABLE_REPLY,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
             let upstream_frame = parse_frame(&upstream_bytes)?;
             let response = if is_cluster_shards(&argv) {
                 rewrite_cluster_shards(&upstream_frame, &state.redirection_map)
@@ -502,6 +558,16 @@ async fn proxy_connection(
                                         own_upstream: &target.upstream,
                                         upstream: &mut upstream,
                                         command_index: command_id,
+                                        push: &mut PushDelivery {
+                                            writer: &mut client_write,
+                                            fingerprints: &mut fingerprints,
+                                            config: &config,
+                                            index: &mut push_index,
+                                            connection_id,
+                                            epoch: reset_epoch,
+                                            current_epoch: &state.reset_epoch,
+                                            repro: state.repro.as_ref(),
+                                        },
                                     },
                                     &command_frame,
                                     &command_bytes,
@@ -513,14 +579,34 @@ async fn proxy_connection(
                     };
                     let is_simulated = simulated.is_some();
                     let exchanged = match simulated {
-                        Some(Ok(SimOutcome::Reply(bytes))) => Ok(bytes),
+                        Some(Ok(SimOutcome::Reply(bytes))) => {
+                            Exchange::Reply(bytes)
+                        }
                         Some(Ok(SimOutcome::Close)) => return Ok(()),
-                        Some(Err(error)) => Err(error),
-                        None => upstream.exchange(&command_bytes, &argv).await,
+                        Some(Err(error)) => return Err(error),
+                        None => {
+                            upstream
+                                .forward(
+                                    &command_bytes,
+                                    &argv,
+                                    &mut PushDelivery {
+                                        writer: &mut client_write,
+                                        fingerprints: &mut fingerprints,
+                                        config: &config,
+                                        index: &mut push_index,
+                                        connection_id,
+                                        epoch: reset_epoch,
+                                        current_epoch: &state.reset_epoch,
+                                        repro: state.repro.as_ref(),
+                                    },
+                                )
+                                .await?
+                        }
                     };
                     let upstream_bytes = match exchanged {
-                        Ok(bytes) => bytes,
-                        Err(_) => {
+                        Exchange::Reply(bytes) => bytes,
+                        Exchange::Subscription => continue,
+                        Exchange::Unavailable(_) => {
                             transaction_commands =
                                 TransactionCommands::default();
                             write_client_bytes(
@@ -758,12 +844,13 @@ fn apply_debug_evil(
     }
 }
 
-async fn apply_debug_cluster(
+async fn apply_debug_cluster<W: AsyncWrite + Unpin>(
     state: &SharedState,
     argv: &[String],
     seed: u64,
     upstream: &mut UpstreamConnection,
-) -> Frame {
+    push: &mut PushDelivery<'_, W>,
+) -> AppResult<Frame> {
     let result = match &state.cluster_sim {
         Some(sim) => {
             sim.apply_debug(
@@ -771,6 +858,7 @@ async fn apply_debug_cluster(
                 seed,
                 state.command_ids.load(Ordering::SeqCst),
                 upstream,
+                push,
             )
             .await
         }
@@ -789,13 +877,14 @@ async fn apply_debug_cluster(
                 state.stats.configuration_updated();
                 info!(command = %argv[3..].join(" "), "updated cluster simulation");
             }
-            frame
+            Ok(frame)
         }
-        Err(error) => {
+        Err(error @ AppError::EvilConfig(_)) => {
             state.stats.command_rejected();
             warn!(%error, "rejected DEBUG EVIL CLUSTER command");
-            Frame::SimpleError(format!("ERR {error}"))
+            Ok(Frame::SimpleError(format!("ERR {error}")))
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -1033,6 +1122,412 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncRead;
     use tokio::net::{TcpStream, UnixStream};
+
+    struct PushHarness {
+        client: BufReader<UnixStream>,
+        upstream: BufReader<UnixStream>,
+        state: SharedState,
+        task: tokio::task::JoinHandle<AppResult<()>>,
+        path: PathBuf,
+    }
+
+    impl PushHarness {
+        async fn new(id: u64, repro: Option<ReproWriter>) -> Self {
+            let path = unique_socket_path("push-upstream");
+            let listener = UnixListener::bind(&path).unwrap();
+            let state = SharedState {
+                stats: Arc::new(Stats::default()),
+                repro,
+                monitor: monitor_sender(),
+                reset_barrier: Arc::new(RwLock::new(())),
+                reset_epoch: Arc::new(AtomicU64::new(0)),
+                connection_ids: Arc::new(AtomicU64::new(id + 1)),
+                command_ids: Arc::new(AtomicU64::new(0)),
+                local_slots: None,
+                redirection_map: ClusterRedirectionMap::default(),
+            };
+            let target = ProxyTarget {
+                upstream: Endpoint::Unix(path.clone()),
+                listen: Endpoint::Unix(unique_socket_path("push-unused")),
+            };
+            let (client, server) = UnixStream::pair().unwrap();
+            let task = tokio::spawn(proxy_connection(
+                Box::new(server),
+                target,
+                state.clone(),
+                id,
+                0,
+            ));
+            let (upstream, _) = listener.accept().await.unwrap();
+            let upstream =
+                crate::upstream_identity::accept_identity(upstream).await;
+            Self {
+                client: BufReader::new(client),
+                upstream: BufReader::new(upstream),
+                state,
+                task,
+                path,
+            }
+        }
+
+        async fn command(&mut self, args: &[&str]) {
+            self.client
+                .get_mut()
+                .write_all(&resp_command(args))
+                .await
+                .unwrap();
+        }
+
+        async fn forwarded(&mut self, args: &[&str]) {
+            assert_eq!(
+                read_raw_frame(&mut self.upstream).await.unwrap(),
+                resp_command(args)
+            );
+        }
+
+        async fn event(&mut self, bytes: &[u8]) {
+            self.upstream.get_mut().write_all(bytes).await.unwrap();
+        }
+
+        async fn reply(&mut self, expected: &[u8]) {
+            assert_eq!(
+                read_raw_frame(&mut self.client).await.unwrap(),
+                expected
+            );
+        }
+
+        async fn configure(&mut self, options: &[&str]) {
+            self.command(&[&["DEBUG", "EVIL"], options].concat()).await;
+            self.reply(b"+OK\r\n").await;
+        }
+
+        async fn finish(self) {
+            drop(self.client);
+            self.task.await.unwrap().unwrap();
+            drop(self.upstream);
+            std::fs::remove_file(self.path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn push_mutations_replay_across_connections_and_reset_with_event_repro_records()
+     {
+        let path = unique_socket_path("push-repro");
+        let repro = ReproWriter::open(&path).await.unwrap();
+        let mut runs = Vec::new();
+        for id in [1, 900] {
+            let mut h = PushHarness::new(id, Some(repro.clone())).await;
+            for options in [
+                vec!["MODE", "MUTATE", "PROBABILITY", "0"],
+                vec!["SEED", "1234"],
+                vec!["PUSH", "PAYLOAD"],
+                vec!["FRAMING", "OFF"],
+                vec!["DEPTH", "ANY"],
+            ] {
+                h.configure(&options).await;
+            }
+            // Different ordinary command indexes must not affect push RNG.
+            if id == 900 {
+                h.command(&["PING"]).await;
+                h.forwarded(&["PING"]).await;
+                h.event(b"+PONG\r\n").await;
+                h.reply(b"+PONG\r\n").await;
+            }
+            let mut output = Vec::new();
+            for _ in 0..2 {
+                h.event(INVALIDATE).await;
+                let bytes = read_raw_frame(&mut h.client).await.unwrap();
+                assert_ne!(bytes, INVALIDATE);
+                output.push(bytes);
+            }
+            assert_eq!(
+                h.state.command_ids.load(Ordering::SeqCst),
+                u64::from(id == 900)
+            );
+            h.configure(&["MODE", "RESET"]).await;
+            h.configure(&["MODE", "MUTATE", "PROBABILITY", "0"]).await;
+            h.event(INVALIDATE).await;
+            h.reply(&output[0]).await;
+            h.command(&["DEBUG", "PROTOCOL", "OUT", "BLAKE3"]).await;
+            let fingerprint = read_bulk_string(&mut h.client).await;
+            assert_eq!(
+                fingerprint,
+                blake3_hex(&[b"+OK\r\n".as_slice(), &output[0]].concat())
+                    .into_bytes()
+            );
+            assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 0);
+            runs.push(output);
+            h.finish().await;
+        }
+        assert_eq!(runs[0], runs[1]);
+        let records = tokio::fs::read_to_string(&path).await.unwrap();
+        let records: Vec<serde_json::Value> = records
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 6);
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(record["push"]["index"], [0, 1, 0][i % 3]);
+            assert_eq!(record["push"]["kind"], "invalidate");
+            assert_eq!(record["command_bytes_hex"], "");
+            assert_eq!(
+                record["upstream_response_bytes_hex"],
+                hex::encode(INVALIDATE)
+            );
+            assert_eq!(
+                record["mutated_response_bytes_hex"],
+                hex::encode(&runs[i / 3][usize::from(i % 3 == 1)])
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_from_another_client_prevents_idle_push_delivery() {
+        let mut h = PushHarness::new(0, None).await;
+        // Advance the shared epoch through the real reset path, as another
+        // client would. The idle connection may not emit an old-epoch event.
+        let mut other_epoch = 0;
+        reset_incrementing_state(&h.state, &mut other_epoch).await;
+        h.event(INVALIDATE).await;
+        let mut byte = [0];
+        assert_eq!(
+            tokio::io::AsyncReadExt::read(&mut h.client, &mut byte)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 0);
+        drop(h.client);
+        assert!(h.task.await.unwrap().is_err());
+        std::fs::remove_file(h.path).unwrap();
+    }
+
+    const INVALIDATE: &[u8] = b">2\r\n$10\r\ninvalidate\r\n*1\r\n$3\r\nkey\r\n";
+
+    #[tokio::test]
+    async fn tracking_pushes_arrive_idle_and_between_replies_with_fragmented_reads()
+     {
+        let mut h = PushHarness::new(10, None).await;
+        h.configure(&["MODE", "MUTATE"]).await;
+        h.configure(&["INCLUDE", "NOT_A_COMMAND"]).await;
+        for (command, reply) in [
+            (vec!["HELLO", "3"], b"%0\r\n".as_slice()),
+            (vec!["CLIENT", "TRACKING", "ON"], b"+OK\r\n"),
+        ] {
+            h.command(&command).await;
+            h.forwarded(&command).await;
+            h.event(reply).await;
+            h.reply(reply).await;
+        }
+        // A partial upstream frame must survive servicing a local command.
+        h.event(&INVALIDATE[..12]).await;
+        h.configure(&["SEED", "12"]).await;
+        h.event(&INVALIDATE[12..]).await;
+        h.reply(INVALIDATE).await;
+
+        // A partial client command must survive delivering an idle push.
+        let get = resp_command(&["GET", "key"]);
+        h.client.get_mut().write_all(&get[..8]).await.unwrap();
+        h.event(INVALIDATE).await;
+        h.reply(INVALIDATE).await;
+        h.client.get_mut().write_all(&get[8..]).await.unwrap();
+        h.forwarded(&["GET", "key"]).await;
+        h.event(&[INVALIDATE, b"$5\r\nvalue\r\n", INVALIDATE].concat())
+            .await;
+        h.reply(INVALIDATE).await;
+        h.reply(b"$5\r\nvalue\r\n").await;
+        h.reply(INVALIDATE).await;
+        assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 3);
+
+        // A second pipelined command must still get its own ordinary reply.
+        h.command(&["PING"]).await;
+        h.command(&["ECHO", "marker"]).await;
+        h.forwarded(&["PING"]).await;
+        h.event(&[INVALIDATE, b"+PONG\r\n"].concat()).await;
+        h.reply(INVALIDATE).await;
+        h.reply(b"+PONG\r\n").await;
+        h.forwarded(&["ECHO", "marker"]).await;
+        h.event(b"$6\r\nmarker\r\n").await;
+        h.reply(b"$6\r\nmarker\r\n").await;
+        assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 5);
+        h.finish().await;
+    }
+
+    fn subscription_event(
+        resp3: bool,
+        kind: &str,
+        channel: Frame,
+        value: Frame,
+    ) -> Vec<u8> {
+        let items = vec![bulk_string(kind), channel, value];
+        if resp3 {
+            Frame::Push(items)
+        } else {
+            Frame::Array(Some(items))
+        }
+        .encode()
+    }
+
+    #[tokio::test]
+    async fn subscribed_clients_receive_all_acks_and_idle_messages_in_both_protocols()
+     {
+        for resp3 in [false, true] {
+            for (subscribe, unsubscribe, message_kind) in [
+                ("SUBSCRIBE", "UNSUBSCRIBE", "message"),
+                ("SSUBSCRIBE", "SUNSUBSCRIBE", "smessage"),
+                ("PSUBSCRIBE", "PUNSUBSCRIBE", "pmessage"),
+            ] {
+                let mut h = PushHarness::new(0, None).await;
+                h.command(&[subscribe, "one", "two"]).await;
+                h.forwarded(&[subscribe, "one", "two"]).await;
+                for (channel, count) in [("one", 1), ("two", 2)] {
+                    let ack = subscription_event(
+                        resp3,
+                        &subscribe.to_ascii_lowercase(),
+                        bulk_string(channel),
+                        Frame::Integer(count),
+                    );
+                    h.event(&ack).await;
+                    h.reply(&ack).await;
+                }
+                let message = if message_kind == "pmessage" {
+                    let items = vec![
+                        bulk_string("pmessage"),
+                        bulk_string("one"),
+                        bulk_string("channel"),
+                        bulk_string("body"),
+                    ];
+                    if resp3 {
+                        Frame::Push(items)
+                    } else {
+                        Frame::Array(Some(items))
+                    }
+                    .encode()
+                } else {
+                    subscription_event(
+                        resp3,
+                        message_kind,
+                        bulk_string("one"),
+                        bulk_string("body"),
+                    )
+                };
+                h.event(&message).await;
+                h.reply(&message).await;
+                h.command(&["PING"]).await;
+                h.forwarded(&["PING"]).await;
+                let pong = if resp3 {
+                    b"+PONG\r\n".to_vec()
+                } else {
+                    resp_command(&["pong", ""])
+                };
+                h.event(&[message.clone(), pong.clone()].concat()).await;
+                h.reply(&message).await;
+                h.reply(&pong).await;
+                h.command(&[unsubscribe]).await;
+                h.forwarded(&[unsubscribe]).await;
+                for (channel, count) in [("one", 1), ("two", 0)] {
+                    let ack = subscription_event(
+                        resp3,
+                        &unsubscribe.to_ascii_lowercase(),
+                        bulk_string(channel),
+                        Frame::Integer(count),
+                    );
+                    h.event(&ack).await;
+                    h.reply(&ack).await;
+                }
+                // Unsubscribing an empty family still has one null-name ack.
+                h.command(&[unsubscribe]).await;
+                h.forwarded(&[unsubscribe]).await;
+                let ack = subscription_event(
+                    resp3,
+                    &unsubscribe.to_ascii_lowercase(),
+                    Frame::BulkString(None),
+                    Frame::Integer(0),
+                );
+                h.event(&ack).await;
+                h.reply(&ack).await;
+                // Outside RESP2 subscription mode, a message-shaped array is
+                // an ordinary reply and must not be swallowed as an event.
+                h.command(&["GET", "array"]).await;
+                h.forwarded(&["GET", "array"]).await;
+                let array = subscription_event(
+                    false,
+                    "message",
+                    bulk_string("one"),
+                    bulk_string("body"),
+                );
+                h.event(&array).await;
+                h.reply(&array).await;
+                assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 5);
+                h.finish().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_subscription_acks_do_not_change_upstream_bookkeeping() {
+        let mut h = PushHarness::new(0, None).await;
+        for options in [
+            vec!["MODE", "MUTATE", "PROBABILITY", "0"],
+            vec!["PUSH", "FRAME", "PROBABILITY", "0"],
+            vec!["FRAMING", "LENGTH", "TARGET", "root", "KIND", "SHORTER"],
+        ] {
+            h.configure(&options).await;
+        }
+        h.command(&["SUBSCRIBE", "one", "two"]).await;
+        h.forwarded(&["SUBSCRIBE", "one", "two"]).await;
+        for (channel, count) in [("one", 1), ("two", 2)] {
+            let ack = subscription_event(
+                true,
+                "subscribe",
+                bulk_string(channel),
+                Frame::Integer(count),
+            );
+            h.event(&ack).await;
+            let mut actual = vec![0; ack.len()];
+            tokio::io::AsyncReadExt::read_exact(&mut h.client, &mut actual)
+                .await
+                .unwrap();
+            let mut expected = ack;
+            expected[1] = b'2';
+            assert_eq!(actual, expected);
+        }
+        h.configure(&["PUSH", "OFF"]).await;
+        h.command(&["UNSUBSCRIBE"]).await;
+        h.forwarded(&["UNSUBSCRIBE"]).await;
+        for (channel, count) in [("one", 1), ("two", 0)] {
+            let ack = subscription_event(
+                true,
+                "unsubscribe",
+                bulk_string(channel),
+                Frame::Integer(count),
+            );
+            h.event(&ack).await;
+            h.reply(&ack).await;
+        }
+        assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 2);
+        h.finish().await;
+    }
+
+    #[tokio::test]
+    async fn failed_subscribe_and_push_before_upstream_loss_do_not_shift_replies()
+     {
+        let mut h = PushHarness::new(0, None).await;
+        h.command(&["SUBSCRIBE", "denied"]).await;
+        h.forwarded(&["SUBSCRIBE", "denied"]).await;
+        h.event(b"-NOPERM denied\r\n").await;
+        h.reply(b"-NOPERM denied\r\n").await;
+        h.command(&["GET", "key"]).await;
+        h.forwarded(&["GET", "key"]).await;
+        h.event(INVALIDATE).await;
+        h.reply(INVALIDATE).await;
+        h.upstream.get_mut().shutdown().await.unwrap();
+        h.reply(UNAVAILABLE_REPLY).await;
+        h.configure(&["PUSH", "PAYLOAD"]).await;
+        assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 2);
+        h.finish().await;
+    }
 
     static SOCKET_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -4669,6 +5164,7 @@ mod tests {
                         &read_raw_frame(&mut stream).await.unwrap(),
                         command
                     );
+                    stream.get_mut().write_all(INVALIDATE).await.unwrap();
                     stream.get_mut().write_all(b"+OK\r\n").await.unwrap();
                 }
                 assert_eq!(
@@ -4703,9 +5199,13 @@ mod tests {
             .concat();
             client.get_mut().write_all(&input).await.unwrap();
             let mut output = Vec::new();
-            for expected in
-                [&b"-WRONGPASS bad password\r\n"[..], reply, b"+PONG\r\n"]
-            {
+            let mut expected = vec![&b"-WRONGPASS bad password\r\n"[..], reply];
+            expected.extend(std::iter::repeat_n(
+                INVALIDATE,
+                3 - usize::from(custom_name),
+            ));
+            expected.push(b"+PONG\r\n");
+            for expected in expected {
                 let actual = read_raw_frame(&mut client).await.unwrap();
                 assert_eq!(actual, expected);
                 output.extend(actual);

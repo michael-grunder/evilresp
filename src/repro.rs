@@ -40,6 +40,8 @@ impl ReproWriter {
 
 #[derive(Debug, Serialize)]
 pub struct ReproRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push: Option<crate::push::PushRecord>,
     pub global_seed: u64,
     pub connection_id: u64,
     pub command_index: u64,
@@ -72,6 +74,7 @@ impl ReproRecord {
         mutations: Vec<AppliedMutation>,
     ) -> Self {
         Self {
+            push: None,
             global_seed,
             connection_id,
             command_index,

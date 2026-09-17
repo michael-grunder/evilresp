@@ -115,6 +115,12 @@ Client commands still pass through unchanged: explicit `CLIENT SETNAME`,
 Identification is best effort, so cleanup tools must account for missing or
 overridden fields.
 
+After authentication, metadata retry replies are consumed internally while
+preserving the order of the client's reply and any subsequent PUSH events.
+Retries finish before the next client command is forwarded. A failure detected
+after delivering the authentication reply is reported at that next forwarding
+boundary; already delivered replies are never replaced.
+
 If upstream I/O detects a disconnect (including EOF, a reset, or a socket
 timeout), evilresp logs a warning and discards that upstream session, including
 any partial reply. The affected command receives
@@ -141,6 +147,35 @@ Ordinary failed commands still consume their command index; cluster bootstrap
 queries remain exempt. Upstream reconnects do not rediscover cluster topology.
 Client disconnects and intentionally injected close/reset/truncation faults
 still end the client connection.
+
+## PUSH messages and subscriptions
+
+Upstream frames are read independently of client commands. RESP3 PUSH frames,
+including client-tracking `invalidate` events, reach idle clients and are
+forwarded in order when interleaved with ordinary replies. A PUSH never
+completes an ordinary pending command. Unknown PUSH kinds are forwarded too.
+
+RESP2 and RESP3 Pub/Sub support `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE`, and
+their unsubscribe counterparts, including multiple acknowledgements for one
+command and unsubscribe-without-arguments. Subscription bookkeeping uses
+original upstream acknowledgements, even when their delivered bytes are
+mutated. RESP2 message arrays are recognized only in subscription context;
+ordinary RESP3 array replies remain ordinary replies while subscribed.
+
+PUSH events and RESP2 Pub/Sub events are unchanged by default, even with
+ordinary reply mutation enabled. Use `DEBUG EVIL PUSH` below to opt into event
+mutation. Events do not consume shared command indexes, and they count toward
+output protocol fingerprints. Subscription commands themselves still consume
+one ordinary command index each. Local `DEBUG` controls remain available to
+subscribed clients.
+
+The upstream reader uses a bounded queue and applies socket backpressure;
+partial frames survive servicing commands and events in the other direction.
+A slow client can still delay further delivery. Commands continue to execute
+one at a time; this does not enable concurrent execution of blocking commands.
+Upstream disconnects retain the recovery policy above: no background reconnect
+or automatic restoration of tracking/subscriptions. An EOF observed while idle
+is held until the next forwarded command can receive the upstream error.
 
 ## MONITOR
 
@@ -240,6 +275,17 @@ refer to the canonicalized outer array before the edit. Other mutations omit
 `exec`; all existing repro fields retain their meaning.
 Repro-file write failures are logged and do not stop proxying.
 
+Mutated PUSH/Pub/Sub events and failed event deliveries add a `push` object
+with `index` (zero-based per-client event index), `kind` (original kind, or
+`null` when unparseable), and `target` (`OFF`, `PAYLOAD`, or `FRAME`). Ordinary
+command records omit `push`. On an event record, `command_index` is the unused
+placeholder `0`, `command_bytes_hex` is empty, and `command_hash` is SHA-256
+of empty bytes; these fields do not associate the event with a command.
+Upstream and mutated response fields contain the original and delivered event.
+Event records use a plain delivery plan and retain partial-write outcomes.
+Unchanged, successfully delivered events do not create records, so event
+indexes in the JSONL may have gaps.
+
 Records retain `mutated_response_bytes_hex` and its hash as the full response
 **before transport faults**. For a connection fault at `BEFORE`, no reply
 was obtained or generated: these response fields contain empty bytes and
@@ -337,6 +383,9 @@ Temperature is not an overall per-reply probability or a guarantee that every
 individual reply gets worse as it rises. Even low temperatures can change
 values to extremes; high temperatures can break framing or close the connection.
 The preset never enables stalls, TCP resets, or external redirect targets.
+It also never opts into PUSH mutation: it preserves the explicit `PUSH`
+target/probability settings. An existing opt-in follows the resulting
+MUTATE settings; temperature zero disables event mutation through `MODE OFF`.
 
 `SEED` accepts an unsigned 64-bit integer. Omit it to retain the connection's
 current seed (including a prior `DEBUG EVIL SEED`; initially `0`). The command
@@ -383,6 +432,7 @@ DEBUG EVIL SEED <seed>
 DEBUG EVIL MODE <OFF|RANDOM|MUTATE|OVERFLOW> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL STRATEGY <PRESERVE|REPLACE>
 DEBUG EVIL MUTATIONS <ONE|MANY>
+DEBUG EVIL PUSH <OFF|PAYLOAD|FRAME> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL DEPTH <ANY|INNER>
 DEBUG EVIL EXEC <OFF|RANDOM|REMOVE|DUPLICATE|SWAP> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLATIONS <OFF|ON>]
@@ -617,8 +667,9 @@ Use `EXEC REMOVE`, `EXEC DUPLICATE`, or `EXEC SWAP` to isolate one operation.
   verbatim formats, standalone push/attribute frames, and RESP3 booleans in
   the RESP2 profile. These are opportunities for deliberate failures, not a
   guarantee that every reply is invalid. Push and attribute generation tests
-  unexpected or incomplete conversations; it does not implement asynchronous
-  push delivery or attributes followed by a normal reply.
+  unexpected or incomplete conversations: such a frame replaces a command
+  reply rather than scheduling an independent event. Attributes followed by
+  a normal reply remain unsupported.
 
 At least one generator option/value pair is required. Options are
 case-insensitive and may appear in any order. Omitted options retain their
@@ -937,10 +988,12 @@ and adds `topology=LEGACY|REDIRECT`; focused mode also reports all redirect
 options. Topology settings survive RESP mode changes and `MODE RESET`.
 
 `DEBUG EVIL MODE RESET` disables RESP evil mode, sets RESP mutation probability
-to zero, resets the deterministic command index, invalidates older client
-connections, and resets the current connection's protocol fingerprints.
+to zero, resets the deterministic command index and current client's event
+index, invalidates older client connections, and resets the current
+connection's protocol fingerprints. Older clients cannot deliver further
+PUSH events after observing the reset epoch.
 It preserves the seed, filters, canonicalization setting, mutation strategy,
-mutation count setting, framing, generator, EXEC and transport configuration, and
+mutation count setting, framing, generator, EXEC, PUSH and transport configuration, and
 topology probability.
 To disable the independent faults too, send `DEBUG EVIL TOPOLOGY 0` and
 `DEBUG EVIL TRANSPORT OFF`.
@@ -1098,6 +1151,58 @@ hostname and unknown-endpoint announcements, TLS ports, and minority-partition
 `cluster_state:fail` are not simulated. Repro records do not identify the
 simulation stage. Use `DEBUG EVIL CLUSTER STATUS` together with the command
 index instead.
+### PUSH mutation
+
+`DEBUG EVIL PUSH OFF` (the default) leaves unsolicited events untouched.
+`PAYLOAD` and `FRAME` opt into event mutation in `MODE MUTATE` or
+`MODE OVERFLOW`; `MODE OFF` and `MODE RANDOM` leave events unchanged. The
+optional probability defaults to 100 and controls value mutation independently
+of ordinary reply probability. Selecting a PUSH target resets its probability
+to the supplied value or 100. `OFF` accepts no options.
+
+- `PAYLOAD`: mutate the key-list/null value of `invalidate`, the payload of
+  `message`/`smessage`, or the payload of `pmessage`. Preserve the outer event
+  type, kind, channel, and pattern. Subscription acknowledgements and unknown
+  event kinds pass unchanged. Explicit length faults are disabled in this
+  mode; generator violations can still produce malformed payload values.
+- `FRAME`: allow the entire event through value and framing mutation,
+  including its kind, routing fields, and subscription acknowledgements.
+  Existing `FRAMING` probability and target rules apply independently of PUSH
+  value probability; paths start at the event root.
+
+Both targets use the connection's `STRATEGY`, `MUTATIONS`, `DEPTH`, and
+`GENERATOR` settings. `STRATEGY PRESERVE` leaves an invalidation's null payload
+unchanged; `REPLACE` can replace it. Payload selection applies depth weighting
+within the payload subtree, and repro paths refer to its position in the full
+event. Command include/exclude filters, canonicalization, EXEC edits, topology
+faults, and transport fault settings do not apply to events. In particular,
+event elements are never sorted, and transport faults still target ordinary
+command replies. A failed subscription command's ordinary error reply follows
+ordinary command rules.
+
+For tracking invalidations with only payload mutation:
+
+```text
+HELLO 3
+CLIENT TRACKING ON
+DEBUG EVIL SEED 1234
+DEBUG EVIL MODE MUTATE PROBABILITY 0
+DEBUG EVIL PUSH PAYLOAD PROBABILITY 25
+```
+
+Read keys on this connection and change them from another connection to
+produce invalidations. Configure Pub/Sub event mutation before subscribing
+when the client library does not allow arbitrary commands in its subscribe
+loop.
+
+Every event consumes one per-client event index, including unmutated events
+and subscription acknowledgements, starting at zero. New clients and
+`MODE RESET` restart this index; upstream reconnects do not. Event RNG uses
+`rng_for(seed, event_index, SHA256("evilresp:push:v1"), SHA256(original_event))`.
+Connection identity, command indexes, and arrival timing are not inputs.
+Reproduce the same event order, bytes, and settings to reproduce mutations;
+real server events and their order depend on the workload. Synchronize
+configuration changes with event producers when replaying a run.
 
 ## DEBUG PROTOCOL
 
@@ -1137,11 +1242,11 @@ mutated or inspected for cluster redirections, and transport faults for them
 are seeded from an empty reply hash. Replies inside a bulk string or bulk
 error are binary-safe and unaffected.
 
-The proxy processes one command and one upstream frame at a time. It supports
-ordinary request/reply traffic and buffered pipelines, but does not handle
-unsolicited Pub/Sub messages, RESP3 push delivery, or attribute frames attached
-to replies as a complete asynchronous conversation. Streamed RESP3 strings
-and aggregates are unsupported. Inline commands are split on whitespace;
+The proxy forwards one command at a time and supports ordinary request/reply
+traffic, buffered pipelines, asynchronous RESP3 PUSH delivery, and RESP2/RESP3
+Pub/Sub. Attribute frames attached to replies are not handled as a complete
+conversation. Streamed RESP3 strings and aggregates are unsupported.
+Inline commands are split on whitespace;
 use RESP arrays for quoting, spaces within arguments, or binary arguments.
 
 ## Development

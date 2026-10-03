@@ -187,7 +187,9 @@ connected clients:
 redis-cli -p 6380 MONITOR
 ```
 
-Monitor lines include the evilresp connection id as a Redis-compatible
+Monitor timestamps use Unix seconds with exactly six fractional digits
+(microseconds), including zeros: `1789609304.274000`.
+Lines include the evilresp connection id as a Redis-compatible
 `unix:evilresp:<id>` client address and quoted command arguments.
 
 ## Logging

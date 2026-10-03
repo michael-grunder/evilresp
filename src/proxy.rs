@@ -1000,7 +1000,7 @@ fn publish_monitor_command(
         return;
     }
 
-    let line = format_monitor_line(connection_id, &argv);
+    let line = format_monitor_line(connection_id, &argv, SystemTime::now());
     let _ = state.monitor.send(line);
 }
 
@@ -1077,10 +1077,12 @@ fn monitor_argv(command: &Frame) -> Vec<Vec<u8>> {
     }
 }
 
-fn format_monitor_line(connection_id: u64, argv: &[Vec<u8>]) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+fn format_monitor_line(
+    connection_id: u64,
+    argv: &[Vec<u8>],
+    now: SystemTime,
+) -> String {
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     let mut line = format!(
         "{}.{:06} [0 unix:evilresp:{}]",
         now.as_secs(),
@@ -1927,6 +1929,7 @@ mod tests {
             command_ids: Arc::new(AtomicU64::new(0)),
             // Cluster mode also inspects every error reply for redirections.
             local_slots: Some(cluster_slots_frame()),
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let proxy = tokio::spawn(proxy_connection(
@@ -2122,6 +2125,37 @@ mod tests {
             upstream.await.unwrap();
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn monitor_timestamps_have_six_fractional_digits() {
+        for (micros, expected) in [
+            (0, "1789609304.000000"),
+            (1, "1789609304.000001"),
+            (273_535, "1789609304.273535"),
+            (273_650, "1789609304.273650"),
+            (273_970, "1789609304.273970"),
+            (274_000, "1789609304.274000"),
+            (999_999, "1789609304.999999"),
+        ] {
+            let now = UNIX_EPOCH + Duration::new(1_789_609_304, micros * 1_000);
+            assert_eq!(
+                format_monitor_line(7, &[b"PING".to_vec()], now),
+                format!("{expected} [0 unix:evilresp:7] \"PING\"")
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_timestamp_before_epoch_falls_back_to_zero() {
+        assert_eq!(
+            format_monitor_line(
+                7,
+                &[b"PING".to_vec()],
+                UNIX_EPOCH - Duration::from_secs(1),
+            ),
+            "0.000000 [0 unix:evilresp:7] \"PING\""
+        );
     }
 
     #[tokio::test]

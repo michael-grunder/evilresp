@@ -25,6 +25,9 @@ All notable changes to this project will be documented in this file.
   on the real upstream owner of the slot, with key positions from the upstream
   `COMMAND` table and `COMMAND GETKEYS`. `DEBUG EVIL CLUSTER STATUS` reports
   the current stage; `DEBUG EVIL CLUSTER OFF` restores normal proxying.
+- Document and regression-test the existing six-digit microsecond format of
+  `MONITOR` timestamps, including leading and trailing zeros.
+
 - Deliver asynchronous RESP3 PUSH events, including client-tracking
   invalidations, to idle clients and between ordinary replies without consuming
   a reply slot or shared command index. Support RESP2/RESP3 subscriptions,

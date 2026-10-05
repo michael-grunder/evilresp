@@ -1,5 +1,6 @@
 //! Select length headers from typed frames and corrupt only their encoding.
 //! Advertised lengths never control allocation or traversal of frame bodies.
+//! Lexical faults (`FRAMING SYNTAX`) live in `syntax.rs`.
 //! `DEPTH INNER` weights `TARGET ANY` toward nested headers and halves the
 //! automatic root fault's probability per nesting level of the reply.
 
@@ -13,12 +14,14 @@ use crate::evil::{
     parse_probability,
 };
 use crate::resp::Frame;
+use crate::syntax::{self, SyntaxConfig};
 
 #[derive(Clone, Debug)]
 pub(crate) enum FramingConfig {
     Auto,
     Off,
     Length(LengthConfig),
+    Syntax(SyntaxConfig),
 }
 
 #[derive(Clone, Debug)]
@@ -29,7 +32,7 @@ pub(crate) struct LengthConfig {
 }
 
 #[derive(Clone, Debug)]
-enum Target {
+pub(crate) enum Target {
     Any,
     Path(String),
 }
@@ -71,14 +74,14 @@ impl Target {
         Ok(Self::Path(path))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Any => "ANY",
             Self::Path(path) => path,
         }
     }
 
-    fn matches(&self, path: &str) -> bool {
+    pub(crate) fn matches(&self, path: &str) -> bool {
         match self {
             Self::Any => true,
             Self::Path(target) => target == path,
@@ -86,10 +89,78 @@ impl Target {
     }
 }
 
+/// Options shared by explicit framing faults. Each command resets omitted
+/// options to probability 100, target ANY, and a random kind (`None`).
+#[derive(Clone, Debug)]
+pub(crate) struct FaultOptions<K> {
+    pub(crate) probability: f64,
+    pub(crate) target: Target,
+    pub(crate) kind: Option<K>,
+}
+
+impl<K> FaultOptions<K> {
+    pub(crate) fn parse(
+        name: &str,
+        argv: &[String],
+        parse_kind: impl Fn(&str) -> AppResult<Option<K>>,
+    ) -> AppResult<Self> {
+        let mut options = Self {
+            probability: 100.0,
+            target: Target::Any,
+            kind: None,
+        };
+        let mut seen = [false; 3];
+        let (pairs, remainder) = argv.as_chunks::<2>();
+        if !remainder.is_empty() {
+            return Err(invalid(&format!(
+                "FRAMING {name} options require a value"
+            )));
+        }
+        for option in pairs {
+            let index = match option[0].to_ascii_uppercase().as_str() {
+                "PROBABILITY" => {
+                    options.probability = parse_probability(&option[1])?;
+                    0
+                }
+                "TARGET" => {
+                    options.target = Target::parse(&option[1])?;
+                    1
+                }
+                "KIND" => {
+                    options.kind = parse_kind(&option[1])?;
+                    2
+                }
+                _ => {
+                    return Err(invalid(&format!(
+                        "FRAMING {name} accepts PROBABILITY, TARGET, and KIND"
+                    )));
+                }
+            };
+            if seen[index] {
+                return Err(invalid(&format!(
+                    "duplicate FRAMING {name} option"
+                )));
+            }
+            seen[index] = true;
+        }
+        Ok(options)
+    }
+
+    pub(crate) fn status(&self, name: &str, kind: Option<&str>) -> String {
+        format!(
+            "framing={name} framing_probability={:.2} framing_target={} framing_kind={}",
+            self.probability,
+            self.target.as_str(),
+            kind.unwrap_or("RANDOM"),
+        )
+    }
+}
+
 impl FramingConfig {
     pub(crate) fn parse(argv: &[String]) -> AppResult<Self> {
+        const USAGE: &str = "FRAMING requires AUTO, OFF, LENGTH, or SYNTAX";
         let Some(mode) = argv.first() else {
-            return Err(invalid("FRAMING requires AUTO, OFF, or LENGTH"));
+            return Err(invalid(USAGE));
         };
         match mode.to_ascii_uppercase().as_str() {
             "AUTO" | "OFF" if argv.len() != 1 => {
@@ -98,74 +169,52 @@ impl FramingConfig {
             "AUTO" => Ok(Self::Auto),
             "OFF" => Ok(Self::Off),
             "LENGTH" => {
-                let mut config = LengthConfig {
-                    probability: 100.0,
-                    target: Target::Any,
-                    kind: None,
-                };
-                let mut seen = [false; 3];
-                let (options, remainder) = argv[1..].as_chunks::<2>();
-                if !remainder.is_empty() {
-                    return Err(invalid(
-                        "FRAMING LENGTH options require a value",
-                    ));
-                }
-                for option in options {
-                    let index = match option[0].to_ascii_uppercase().as_str() {
-                        "PROBABILITY" => {
-                            config.probability = parse_probability(&option[1])?;
-                            0
-                        }
-                        "TARGET" => {
-                            config.target = Target::parse(&option[1])?;
-                            1
-                        }
-                        "KIND" => {
-                            config.kind = match option[1]
-                                .to_ascii_uppercase()
-                                .as_str()
-                            {
-                                "RANDOM" => None,
-                                "SHORTER" => Some(LengthCorruption::Shorter),
-                                "LONGER" => Some(LengthCorruption::Longer),
-                                "NEGATIVE" => Some(LengthCorruption::Negative),
-                                "BOUNDARY" => Some(LengthCorruption::Boundary),
-                                "OVERFLOW" => Some(LengthCorruption::Overflow),
-                                _ => {
-                                    return Err(invalid(
-                                        "KIND requires RANDOM, SHORTER, LONGER, NEGATIVE, BOUNDARY, or OVERFLOW",
-                                    ));
-                                }
-                            };
-                            2
-                        }
-                        _ => {
-                            return Err(invalid(
-                                "FRAMING LENGTH accepts PROBABILITY, TARGET, and KIND",
-                            ));
-                        }
-                    };
-                    if seen[index] {
-                        return Err(invalid("duplicate FRAMING LENGTH option"));
-                    }
-                    seen[index] = true;
-                }
-                Ok(Self::Length(config))
+                let options = FaultOptions::parse(
+                    "LENGTH",
+                    &argv[1..],
+                    |value| {
+                        Ok(match value.to_ascii_uppercase().as_str() {
+                            "RANDOM" => None,
+                            "SHORTER" => Some(LengthCorruption::Shorter),
+                            "LONGER" => Some(LengthCorruption::Longer),
+                            "NEGATIVE" => Some(LengthCorruption::Negative),
+                            "BOUNDARY" => Some(LengthCorruption::Boundary),
+                            "OVERFLOW" => Some(LengthCorruption::Overflow),
+                            _ => {
+                                return Err(invalid(
+                                    "KIND requires RANDOM, SHORTER, LONGER, NEGATIVE, BOUNDARY, or OVERFLOW",
+                                ));
+                            }
+                        })
+                    },
+                )?;
+                Ok(Self::Length(LengthConfig {
+                    probability: options.probability,
+                    target: options.target,
+                    kind: options.kind,
+                }))
             }
-            _ => Err(invalid("FRAMING requires AUTO, OFF, or LENGTH")),
+            "SYNTAX" => Ok(Self::Syntax(SyntaxConfig::parse(&argv[1..])?)),
+            _ => Err(invalid(USAGE)),
         }
+    }
+
+    /// Explicit faults take priority for the single `MUTATIONS ONE` slot.
+    pub(crate) fn is_explicit(&self) -> bool {
+        matches!(self, Self::Length(_) | Self::Syntax(_))
     }
 
     pub(crate) fn status(&self) -> String {
         match self {
             Self::Auto => "framing=AUTO".to_owned(),
             Self::Off => "framing=OFF".to_owned(),
-            Self::Length(config) => format!(
-                "framing=LENGTH framing_probability={:.2} framing_target={} framing_kind={}",
-                config.probability,
-                config.target.as_str(),
-                config.kind.map(kind_name).unwrap_or("RANDOM"),
-            ),
+            Self::Length(config) => FaultOptions {
+                probability: config.probability,
+                target: config.target.clone(),
+                kind: config.kind,
+            }
+            .status("LENGTH", config.kind.map(kind_name)),
+            Self::Syntax(config) => config.status(),
         }
     }
 }
@@ -190,13 +239,17 @@ struct Header {
     original: i128,
 }
 
-pub(crate) fn mutate_length(
+/// Attempt the configured framing fault on an already value-mutated tree.
+pub(crate) fn mutate_framing(
     frame: &Frame,
     config: &EvilConfig,
     rng: &mut ChaCha20Rng,
 ) -> Option<MutatedReply> {
     let (header, kind, replacement) = match &config.framing {
         FramingConfig::Off => return None,
+        FramingConfig::Syntax(options) => {
+            return syntax::mutate(frame, options, config.depth, rng);
+        }
         FramingConfig::Auto => {
             // Preserve the legacy draw order and root-only behavior. INNER
             // treats the root header like any other depth-weighted target.
@@ -250,6 +303,7 @@ pub(crate) fn mutate_length(
             path: header.path,
             kind: MutationKind::WrongLength,
             exec: None,
+            syntax: None,
             length: Some(LengthMutation {
                 kind,
                 original: header.original.to_string(),
@@ -259,7 +313,7 @@ pub(crate) fn mutate_length(
     })
 }
 
-fn should_apply(probability: f64, rng: &mut ChaCha20Rng) -> bool {
+pub(crate) fn should_apply(probability: f64, rng: &mut ChaCha20Rng) -> bool {
     probability > 0.0 && rng.random_range(0.0..100.0) < probability
 }
 
@@ -342,7 +396,7 @@ fn tree_depth(frame: &Frame) -> usize {
     deepest
 }
 
-fn visit(
+pub(crate) fn visit(
     frame: &Frame,
     path: &str,
     depth: usize,

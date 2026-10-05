@@ -43,12 +43,28 @@ impl Frame {
         target: usize,
         replacement: &str,
     ) -> Vec<u8> {
+        self.encode_with_override(
+            target,
+            WireOverride {
+                header: Some(replacement.as_bytes()),
+                ..WireOverride::default()
+            },
+        )
+    }
+
+    /// Override the wire syntax of one frame by pre-order frame index.
+    /// Children are still encoded from the actual tree.
+    pub(crate) fn encode_with_override(
+        &self,
+        target: usize,
+        selected: WireOverride<'_>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         let mut index = 0;
         self.encode_into(&mut out, &mut |_| {
-            let selected = index == target;
+            let matched = index == target;
             index += 1;
-            selected.then_some(replacement)
+            matched.then_some(selected)
         });
         out
     }
@@ -104,90 +120,62 @@ impl Frame {
     fn encode_into<'a>(
         &self,
         out: &mut Vec<u8>,
-        header: &mut impl FnMut(&Frame) -> Option<&'a str>,
+        selected: &mut impl FnMut(&Frame) -> Option<WireOverride<'a>>,
     ) {
-        let replacement = header(self);
+        let wire = selected(self).unwrap_or_default();
+        let len = |count: usize| count.to_string().into_bytes();
         match self {
             Frame::SimpleString(value) => {
-                push_line(out, b'+', value.as_bytes())
+                push_line(out, b'+', value.as_bytes(), wire)
             }
-            Frame::SimpleError(value) => push_line(out, b'-', value.as_bytes()),
+            Frame::SimpleError(value) => {
+                push_line(out, b'-', value.as_bytes(), wire)
+            }
             Frame::Integer(value) => {
-                push_line(out, b':', value.to_string().as_bytes())
+                push_line(out, b':', &value.to_string().into_bytes(), wire)
             }
-            Frame::BulkString(Some(bytes)) => {
-                push_blob(out, b'$', bytes, replacement)
-            }
-            Frame::BulkString(None) => {
-                push_line(out, b'$', replacement.unwrap_or("-1").as_bytes())
-            }
+            Frame::BulkString(Some(bytes)) => push_blob(out, b'$', bytes, wire),
+            Frame::BulkString(None) => push_line(out, b'$', b"-1", wire),
             Frame::Array(Some(items)) => {
-                push_line(
-                    out,
-                    b'*',
-                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
-                );
+                push_line(out, b'*', &len(items.len()), wire);
                 for item in items {
-                    item.encode_into(out, header);
+                    item.encode_into(out, selected);
                 }
             }
-            Frame::Array(None) => {
-                push_line(out, b'*', replacement.unwrap_or("-1").as_bytes())
-            }
-            Frame::Null => out.extend_from_slice(b"_\r\n"),
+            Frame::Array(None) => push_line(out, b'*', b"-1", wire),
+            Frame::Null => push_line(out, b'_', b"", wire),
             Frame::Boolean(value) => {
-                out.extend_from_slice(if *value {
-                    b"#t\r\n"
+                push_line(out, b'#', if *value { b"t" } else { b"f" }, wire)
+            }
+            Frame::Double(value) => {
+                push_line(out, b',', value.as_bytes(), wire)
+            }
+            Frame::BigNumber(value) => {
+                push_line(out, b'(', value.as_bytes(), wire)
+            }
+            Frame::BulkError(bytes) => push_blob(out, b'!', bytes, wire),
+            Frame::VerbatimString(bytes) => push_blob(out, b'=', bytes, wire),
+            Frame::Map(items) | Frame::Attribute(items) => {
+                let prefix = if matches!(self, Frame::Map(_)) {
+                    b'%'
                 } else {
-                    b"#f\r\n"
-                });
-            }
-            Frame::Double(value) => push_line(out, b',', value.as_bytes()),
-            Frame::BigNumber(value) => push_line(out, b'(', value.as_bytes()),
-            Frame::BulkError(bytes) => push_blob(out, b'!', bytes, replacement),
-            Frame::VerbatimString(bytes) => {
-                push_blob(out, b'=', bytes, replacement)
-            }
-            Frame::Map(items) => {
-                push_line(
-                    out,
-                    b'%',
-                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
-                );
+                    b'|'
+                };
+                push_line(out, prefix, &len(items.len()), wire);
                 for (key, value) in items {
-                    key.encode_into(out, header);
-                    value.encode_into(out, header);
+                    key.encode_into(out, selected);
+                    value.encode_into(out, selected);
                 }
             }
-            Frame::Set(items) => {
-                push_line(
-                    out,
-                    b'~',
-                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
-                );
+            Frame::Set(items) | Frame::Push(items) => {
+                let prefix = if matches!(self, Frame::Set(_)) {
+                    b'~'
+                } else {
+                    b'>'
+                };
+                push_line(out, prefix, &len(items.len()), wire);
                 for item in items {
-                    item.encode_into(out, header);
-                }
-            }
-            Frame::Push(items) => {
-                push_line(
-                    out,
-                    b'>',
-                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
-                );
-                for item in items {
-                    item.encode_into(out, header);
-                }
-            }
-            Frame::Attribute(items) => {
-                push_line(
-                    out,
-                    b'|',
-                    replacement.unwrap_or(&items.len().to_string()).as_bytes(),
-                );
-                for (key, value) in items {
-                    key.encode_into(out, header);
-                    value.encode_into(out, header);
+                    item.encode_into(out, selected);
                 }
             }
             Frame::Inline(parts) => {
@@ -201,27 +189,50 @@ impl Frame {
             }
         }
     }
+
+    /// The type byte that starts this frame on the wire, if it has one.
+    pub(crate) fn type_byte(&self) -> Option<u8> {
+        Some(match self {
+            Frame::SimpleString(_) => b'+',
+            Frame::SimpleError(_) => b'-',
+            Frame::Integer(_) => b':',
+            Frame::BulkString(_) => b'$',
+            Frame::Array(_) => b'*',
+            Frame::Null => b'_',
+            Frame::Boolean(_) => b'#',
+            Frame::Double(_) => b',',
+            Frame::BigNumber(_) => b'(',
+            Frame::BulkError(_) => b'!',
+            Frame::VerbatimString(_) => b'=',
+            Frame::Map(_) => b'%',
+            Frame::Set(_) => b'~',
+            Frame::Push(_) => b'>',
+            Frame::Attribute(_) => b'|',
+            Frame::Inline(_) => return None,
+        })
+    }
 }
 
-fn push_line(out: &mut Vec<u8>, prefix: u8, value: &[u8]) {
-    out.push(prefix);
-    out.extend_from_slice(value);
-    out.extend_from_slice(b"\r\n");
+/// Replacement wire bytes for one encoded frame. Each `None` keeps the
+/// canonical encoding; only header-line and blob-body syntax can change.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WireOverride<'a> {
+    pub(crate) prefix: Option<u8>,
+    pub(crate) header: Option<&'a [u8]>,
+    pub(crate) line_end: Option<&'a [u8]>,
+    pub(crate) body_end: Option<&'a [u8]>,
 }
 
-fn push_blob(
-    out: &mut Vec<u8>,
-    prefix: u8,
-    bytes: &[u8],
-    replacement: Option<&str>,
-) {
-    push_line(
-        out,
-        prefix,
-        replacement.unwrap_or(&bytes.len().to_string()).as_bytes(),
-    );
+fn push_line(out: &mut Vec<u8>, prefix: u8, value: &[u8], wire: WireOverride) {
+    out.push(wire.prefix.unwrap_or(prefix));
+    out.extend_from_slice(wire.header.unwrap_or(value));
+    out.extend_from_slice(wire.line_end.unwrap_or(b"\r\n"));
+}
+
+fn push_blob(out: &mut Vec<u8>, prefix: u8, bytes: &[u8], wire: WireOverride) {
+    push_line(out, prefix, &bytes.len().to_string().into_bytes(), wire);
     out.extend_from_slice(bytes);
-    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(wire.body_end.unwrap_or(b"\r\n"));
 }
 
 pub fn parse_frame(bytes: &[u8]) -> AppResult<Frame> {

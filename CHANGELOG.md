@@ -25,6 +25,16 @@ All notable changes to this project will be documented in this file.
   on the real upstream owner of the slot, with key positions from the upstream
   `COMMAND` table and `COMMAND GETKEYS`. `DEBUG EVIL CLUSTER STATUS` reports
   the current stage; `DEBUG EVIL CLUSTER OFF` restores normal proxying.
+- Add `DEBUG EVIL FRAMING SYNTAX [PROBABILITY] [TARGET] [KIND
+  <RANDOM|NUMBER|TERMINATOR|BODY|TYPE>]` for deterministic lexical faults that
+  keep the typed reply intact: non-canonical integer and length spellings
+  (`+5`, `005`, 80-digit padding, spaces, empty, `5x`, `5\0`, `0x5`, `5.0`,
+  `5e0`), wrong header-line terminators, wrong or unchecked-width blob-body
+  terminators, and confusable or unknown type bytes. Selection honors
+  `TARGET` and `DEPTH`, and the fault takes the `MUTATIONS ONE` slot like
+  `FRAMING LENGTH`. Repro mutations gain an optional `syntax` object and the
+  `wrong_syntax` kind; existing fields are unchanged.
+
 - Document and regression-test the existing six-digit microsecond format of
   `MONITOR` timestamps, including leading and trailing zeros.
 

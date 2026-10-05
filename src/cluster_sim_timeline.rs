@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 
@@ -432,11 +432,11 @@ impl Builder {
             .collect::<Vec<_>>();
         if !stale.is_empty() && !candidates.is_empty() {
             candidates.shuffle(&mut self.rng);
-            let count = self.rng.gen_range(1..=candidates.len().div_ceil(2));
+            let count = self.rng.random_range(1..=candidates.len().div_ceil(2));
             let first_stale = self.states.len();
             self.states.extend(stale.iter().cloned());
             for node in candidates.into_iter().take(count) {
-                views[node] = first_stale + self.rng.gen_range(0..stale.len());
+                views[node] = first_stale + self.rng.random_range(0..stale.len());
             }
         }
         self.stages.push(Stage {
@@ -461,19 +461,19 @@ impl Builder {
         let mut state = self.auth();
         let shards = state.shards().len().max(1);
         let max_len = (SLOT_COUNT / (shards * 4)).clamp(1, 512) as u16;
-        let mask = self.rng.gen_range(1_u8..8);
+        let mask = self.rng.random_range(1_u8..8);
         let mut holes = Vec::new();
         if mask & 1 != 0 {
-            let len = self.rng.gen_range(1..=max_len);
+            let len = self.rng.random_range(1..=max_len);
             holes.push((0, len - 1));
         }
         if mask & 2 != 0 {
-            let len = self.rng.gen_range(1..=max_len);
-            let start = self.rng.gen_range(4096..12_288 - len);
+            let len = self.rng.random_range(1..=max_len);
+            let start = self.rng.random_range(4096..12_288 - len);
             holes.push((start, start + len - 1));
         }
         if mask & 4 != 0 {
-            let len = self.rng.gen_range(1..=max_len);
+            let len = self.rng.random_range(1..=max_len);
             let last = (SLOT_COUNT - 1) as u16;
             holes.push((last + 1 - len, last));
         }
@@ -676,11 +676,11 @@ impl Builder {
             return false;
         }
         let node = if !spares.is_empty()
-            && (replicas.is_empty() || self.rng.gen_bool(0.5))
+            && (replicas.is_empty() || self.rng.random_bool(0.5))
         {
-            spares[self.rng.gen_range(0..spares.len())]
+            spares[self.rng.random_range(0..spares.len())]
         } else {
-            let node = replicas[self.rng.gen_range(0..replicas.len())];
+            let node = replicas[self.rng.random_range(0..replicas.len())];
             let previous = self.auth();
             let mut forgotten = previous.clone();
             let entry = &mut forgotten.nodes[node];
@@ -755,7 +755,7 @@ impl Builder {
         if live.len() < 2 || sources.is_empty() {
             return false;
         }
-        let from = sources[self.rng.gen_range(0..sources.len())];
+        let from = sources[self.rng.random_range(0..sources.len())];
         let targets = live
             .iter()
             .copied()
@@ -766,10 +766,10 @@ impl Builder {
         };
         let ranges = state.ranges_of(from);
         let (range_start, range_end) =
-            ranges[self.rng.gen_range(0..ranges.len())];
+            ranges[self.rng.random_range(0..ranges.len())];
         let span = range_end - range_start + 1;
-        let len = self.rng.gen_range(1..=span.min(1024));
-        let start = range_start + self.rng.gen_range(0..=span - len);
+        let len = self.rng.random_range(1..=span.min(1024));
+        let start = range_start + self.rng.random_range(0..=span - len);
         let end = start + len - 1;
 
         let mut migrating = state;
@@ -812,7 +812,7 @@ impl Builder {
     /// A seeded sequence of valid operations that always settles back to a
     /// fully covered, converged cluster.
     fn random_walk(&mut self, steps: usize) {
-        if steps > 0 && self.rng.gen_bool(0.5) {
+        if steps > 0 && self.rng.random_bool(0.5) {
             self.punch_holes();
         }
         for _ in 0..steps {

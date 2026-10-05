@@ -265,7 +265,13 @@ fields.
 Length faults keep `kind: "wrong_length"` and add a `length` object containing
 the applied corruption `kind`, `original` length, and `replacement` length.
 Both lengths are decimal strings, including values beyond integer ranges.
-Other mutations omit `length`. Paths identify the actual encoded target,
+Other mutations omit `length`. `FRAMING SYNTAX` faults use
+`kind: "wrong_syntax"` and add a `syntax` object with the applied `kind`
+(`number`, `terminator`, `body`, or `type`), the `variant` name (for example
+`leading_zeros`, `cr_cr_lf`, `junk`, or `confusable`), and hex-encoded
+`original_hex` and `replacement_hex` spans: the decimal text, the replaced
+CRLF, or the type byte. Other mutations omit `syntax`.
+Paths identify the actual encoded target,
 for example `root.1.0.value` for the value of the first map pair inside the
 second array child. Paths refer to the canonicalized tree; in `MANY`, they
 also reflect preceding value mutation.
@@ -442,6 +448,7 @@ DEBUG EVIL EXEC <OFF|RANDOM|REMOVE|DUPLICATE|SWAP> [PROBABILITY <0.00-100.00>]
 DEBUG EVIL GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLATIONS <OFF|ON>]
 DEBUG EVIL FRAMING <AUTO|OFF>
 DEBUG EVIL FRAMING LENGTH [PROBABILITY <0.00-100.00>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]
+DEBUG EVIL FRAMING SYNTAX [PROBABILITY <0.00-100.00>] [TARGET <ANY|path>] [KIND <RANDOM|NUMBER|TERMINATOR|BODY|TYPE>]
 DEBUG EVIL TRANSPORT OFF
 DEBUG EVIL TRANSPORT [TRUNCATE <OFF|RANDOM|bytes>] [EXTRA <0..16>] [CHUNKS <OFF|RANDOM|offsets>] [PROBABILITY <0.00-100.00>] [FAULT <OFF|CLOSE|RESET|STALL>] [AT <BEFORE|AFTER|REPLY|RANDOM|bytes>] [DURATION <1..3600000>]
 DEBUG EVIL TOPOLOGY <0.00-100.00>
@@ -545,12 +552,14 @@ cases.
 - `AUTO` (default): keep the existing root-only length attempt in `MANY`,
   using the mode's probability. `MUTATE` adds one to the root length;
   `OVERFLOW` advertises `9223372036854775807`. It does nothing in `ONE`.
-- `OFF`: disable all length faults while retaining value mutation.
+- `OFF`: disable all framing faults while retaining value mutation.
 - `LENGTH`: attempt one length fault per reply using its own probability,
   target, and corruption kind. It works even at value probability zero.
   Each `FRAMING LENGTH` command resets omitted options to probability `100`,
   target `ANY`, and kind `RANDOM`. Options can appear in any order;
   duplicate options are rejected. `AUTO` and `OFF` accept no options.
+- `SYNTAX`: attempt one lexical fault per reply instead (see below), with the
+  same option handling and slot rules as `LENGTH`.
 
 `TARGET ANY` selects from eligible length headers, uniformly under
 `DEPTH ANY` and weighted toward nested headers under `DEPTH INNER`. A specific path
@@ -580,6 +589,30 @@ advertised length. A boundary matching the current length is replaced by
 another boundary so the fault changes bytes. Framing targets the original
 canonicalized tree in `ONE`, and the tree after value mutation in `MANY`,
 including generated replacements. A path removed by replacement is skipped.
+
+`FRAMING SYNTAX` leaves the typed tree intact and changes how one frame is
+*spelled* on the wire. It targets hand-written parsers (hiredis, redis-py's
+pure-Python reader, ...) where lenient and strict parsing disagree: many
+spellings decode to the original value under `atoi`/`strtol` yet are invalid
+RESP, while others silently decode to a different value or desynchronize the
+stream. Kinds:
+
+| Kind | Eligible frames | Replacement |
+| --- | --- | --- |
+| `NUMBER` | Integers and every length header, including `-1` nulls. | The decimal text is respelled: `+5`, `005`, 80-digit zero padding, ` 5`, `5 `, empty, `5x`, `5\0`, `0x5`, `5.0`, or `5e0`. Signs are kept (`-0012`, `-0xc`). |
+| `TERMINATOR` | Every frame. | The CRLF ending the header line becomes `\n`, `\r`, `\r\r\n`, `\n\r`, nothing, or `\r\n\r\n`. |
+| `BODY` | Non-null bulk strings, bulk errors, and verbatim strings. | The CRLF after the payload becomes nothing, `\n`, `\r`, `\n\r`, `!!`, two NUL bytes, or `\r\n\r\n`. The two-byte variants catch parsers that skip the terminator without checking it. |
+| `TYPE` | Every frame. | With equal chance, a *confusable* type byte from the same header shape (aggregates `* ~ > % \|`, blobs `$ ! =`, lines `+ - : , ( # _`) or an *unknown* byte (`@`, NUL, `0xff`, space, `\r`). Confusables change how children are counted (`*2` read as a map of two pairs), turn replies into pushes or attributes, or errors into statuses. |
+| `RANDOM` | Any of the above. | Selects a frame first, then one kind applicable to it. |
+
+Frame selection uses `TARGET` and `DEPTH` exactly like `LENGTH` (weighted
+toward nested frames under `DEPTH INNER`); a frame is eligible if any allowed
+kind applies to it. Only the chosen frame's bytes change: children, siblings,
+and payloads are encoded from the actual tree. Simple-string, double, and
+other line contents are never respelled by `NUMBER`. `LENGTH` and `SYNTAX`
+are alternatives; selecting one replaces the other. Some faults (for example
+a missing final terminator) leave a well-behaved client waiting for more data,
+which exercises its timeout handling.
 
 These controls are per connection, appear in `STATUS`, and reject missing,
 invalid, or extra arguments without changing configuration. They do not

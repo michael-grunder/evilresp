@@ -24,6 +24,7 @@ mod push;
 pub mod repro;
 pub mod resp;
 mod stats;
+mod syntax;
 mod topology_config;
 pub mod topology_evil;
 mod transaction;

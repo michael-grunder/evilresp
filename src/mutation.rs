@@ -10,7 +10,7 @@ use crate::evil::{
     AppliedMutation, EvilConfig, EvilMode, MutatedReply, MutationCount,
     MutationDepth, MutationKind, MutationStrategy,
 };
-use crate::framing::{FramingConfig, mutate_length};
+use crate::framing::mutate_framing;
 use crate::resp::Frame;
 
 pub(crate) fn mutate(
@@ -30,8 +30,8 @@ pub(crate) fn mutate(
     // An explicit framing fault has priority for the single mutation slot.
     // If it cannot apply, value mutation still gets its probability check.
     if config.mutation_count == MutationCount::One
-        && matches!(config.framing, FramingConfig::Length(_))
-        && let Some(reply) = mutate_length(&frame, config, rng)
+        && config.framing.is_explicit()
+        && let Some(reply) = mutate_framing(&frame, config, rng)
     {
         return reply;
     }
@@ -68,7 +68,7 @@ pub(crate) fn mutate(
 
     // MANY applies framing to the final typed tree after value mutation.
     if config.mutation_count == MutationCount::Many
-        && let Some(mut reply) = mutate_length(&frame, config, rng)
+        && let Some(mut reply) = mutate_framing(&frame, config, rng)
     {
         mutations.append(&mut reply.mutations);
         reply.mutations = mutations;
@@ -174,6 +174,7 @@ fn mutate_selected(
                 path: path.to_owned(),
                 kind: mutate_one(frame, config, rng),
                 length: None,
+                syntax: None,
                 exec: None,
             });
             return true;
@@ -244,6 +245,7 @@ fn mutate_frame(
             path: path.to_owned(),
             kind,
             length: None,
+            syntax: None,
             exec: None,
         });
         // Do not recursively mutate a replacement's generated descendants.

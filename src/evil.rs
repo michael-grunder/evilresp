@@ -41,10 +41,14 @@ const DEBUG_EVIL_HELP: &[&str] = &[
     "    Selected edits replace generic value/framing mutation; transport still applies.",
     "    Probability defaults to 100, independently of value probability. OFF accepts no options.",
     "FRAMING <AUTO|OFF>",
-    "    Use automatic root length faults or disable length faults.",
+    "    Use automatic root length faults or disable framing faults.",
     "FRAMING LENGTH [PROBABILITY <0..100>] [TARGET <ANY|path>] [KIND <RANDOM|SHORTER|LONGER|NEGATIVE|BOUNDARY|OVERFLOW>]",
     "    Attempt one length fault in MUTATE/OVERFLOW, independent of value probability.",
     "    Omitted options reset to 100, ANY, RANDOM. Paths include root.0 and root.0.value.",
+    "FRAMING SYNTAX [PROBABILITY <0..100>] [TARGET <ANY|path>] [KIND <RANDOM|NUMBER|TERMINATOR|BODY|TYPE>]",
+    "    Attempt one lexical fault in MUTATE/OVERFLOW, replacing FRAMING LENGTH.",
+    "    NUMBER respells an integer or length (+5, 005, ' 5', 5x, 0x5, empty, ...).",
+    "    TERMINATOR/BODY replace a header or blob-body CRLF; TYPE swaps the type byte.",
     "GENERATOR [PROTOCOL <RESP2|RESP3>] [CORPUS <BOUNDARY|RANDOM>] [VIOLATIONS <OFF|ON>]",
     "    Configure generated values; supply at least one option/value pair.",
     "    Omitted options retain their values. VIOLATIONS ON permits malformed values.",
@@ -750,6 +754,8 @@ pub struct AppliedMutation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub length: Option<LengthMutation>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub syntax: Option<SyntaxMutation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<ExecMutation>,
 }
 
@@ -772,6 +778,25 @@ pub struct LengthMutation {
     pub replacement: String,
 }
 
+/// One lexical fault. Hex fields hold the exact replaced span: a numeric
+/// header's text, a CRLF terminator, or a type byte.
+#[derive(Clone, Debug, Serialize)]
+pub struct SyntaxMutation {
+    pub kind: SyntaxCorruption,
+    pub variant: &'static str,
+    pub original_hex: String,
+    pub replacement_hex: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyntaxCorruption {
+    Number,
+    Terminator,
+    Body,
+    Type,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LengthCorruption {
@@ -792,6 +817,7 @@ pub enum MutationKind {
     RandomValue,
     WrongType,
     WrongLength,
+    WrongSyntax,
     OverflowValue,
     TopologyFakeRedirection,
     TopologyWrongRedirectionKind,
@@ -866,6 +892,7 @@ pub fn random_reply(
             path: "root".to_owned(),
             kind: MutationKind::RandomFrame,
             length: None,
+            syntax: None,
             exec: None,
         }],
     }

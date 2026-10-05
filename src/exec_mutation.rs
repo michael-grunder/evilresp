@@ -162,6 +162,7 @@ pub(crate) fn mutate_reply(
             path: "root".to_owned(),
             kind,
             length: None,
+            syntax: None,
             exec: Some(detail),
         }],
     })

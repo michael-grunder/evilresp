@@ -2,6 +2,7 @@ use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::{Level, Metadata, Subscriber};
 use tracing_subscriber::EnvFilter;
@@ -40,23 +41,38 @@ fn subscriber(
     let writer = open_writer(output)?;
     let ansi = *output == LogOutput::Stderr && io::stderr().is_terminal();
     let registry = tracing_subscriber::registry().with(filter);
+    let timer: fn(&mut fmt::format::Writer<'_>) -> std::fmt::Result =
+        |writer| format_timestamp(writer, SystemTime::now());
 
     Ok(match mode {
         LogMode::Human => Box::new(
             registry.with(
                 fmt::layer()
                     .compact()
+                    .with_timer(timer)
                     .with_ansi(ansi)
                     .with_target(false)
                     .with_writer(writer),
             ),
         ),
-        LogMode::Json => {
-            Box::new(registry.with(
-                fmt::layer().json().flatten_event(true).with_writer(writer),
-            ))
-        }
+        LogMode::Json => Box::new(
+            registry.with(
+                fmt::layer()
+                    .json()
+                    .with_timer(timer)
+                    .flatten_event(true)
+                    .with_writer(writer),
+            ),
+        ),
     })
+}
+
+fn format_timestamp(
+    writer: &mut fmt::format::Writer<'_>,
+    now: SystemTime,
+) -> std::fmt::Result {
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    write!(writer, "{}.{:06}", now.as_secs(), now.subsec_micros())
 }
 
 fn open_writer(output: &LogOutput) -> AppResult<BoxMakeWriter> {
@@ -157,7 +173,38 @@ impl Drop for SyslogRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    #[test]
+    fn timestamps_use_unix_seconds_with_six_fractional_digits() {
+        for (now, expected) in [
+            (UNIX_EPOCH, "0.000000"),
+            (UNIX_EPOCH - Duration::from_secs(1), "0.000000"),
+            (
+                UNIX_EPOCH + Duration::new(1_789_609_304, 0),
+                "1789609304.000000",
+            ),
+            (
+                UNIX_EPOCH + Duration::new(1_789_609_304, 1_000),
+                "1789609304.000001",
+            ),
+            (
+                UNIX_EPOCH + Duration::new(1_789_609_304, 274_000_000),
+                "1789609304.274000",
+            ),
+            (
+                UNIX_EPOCH + Duration::new(1_789_609_304, 999_999_999),
+                "1789609304.999999",
+            ),
+        ] {
+            let mut text = String::new();
+            format_timestamp(&mut fmt::format::Writer::new(&mut text), now)
+                .unwrap();
+            assert_eq!(text, expected);
+        }
+    }
 
     #[test]
     fn files_append_complete_human_and_json_events_without_ansi() {
@@ -187,6 +234,16 @@ mod tests {
         assert_eq!(json["message"], "log output test");
         assert_eq!(json["answer"], 42);
         assert_eq!(json["level"], "INFO");
+        for timestamp in [
+            lines[1].split_whitespace().next().unwrap(),
+            json["timestamp"].as_str().unwrap(),
+        ] {
+            let (seconds, micros) = timestamp.split_once('.').unwrap();
+            assert!(!seconds.is_empty());
+            assert!(seconds.bytes().all(|byte| byte.is_ascii_digit()));
+            assert_eq!(micros.len(), 6);
+            assert!(micros.bytes().all(|byte| byte.is_ascii_digit()));
+        }
         std::fs::remove_file(path).unwrap();
     }
 

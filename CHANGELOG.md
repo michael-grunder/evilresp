@@ -222,6 +222,10 @@ All notable changes to this project will be documented in this file.
   connections. While active, bootstrap topology queries return the simulated
   topology instead of the startup snapshot; they still bypass mutation and do
   not consume a command index.
+- Use compact Unix timestamps with six microsecond digits in human and JSON
+  logs for stderr, files, and syslog, replacing fully qualified date strings.
+  JSON timestamps remain strings.
+
 - Migrate random sampling to `rand` 0.10's `RngExt` and `random*` APIs for
   compatibility with the upgraded dependencies. Seeded mutation and delivery
   choices change relative to `rand` 0.8 builds; reproduce cases with the same

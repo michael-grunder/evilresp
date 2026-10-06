@@ -233,6 +233,9 @@ Lines include the evilresp connection id as a Redis-compatible
 ## Logging
 
 Human-readable logs are the default, with color when stderr is a terminal.
+Human and JSON log timestamps use Unix seconds with exactly six fractional
+digits (microseconds), like `1789609304.274000`, for every destination.
+JSON keeps the timestamp as a string.
 Increase verbosity with `-v` or `-vv`. `RUST_LOG`, when valid, overrides the
 verbosity filter. Choose one destination with `--logfile <path|stderr|syslog>`:
 

@@ -44,7 +44,7 @@ logging and Tokio before calling `proxy::run`. Keep `main.rs` that thin.
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `cli.rs`                  | `clap` args, `Endpoint` (`host:port` or `unix:/path`), `LogMode`.                                                             |
 | `daemon.rs`               | Background process launch, session detachment, startup reporting, and runtime initialization. |
-| `logging.rs`              | `tracing-subscriber` setup: human/colored vs JSON lines, verbosity mapping.                                                   |
+| `logging.rs`              | `tracing-subscriber` setup: human/JSON formatting, verbosity, append-only files, stderr, and native syslog. |
 | `stats.rs`                | Process-lifetime monitoring counters and periodic aggregate INFO logs. |
 | `error.rs`                | `AppError` (`thiserror`) and `AppResult<T>`. Add variants here, not ad-hoc types.                                             |
 | `resp.rs`                 | RESP2/RESP3 `Frame` type, parsing, encoding, raw frame reads off a stream.                                                    |

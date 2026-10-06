@@ -11,6 +11,39 @@ pub enum LogMode {
     Json,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LogOutput {
+    Stderr,
+    Syslog,
+    File(PathBuf),
+}
+
+impl FromStr for LogOutput {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "" => {
+                Err("log output must be a path, stderr, or syslog".to_owned())
+            }
+            "stderr" => Ok(Self::Stderr),
+            "syslog" => Ok(Self::Syslog),
+            path => Ok(Self::File(path.into())),
+        }
+    }
+}
+
+impl std::fmt::Display for LogOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stderr => formatter.write_str("stderr (inherited)"),
+            Self::Syslog => formatter
+                .write_str("syslog (identifier: evilresp, facility: daemon)"),
+            Self::File(path) => path.display().fmt(formatter),
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     author,
@@ -30,6 +63,10 @@ Examples:
   Start in the background; stop through any proxy listener:
     evilresp --proxy localhost:6379 --daemonize
     redis-cli -p 6380 DEBUG SHUTDOWN NOSAVE
+
+  Run in the background with syslog or an append-only log file:
+    evilresp --proxy localhost:6379 --daemonize --logfile syslog
+    evilresp --proxy localhost:6379 --daemonize --logfile ./evilresp.log
 
   Record mutations and use JSON logs:
     evilresp --proxy localhost:6379 --repro-file repro.jsonl --log-mode json
@@ -63,6 +100,11 @@ pub struct Cli {
     /// Log format.
     #[arg(long, value_enum, default_value_t = LogMode::Human)]
     pub log_mode: LogMode,
+
+    /// Log destination: a file path (append), stderr, or syslog.
+    /// Defaults to stderr in foreground mode; discarded when daemonized.
+    #[arg(long = "logfile", value_name = "PATH|stderr|syslog")]
+    pub log_output: Option<LogOutput>,
 
     /// Increase logging verbosity. Repeat for trace logs.
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -174,6 +216,30 @@ mod tests {
 
     mod build_metadata {
         include!("../build.rs");
+    }
+
+    #[test]
+    fn logfile_accepts_reserved_names_and_paths() {
+        let args = ["evilresp", "--proxy", "localhost:6379"];
+        assert!(Cli::try_parse_from(args).unwrap().log_output.is_none());
+        for (value, expected) in [
+            ("stderr", LogOutput::Stderr),
+            ("syslog", LogOutput::Syslog),
+            ("/tmp/proxy logs", LogOutput::File("/tmp/proxy logs".into())),
+            ("./syslog", LogOutput::File("./syslog".into())),
+            ("./stderr", LogOutput::File("./stderr".into())),
+        ] {
+            let cli = Cli::try_parse_from(
+                args.into_iter().chain(["--logfile", value]),
+            )
+            .unwrap();
+            assert_eq!(cli.log_output, Some(expected));
+        }
+        for invalid in [vec!["--logfile"], vec!["--logfile", ""]] {
+            assert!(
+                Cli::try_parse_from(args.into_iter().chain(invalid)).is_err()
+            );
+        }
     }
 
     #[test]

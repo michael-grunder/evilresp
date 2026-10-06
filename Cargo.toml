@@ -8,6 +8,7 @@ blake3 = "1.8"
 clap = { version = "4.6", features = ["derive"] }
 tlsh = { package = "fast-tlsh", version = "0.1" }
 hex = "0.4"
+libc = "0.2"
 rand = "0.10"
 rand_chacha = "0.10"
 regex = "1"

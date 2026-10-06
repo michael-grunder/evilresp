@@ -5,7 +5,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::process::{Command, Stdio};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, LogOutput};
 use crate::error::{AppError, AppResult};
 
 unsafe extern "C" {
@@ -15,7 +15,7 @@ unsafe extern "C" {
 
 pub fn run(cli: Cli) -> AppResult<()> {
     if cli.daemonize && !cli.daemon_child {
-        return launch();
+        return launch(&cli);
     }
     let child = cli.daemon_child;
     let result = (|| {
@@ -25,7 +25,11 @@ pub fn run(cli: Cli) -> AppResult<()> {
                 return Err(io::Error::last_os_error().into());
             }
         }
-        crate::logging::init(cli.log_mode, cli.verbose);
+        crate::logging::init(
+            cli.log_mode,
+            cli.verbose,
+            cli.log_output.as_ref(),
+        )?;
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
@@ -37,13 +41,17 @@ pub fn run(cli: Cli) -> AppResult<()> {
     result
 }
 
-fn launch() -> AppResult<()> {
+fn launch(cli: &Cli) -> AppResult<()> {
     let mut child = Command::new(std::env::current_exe()?)
         .arg("--daemon-child")
         .args(std::env::args_os().skip(1))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if cli.log_output == Some(LogOutput::Stderr) {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .spawn()?;
     let result = (|| {
         let mut line = String::new();
@@ -64,6 +72,11 @@ fn launch() -> AppResult<()> {
             for mapping in mappings {
                 println!("  {mapping}");
             }
+            let destination = cli.log_output.as_ref().map_or_else(
+                || "discarded (/dev/null)".to_owned(),
+                ToString::to_string,
+            );
+            println!("  Logs: {destination}");
             Ok(())
         }
         Err(error) => {

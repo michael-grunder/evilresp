@@ -51,20 +51,23 @@ redis-cli -p 6380 DEBUG SHUTDOWN NOSAVE
 ```
 
 The launching command waits for setup. On success it exits with status zero
-and prints the daemon PID plus every `local endpoint -> upstream endpoint`
-mapping, including all primary and replica listeners in cluster mode. All
+and prints the daemon PID, log destination, and every
+`local endpoint -> upstream endpoint` mapping, including all primary and replica
+listeners in cluster mode. All
 listeners run in that one process. Daemon startup checks connection and
 identification for every upstream and binds every listener before reporting
 success. Discovery and each upstream check have a ten-second timeout.
-DNS, connection, identification, listener binding, or repro-file failures are
+DNS, connection, identification, listener binding, log-file, or repro-file failures are
 reported to stderr with context; the command exits nonzero and leaves no
 daemon or partial listeners running. An upstream rejection of `CLUSTER SLOTS`
 (including `NOAUTH`) still permits standalone mode, and rejections of client
 identification remain best effort.
 
 The daemon starts a new session and disconnects its standard streams from
-the terminal. Background logs are discarded; use foreground mode to capture
-logs. The working directory is preserved, so relative Unix socket and
+the terminal, except when `--logfile stderr` explicitly preserves stderr.
+Background logs are discarded unless `--logfile` selects a destination.
+The startup summary always reports the destination, including discarded logs.
+The working directory is preserved, so relative log-file, Unix socket, and
 `--repro-file` paths retain their meaning. Repro recording works in either mode.
 
 `DEBUG SHUTDOWN [NOSAVE]` is case-insensitive and handled locally in both
@@ -229,9 +232,32 @@ Lines include the evilresp connection id as a Redis-compatible
 
 ## Logging
 
-Human-readable colored logs are the default. Increase verbosity with `-v` or
-`-vv`. Logs go to stderr. `RUST_LOG`, when valid, overrides the verbosity
-filter.
+Human-readable logs are the default, with color when stderr is a terminal.
+Increase verbosity with `-v` or `-vv`. `RUST_LOG`, when valid, overrides the
+verbosity filter. Choose one destination with `--logfile <path|stderr|syslog>`:
+
+- A file path creates the file if needed and appends without truncating it.
+  Its parent directory must already exist; an open failure aborts startup and
+  reports the path and cause. Paths are relative to the launching directory.
+- `stderr` writes to standard error. With `--daemonize`, it keeps the caller's
+  stderr open, including shell redirections, after the launcher exits.
+- `syslog` uses the operating system's local syslog service, with identifier
+  `evilresp`, the daemon PID, and facility `daemon`. ERROR, WARN, INFO, and
+  DEBUG/TRACE map to syslog error, warning, info, and debug priorities.
+  Delivery and retention depend on the host's syslog configuration; the native
+  syslog API cannot report delivery failures, including a missing collector.
+
+Without `--logfile`, foreground logs go to stderr and daemon logs are
+discarded. File and syslog output never contain ANSI color codes.
+`--log-mode human|json` selects the format independently of the destination;
+syslog carries the formatted text or JSON as its message body. Use `./stderr`
+or `./syslog` to write a file with one of those reserved names.
+
+```bash
+evilresp --proxy localhost:6379 --daemonize --logfile ./evilresp.log
+evilresp --proxy localhost:6379 --daemonize --logfile syslog
+evilresp --proxy localhost:6379 --daemonize --logfile stderr 2>evilresp.log
+```
 
 At the default INFO level, one `proxy statistics` summary is logged about
 every second, combining all listeners (including cluster nodes). Fields are:

@@ -25,6 +25,12 @@ All notable changes to this project will be documented in this file.
   on the real upstream owner of the slot, with key positions from the upstream
   `COMMAND` table and `COMMAND GETKEYS`. `DEBUG EVIL CLUSTER STATUS` reports
   the current stage; `DEBUG EVIL CLUSTER OFF` restores normal proxying.
+- Add `--logfile <path|stderr|syslog>` for append-only log files, inherited
+  stderr, or native local syslog with per-event severity and the `evilresp`
+  identifier. Daemon startup reports the log destination, including discarded
+  logs, and log-file open failures abort startup. Human and JSON formats work
+  with every destination; color is limited to terminal stderr.
+
 - Add `--daemonize` with startup failure reporting, upstream checks, and a
   success overview containing the daemon PID and every listener mapping.
   Failed startup leaves no background proxy running.

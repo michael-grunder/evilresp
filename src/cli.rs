@@ -27,6 +27,10 @@ Examples:
   Proxy between Unix sockets:
     evilresp --proxy unix:/tmp/redis.sock --listen unix:/tmp/evilresp.sock
 
+  Start in the background; stop through any proxy listener:
+    evilresp --proxy localhost:6379 --daemonize
+    redis-cli -p 6380 DEBUG SHUTDOWN NOSAVE
+
   Record mutations and use JSON logs:
     evilresp --proxy localhost:6379 --repro-file repro.jsonl --log-mode json
 
@@ -44,6 +48,13 @@ pub struct Cli {
     /// this port as the first local node port.
     #[arg(long, default_value = "127.0.0.1:6380")]
     pub listen: Endpoint,
+
+    /// Run in the background after reporting startup success or failure.
+    #[arg(long)]
+    pub daemonize: bool,
+
+    #[arg(long, hide = true, requires = "daemonize")]
+    pub(crate) daemon_child: bool,
 
     /// Append deterministic mutation records as JSON lines.
     #[arg(long)]
@@ -163,6 +174,21 @@ mod tests {
 
     mod build_metadata {
         include!("../build.rs");
+    }
+
+    #[test]
+    fn daemonize_is_opt_in_and_takes_no_value() {
+        let args = ["evilresp", "--proxy", "localhost:6379"];
+        assert!(!Cli::try_parse_from(args).unwrap().daemonize);
+        assert!(
+            Cli::try_parse_from(args.into_iter().chain(["--daemonize"]))
+                .unwrap()
+                .daemonize
+        );
+        assert!(
+            Cli::try_parse_from(args.into_iter().chain(["--daemonize=no"]))
+                .is_err()
+        );
     }
 
     #[test]

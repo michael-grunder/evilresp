@@ -7,6 +7,9 @@ pub type AppResult<T> = Result<T, AppError>;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error("{0}")]
+    Startup(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 

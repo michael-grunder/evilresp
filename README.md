@@ -43,6 +43,39 @@ For a TCP listener with a TCP upstream, `--listen` requires a numeric IP
 address; use brackets for IPv6, for example `[::1]:6380`. The upstream may
 use a hostname.
 
+Use `--daemonize` to start a background process:
+
+```bash
+evilresp --proxy localhost:6379 --daemonize
+redis-cli -p 6380 DEBUG SHUTDOWN NOSAVE
+```
+
+The launching command waits for setup. On success it exits with status zero
+and prints the daemon PID plus every `local endpoint -> upstream endpoint`
+mapping, including all primary and replica listeners in cluster mode. All
+listeners run in that one process. Daemon startup checks connection and
+identification for every upstream and binds every listener before reporting
+success. Discovery and each upstream check have a ten-second timeout.
+DNS, connection, identification, listener binding, or repro-file failures are
+reported to stderr with context; the command exits nonzero and leaves no
+daemon or partial listeners running. An upstream rejection of `CLUSTER SLOTS`
+(including `NOAUTH`) still permits standalone mode, and rejections of client
+identification remain best effort.
+
+The daemon starts a new session and disconnects its standard streams from
+the terminal. Background logs are discarded; use foreground mode to capture
+logs. The working directory is preserved, so relative Unix socket and
+`--repro-file` paths retain their meaning. Repro recording works in either mode.
+
+`DEBUG SHUTDOWN [NOSAVE]` is case-insensitive and handled locally in both
+foreground and daemon mode. It replies `OK`, then stops the entire proxy,
+including all cluster listeners and active clients, from whichever listener
+received it. `NOSAVE` is optional and has no effect: evilresp has no database
+to save. Other arguments return an error without shutting down. Shutdown
+bypasses mutation and transport faults and consumes no command index.
+It does not wait for in-flight commands to finish. Ordinary Redis `SHUTDOWN`
+commands retain their usual forwarding behavior.
+
 Use `unix:/path/to/socket` to proxy an upstream AF_UNIX socket, listen on an
 AF_UNIX socket, or both:
 
@@ -78,8 +111,10 @@ Each replica listener forwards to that actual upstream replica, including
 client `READONLY` and `READWRITE` commands. Replica connections start with
 their own default non-evil configuration, just like primary connections.
 
-Discovery runs once at startup. If the probe fails (including an
-authentication error), the proxy falls back to standalone mode.
+Discovery runs once at startup. In foreground mode, if the probe fails
+(including an authentication error), the proxy falls back to standalone mode.
+Daemon mode also falls back on server errors, but fails startup on discovery
+I/O errors, malformed RESP/topology replies, or timeouts.
 In cluster mode, a redirection to a target with no mapped local listener
 returns `ERR evilresp has no local listener for redirection target`. Restart
 the proxy to discover changed topology, including changed slot ownership or

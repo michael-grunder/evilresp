@@ -10,6 +10,7 @@ mod cluster_sim_timeline;
 mod command_keys;
 mod connection;
 mod connection_fault;
+pub mod daemon;
 pub mod error;
 pub mod evil;
 mod exec_mutation;

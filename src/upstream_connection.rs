@@ -82,6 +82,10 @@ pub(crate) struct UpstreamConnection {
 }
 
 impl UpstreamConnection {
+    pub(crate) async fn check(endpoint: &Endpoint) -> AppResult<()> {
+        Session::connect(endpoint).await.map(|_| ())
+    }
+
     pub(crate) async fn new(endpoint: Endpoint, connection_id: u64) -> Self {
         let session = match Session::connect(&endpoint).await {
             Ok(session) => Some(session),

@@ -25,6 +25,13 @@ All notable changes to this project will be documented in this file.
   on the real upstream owner of the slot, with key positions from the upstream
   `COMMAND` table and `COMMAND GETKEYS`. `DEBUG EVIL CLUSTER STATUS` reports
   the current stage; `DEBUG EVIL CLUSTER OFF` restores normal proxying.
+- Add `--daemonize` with startup failure reporting, upstream checks, and a
+  success overview containing the daemon PID and every listener mapping.
+  Failed startup leaves no background proxy running.
+- Add local `DEBUG SHUTDOWN [NOSAVE]` to stop the whole proxy from any listener,
+  including primary and replica listeners, without forwarding upstream or
+  applying faults. Works in foreground and daemon mode.
+
 - Add `DEBUG EVIL FRAMING SYNTAX [PROBABILITY] [TARGET] [KIND
   <RANDOM|NUMBER|TERMINATOR|BODY|TYPE>]` for deterministic lexical faults that
   keep the typed reply intact: non-canonical integer and length spellings

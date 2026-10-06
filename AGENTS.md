@@ -37,12 +37,13 @@ Tests do not need a running Redis. They spin up in-process fake upstreams
 ## Repository Map
 
 All code lives in one crate: `src/lib.rs` exposes the modules, `src/main.rs`
-is a thin binary that parses the CLI, initializes logging, and calls
-`proxy::run`. Keep `main.rs` that thin.
+is a thin binary that parses the CLI and calls `daemon::run`, which initializes
+logging and Tokio before calling `proxy::run`. Keep `main.rs` that thin.
 
 | Module                    | Owns                                                                                                                          |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `cli.rs`                  | `clap` args, `Endpoint` (`host:port` or `unix:/path`), `LogMode`.                                                             |
+| `daemon.rs`               | Background process launch, session detachment, startup reporting, and runtime initialization. |
 | `logging.rs`              | `tracing-subscriber` setup: human/colored vs JSON lines, verbosity mapping.                                                   |
 | `stats.rs`                | Process-lifetime monitoring counters and periodic aggregate INFO logs. |
 | `error.rs`                | `AppError` (`thiserror`) and `AppResult<T>`. Add variants here, not ad-hoc types.                                             |
@@ -99,7 +100,7 @@ them need a test proving they still hold.
 - **Same input, same bytes on the wire.** There is regression coverage for
   identical evil sessions producing identical protocol output; keep it green.
 - **Local commands never reach the upstream.** `DEBUG EVIL`, `DEBUG CHAOS`,
-  `DEBUG PROTOCOL`, and `MONITOR` are answered by evilresp itself. (Enabling a
+  `DEBUG PROTOCOL`, `DEBUG SHUTDOWN`, and `MONITOR` are answered by evilresp itself. (Enabling a
   cluster scenario sends one internal `COMMAND` upstream to load key specs;
   its reply never reaches the client.)
 - **Events never consume ordinary reply slots or shared command indexes.**
@@ -116,7 +117,7 @@ them need a test proving they still hold.
   deliberately, not casually.
 - **Evil config is per client connection.** New connections start non-evil.
   Shared state is limited to what must be global (command index, reset epoch,
-  monitor fan-out, repro writer, aggregate monitoring counters, and the
+  monitor fan-out, repro writer, aggregate monitoring counters, shutdown signal, and the
   `DEBUG EVIL CLUSTER` scenario). The cluster simulation is the one
   deliberate exception: a cluster client's connections must agree on one
   topology, so it applies to every listener and connection.

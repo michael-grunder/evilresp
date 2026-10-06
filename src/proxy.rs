@@ -3,17 +3,19 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::chaos;
 use crate::cli::{Cli, Endpoint};
-use crate::cluster::{ClusterRedirectionMap, ProxyTarget, Topology, discover};
+use crate::cluster::{
+    ClusterRedirectionMap, ProxyTarget, Topology, discover_with_checks,
+};
 use crate::cluster_rewrite::{
     is_cluster_nodes, is_cluster_shards, rewrite_cluster_nodes,
     rewrite_cluster_shards,
@@ -106,6 +108,7 @@ impl Drop for ProxyListener {
 
 #[derive(Clone)]
 struct SharedState {
+    shutdown: Arc<Notify>,
     stats: Arc<Stats>,
     repro: Option<ReproWriter>,
     monitor: broadcast::Sender<String>,
@@ -120,12 +123,31 @@ struct SharedState {
 
 pub async fn run(cli: Cli) -> AppResult<()> {
     let repro = match &cli.repro_file {
-        Some(path) => Some(ReproWriter::open(path).await?),
+        Some(path) => Some(ReproWriter::open(path).await.map_err(|error| {
+            AppError::Startup(format!(
+                "opening repro file {}: {error}",
+                path.display()
+            ))
+        })?),
         None => None,
     };
     let (monitor, _) = broadcast::channel(MONITOR_BUFFER);
-    let topology = discover(cli.proxy.clone(), cli.listen).await?;
+    let discovery =
+        discover_with_checks(cli.proxy.clone(), cli.listen, cli.daemonize);
+    let topology = if cli.daemonize {
+        tokio::time::timeout(Duration::from_secs(10), discovery)
+            .await
+            .map_err(|_| {
+                AppError::Startup(format!(
+                    "probing upstream {} timed out after 10 seconds",
+                    cli.proxy
+                ))
+            })??
+    } else {
+        discovery.await?
+    };
     let state = SharedState {
+        shutdown: Arc::new(Notify::new()),
         stats: Arc::new(Stats::default()),
         repro,
         monitor,
@@ -138,30 +160,64 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         redirection_map: topology.local_redirection_map(),
     };
 
-    serve_topology(topology, state).await
+    let (bound, mappings) = bind_topology(&topology, cli.daemonize).await?;
+    if cli.daemon_child {
+        crate::daemon::ready(mappings)?;
+    }
+    serve_topology(bound, state).await
+}
+
+async fn bind_topology(
+    topology: &Topology,
+    check_upstreams: bool,
+) -> AppResult<(Vec<(ProxyListener, ProxyTarget)>, Vec<String>)> {
+    let mut bound = Vec::new();
+    let mut mappings = Vec::new();
+    for target in topology.targets() {
+        if check_upstreams {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                UpstreamConnection::check(&target.upstream),
+            ).await.map_err(|_| AppError::Startup(format!(
+                "connecting to/identifying upstream {} timed out after 10 seconds", target.upstream
+            )))?.map_err(|error| AppError::Startup(format!(
+                "connecting to/identifying upstream {}: {error}", target.upstream
+            )))?;
+        }
+        let listener =
+            ProxyListener::bind(&target.listen).await.map_err(|error| {
+                AppError::Startup(format!(
+                    "binding listener {} for upstream {}: {error}",
+                    target.listen, target.upstream
+                ))
+            })?;
+        mappings.push(format!(
+            "{} -> {}",
+            listener.local_endpoint()?,
+            target.upstream
+        ));
+        bound.push((listener, target.clone()));
+    }
+    Ok((bound, mappings))
 }
 
 async fn serve_topology(
-    topology: Topology,
+    bound: Vec<(ProxyListener, ProxyTarget)>,
     state: SharedState,
 ) -> AppResult<()> {
     let mut listeners = JoinSet::new();
-    for target in topology.targets() {
-        let listener = ProxyListener::bind(&target.listen).await?;
+    for (listener, target) in bound {
         let local_endpoint = listener.local_endpoint()?;
         info!(
             listen = %local_endpoint,
             upstream = %target.upstream,
             "listening for RESP clients"
         );
-        listeners.spawn(serve_listener(
-            listener,
-            target.clone(),
-            state.clone(),
-        ));
+        listeners.spawn(serve_listener(listener, target, state.clone()));
     }
 
-    tokio::select! {
+    let result = tokio::select! {
+        () = state.shutdown.notified() => Ok(()),
         _ = state.stats.report() => Ok(()),
         signal = tokio::signal::ctrl_c() => {
             signal?;
@@ -178,7 +234,10 @@ async fn serve_topology(
                 None => Ok(()),
             }
         }
-    }
+    };
+    // Await cancellation so listener sockets and their client tasks are closed.
+    listeners.shutdown().await;
+    result
 }
 
 async fn serve_listener(
@@ -186,8 +245,12 @@ async fn serve_listener(
     target: ProxyTarget,
     state: SharedState,
 ) -> AppResult<()> {
+    let mut clients = JoinSet::new();
     loop {
-        let (client, peer) = listener.accept().await?;
+        let (client, peer) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            Some(_) = clients.join_next(), if !clients.is_empty() => continue,
+        };
         let reset_epoch = state.reset_epoch.load(Ordering::SeqCst);
         let connection_id = state.connection_ids.fetch_add(1, Ordering::SeqCst);
         debug!(%peer, reset_epoch, connection_id, upstream = %target.upstream, "accepted client");
@@ -195,7 +258,7 @@ async fn serve_listener(
         let connection = state.stats.client_connected();
         let target = target.clone();
         let state = state.clone();
-        tokio::spawn(async move {
+        clients.spawn(async move {
             let _connection = connection;
             handle_connection(
                 client,
@@ -308,6 +371,33 @@ async fn proxy_connection(
         }
 
         fingerprints.update(ProtocolDirection::In, &command_bytes);
+
+        if argv.len() >= 2
+            && argv[0].eq_ignore_ascii_case("DEBUG")
+            && argv[1].eq_ignore_ascii_case("SHUTDOWN")
+        {
+            let valid = argv.len() == 2
+                || (argv.len() == 3 && argv[2].eq_ignore_ascii_case("NOSAVE"));
+            let response = if valid {
+                Frame::SimpleString("OK".to_owned())
+            } else {
+                Frame::SimpleError(
+                    "ERR syntax: DEBUG SHUTDOWN [NOSAVE]".to_owned(),
+                )
+            };
+            let result = write_client_frame(
+                &mut client_write,
+                &mut fingerprints,
+                &response,
+            )
+            .await;
+            if valid {
+                state.shutdown.notify_one();
+                return result;
+            }
+            result?;
+            continue;
+        }
 
         if is_monitor(command_name.as_deref()) {
             if argv.len() != 1 {
@@ -1120,10 +1210,167 @@ fn push_monitor_arg(line: &mut String, arg: &[u8]) {
 mod tests {
     use super::*;
     use crate::cli::TcpEndpoint;
+    use crate::cluster::discover;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::io::AsyncRead;
     use tokio::net::{TcpStream, UnixStream};
+
+    #[tokio::test]
+    async fn shutdown_is_local_validated_and_bypasses_faults() {
+        for suffix in [vec![], vec!["nOsAvE"]] {
+            let mut h = PushHarness::new(0, None).await;
+            for args in [
+                vec!["DEBUG", "SHUTDOWN", "SAVE"],
+                vec!["DEBUG", "SHUTDOWN", "NOSAVE", "extra"],
+            ] {
+                h.command(&args).await;
+                h.reply(b"-ERR syntax: DEBUG SHUTDOWN [NOSAVE]\r\n").await;
+            }
+            // Bare Redis SHUTDOWN keeps its ordinary upstream behavior.
+            h.command(&["SHUTDOWN", "NOSAVE"]).await;
+            h.forwarded(&["SHUTDOWN", "NOSAVE"]).await;
+            h.event(b"+OK\r\n").await;
+            h.reply(b"+OK\r\n").await;
+            h.configure(&["MODE", "RANDOM"]).await;
+            h.configure(&["TRANSPORT", "FAULT", "CLOSE", "AT", "BEFORE"])
+                .await;
+            let mut args = vec!["dEbUg", "sHuTdOwN"];
+            args.extend(suffix);
+            h.command(&args).await;
+            h.reply(b"+OK\r\n").await;
+            h.state.shutdown.notified().await;
+            assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                read_raw_frame(&mut h.upstream).await.unwrap_err().kind(),
+                ErrorKind::UnexpectedEof
+            );
+            h.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_from_any_listener_stops_all_listeners() {
+        for shutdown_node in 0..2 {
+            let h = PushHarness::new(0, None).await;
+            let paths = [
+                unique_socket_path("shutdown-a"),
+                unique_socket_path("shutdown-b"),
+            ];
+            let topology = Topology::Cluster {
+                targets: paths
+                    .iter()
+                    .map(|path| ProxyTarget {
+                        listen: Endpoint::Unix(path.clone()),
+                        // Local shutdown also works when the upstream is gone.
+                        upstream: Endpoint::Unix(unique_socket_path(
+                            "missing-upstream",
+                        )),
+                    })
+                    .collect(),
+                slots: Vec::new(),
+            };
+            let (bound, mappings) =
+                bind_topology(&topology, false).await.unwrap();
+            assert_eq!(mappings.len(), 2);
+            let task = tokio::spawn(serve_topology(bound, h.state.clone()));
+            let mut clients = Vec::new();
+            for path in &paths {
+                let mut client =
+                    BufReader::new(UnixStream::connect(path).await.unwrap());
+                client
+                    .get_mut()
+                    .write_all(&resp_command(&["DEBUG", "EVIL", "STATUS"]))
+                    .await
+                    .unwrap();
+                read_raw_frame(&mut client).await.unwrap();
+                clients.push(client);
+            }
+            clients[shutdown_node]
+                .get_mut()
+                .write_all(&resp_command(&["DEBUG", "SHUTDOWN"]))
+                .await
+                .unwrap();
+            assert_eq!(
+                read_raw_frame(&mut clients[shutdown_node]).await.unwrap(),
+                b"+OK\r\n"
+            );
+            task.await.unwrap().unwrap();
+            for (client, path) in clients.iter_mut().zip(&paths) {
+                assert_eq!(
+                    read_raw_frame(client).await.unwrap_err().kind(),
+                    ErrorKind::UnexpectedEof
+                );
+                assert!(!path.exists());
+            }
+            assert_eq!(h.state.command_ids.load(Ordering::SeqCst), 0);
+            h.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_checks_upstreams_and_cleans_up_partial_bindings() {
+        let path = unique_socket_path("startup-upstream");
+        let upstream = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            crate::upstream_identity::accept_identity(stream).await;
+        });
+        let listen_path = unique_socket_path("startup-listen");
+        let target = ProxyTarget {
+            listen: Endpoint::Unix(listen_path.clone()),
+            upstream: Endpoint::Unix(path.clone()),
+        };
+        let topology = Topology::Standalone {
+            target: target.clone(),
+        };
+        let (bound, mappings) = bind_topology(&topology, true).await.unwrap();
+        assert_eq!(
+            mappings,
+            vec![format!("{} -> {}", target.listen, target.upstream)]
+        );
+        drop(bound);
+        server.await.unwrap();
+        assert!(!listen_path.exists());
+        std::fs::remove_file(&path).unwrap();
+
+        let error = bind_topology(&topology, true)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains(&target.upstream.to_string()), "{error}");
+        assert!(error.contains("connecting to/identifying"), "{error}");
+        assert!(!listen_path.exists());
+
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let topology = Topology::Cluster {
+            targets: vec![
+                target.clone(),
+                ProxyTarget {
+                    listen: occupied
+                        .local_addr()
+                        .unwrap()
+                        .to_string()
+                        .parse()
+                        .unwrap(),
+                    upstream: target.upstream,
+                },
+            ],
+            slots: Vec::new(),
+        };
+        let error = bind_topology(&topology, false)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("binding listener"), "{error}");
+        assert!(
+            error.contains(&occupied.local_addr().unwrap().to_string()),
+            "{error}"
+        );
+        assert!(!listen_path.exists());
+    }
 
     struct PushHarness {
         client: BufReader<UnixStream>,
@@ -1138,6 +1385,7 @@ mod tests {
             let path = unique_socket_path("push-upstream");
             let listener = UnixListener::bind(&path).unwrap();
             let state = SharedState {
+                shutdown: Arc::new(Notify::new()),
                 stats: Arc::new(Stats::default()),
                 repro,
                 monitor: monitor_sender(),
@@ -1591,6 +1839,7 @@ mod tests {
         use std::task::{Context, Waker};
 
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -1838,6 +2087,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -1920,6 +2170,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -2047,6 +2298,7 @@ mod tests {
                 stream.get_mut().write_all(exec_reply).await.unwrap();
             });
             let state = SharedState {
+                shutdown: Arc::new(Notify::new()),
                 stats: Arc::new(Stats::default()),
                 repro: None,
                 monitor: monitor_sender(),
@@ -2198,6 +2450,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -2499,6 +2752,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -2586,6 +2840,7 @@ mod tests {
         config.probability = 100.0;
 
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -2704,6 +2959,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -2833,6 +3089,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -3088,6 +3345,7 @@ mod tests {
 
     fn transport_test_state(repro: ReproWriter) -> SharedState {
         SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: Some(repro),
             monitor: monitor_sender(),
@@ -3370,6 +3628,7 @@ mod tests {
                 listen: Endpoint::Unix(unique_socket_path("unused-listen")),
             };
             let state = SharedState {
+                shutdown: Arc::new(Notify::new()),
                 stats: Arc::new(Stats::default()),
                 repro: Some(ReproWriter::open(&repro_path).await.unwrap()),
                 monitor: monitor_sender(),
@@ -3486,6 +3745,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -3978,6 +4238,7 @@ mod tests {
             ])),
         ]));
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4131,6 +4392,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4282,6 +4544,7 @@ mod tests {
             }
         });
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4394,6 +4657,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4503,6 +4767,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4576,6 +4841,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4665,6 +4931,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4796,6 +5063,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4889,6 +5157,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -4966,6 +5235,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),
@@ -5210,6 +5480,7 @@ mod tests {
                 stream.get_mut().write_all(b"+PONG\r\n").await.unwrap();
             });
             let state = SharedState {
+                shutdown: Arc::new(Notify::new()),
                 stats: Arc::new(Stats::default()),
                 repro: None,
                 monitor: monitor_sender(),
@@ -5326,6 +5597,7 @@ mod tests {
             listen: Endpoint::Unix(unique_socket_path("unused-listen")),
         };
         let state = SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),

@@ -213,6 +213,14 @@ pub async fn discover(
     proxy: Endpoint,
     listen: Endpoint,
 ) -> AppResult<Topology> {
+    discover_with_checks(proxy, listen, false).await
+}
+
+pub(crate) async fn discover_with_checks(
+    proxy: Endpoint,
+    listen: Endpoint,
+    strict: bool,
+) -> AppResult<Topology> {
     let (tcp_proxy, tcp_listen) = match (proxy.as_tcp(), listen.as_tcp()) {
         (Some(proxy), Some(listen)) => {
             let socket_addr =
@@ -252,6 +260,11 @@ pub async fn discover(
         }
         Ok(slots) => slots,
         Err(error) => {
+            if strict {
+                return Err(AppError::Startup(format!(
+                    "probing upstream {tcp_proxy}: {error}"
+                )));
+            }
             debug!(%error, "cluster probe failed; using standalone proxy mode");
             return Ok(Topology::Standalone {
                 target: ProxyTarget {
@@ -373,7 +386,8 @@ async fn fetch_cluster_slots(
     match frame {
         Frame::Array(Some(items)) => parse_cluster_slots(items, proxy),
         Frame::SimpleError(error) => {
-            Err(AppError::Proxy(format!("CLUSTER SLOTS failed: {error}")))
+            debug!(%error, "CLUSTER SLOTS rejected; using standalone proxy mode");
+            Ok(Vec::new())
         }
         other => Err(AppError::Proxy(format!(
             "CLUSTER SLOTS returned unexpected frame {other:?}"
@@ -510,6 +524,45 @@ mod tests {
 
     fn bulk(value: &str) -> Frame {
         Frame::BulkString(Some(value.as_bytes().to_vec()))
+    }
+
+    #[tokio::test]
+    async fn daemon_discovery_reports_broken_streams_but_allows_server_errors()
+    {
+        for (reply, strict, fails) in [
+            (&b"?invalid\r\n"[..], true, true),
+            (&b"?invalid\r\n"[..], false, false),
+            (&b"-NOAUTH Authentication required\r\n"[..], true, false),
+        ] {
+            let listener =
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
+                let mut stream = BufReader::new(stream);
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    cluster_slots_command().encode()
+                );
+                stream.get_mut().write_all(reply).await.unwrap();
+            });
+            let result = discover_with_checks(
+                address.to_string().parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+                strict,
+            )
+            .await;
+            if fails {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("probing upstream"), "{error}");
+                assert!(error.contains(&address.to_string()), "{error}");
+            } else {
+                assert!(matches!(result.unwrap(), Topology::Standalone { .. }));
+            }
+            server.await.unwrap();
+        }
     }
 
     fn node(host: &str, port: i64, id: &str) -> Frame {

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
@@ -436,7 +436,8 @@ impl Builder {
             let first_stale = self.states.len();
             self.states.extend(stale.iter().cloned());
             for node in candidates.into_iter().take(count) {
-                views[node] = first_stale + self.rng.random_range(0..stale.len());
+                views[node] =
+                    first_stale + self.rng.random_range(0..stale.len());
             }
         }
         self.stages.push(Stage {

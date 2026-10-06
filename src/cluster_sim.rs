@@ -167,12 +167,11 @@ impl ClusterSim {
             return Ok(table);
         }
         let command = encode_command(&[b"COMMAND".to_vec()]);
-        let table = parse_frame(
-            &exchange_reply(upstream, &command, &["COMMAND".to_owned()], push)
-                .await?,
-        )
-        .ok()
-        .and_then(|frame| CommandTable::parse(&frame));
+        let table =
+            exchange_reply(upstream, &command, &["COMMAND".to_owned()], push)
+                .await?
+                .and_then(|bytes| parse_frame(&bytes).ok())
+                .and_then(|frame| CommandTable::parse(&frame));
         let Some(table) = table else {
             debug!(
                 "COMMAND unavailable; cluster simulation uses COMMAND GETKEYS"
@@ -427,7 +426,10 @@ impl SimConnection {
             return None;
         }
         let keys = match self.keys(&mut ctx, info.as_ref(), &raw).await {
-            Ok(keys) => keys,
+            Ok(Some(keys)) => keys,
+            Ok(None) => {
+                return Some(Ok(SimOutcome::Reply(UNAVAILABLE_REPLY.to_vec())));
+            }
             Err(error) => return Some(Err(error)),
         };
         let write = info.as_ref().is_none_or(|info| info.write);
@@ -482,11 +484,11 @@ impl SimConnection {
         ctx: &mut ExchangeContext<'_, '_, W>,
         info: Option<&CommandInfo>,
         raw: &[Vec<u8>],
-    ) -> AppResult<Vec<Vec<u8>>> {
+    ) -> AppResult<Option<Vec<Vec<u8>>>> {
         match info.map(|info| info.keys(raw)) {
-            Some(Keys::Known(keys)) => return Ok(keys),
+            Some(Keys::Known(keys)) => return Ok(Some(keys)),
             Some(Keys::Lookup) | None if raw.is_empty() => {
-                return Ok(Vec::new());
+                return Ok(Some(Vec::new()));
             }
             _ => {}
         }
@@ -500,9 +502,11 @@ impl SimConnection {
             ctx.push,
         )
         .await?;
-        Ok(parse_frame(&reply)
-            .map(|frame| parse_getkeys(&frame))
-            .unwrap_or_default())
+        Ok(reply.map(|reply| {
+            parse_frame(&reply)
+                .map(|frame| parse_getkeys(&frame))
+                .unwrap_or_default()
+        }))
     }
 
     async fn exec<W: AsyncWrite + Unpin>(
@@ -557,7 +561,12 @@ impl SimConnection {
         commands.push((exec, vec!["EXEC".to_owned()]));
         let mut last = Vec::new();
         for (bytes, argv) in commands {
-            last = self.send(ctx, target.as_ref(), &bytes, &argv).await?;
+            let Some(reply) =
+                self.send(ctx, target.as_ref(), &bytes, &argv).await?
+            else {
+                return Ok(SimOutcome::Reply(UNAVAILABLE_REPLY.to_vec()));
+            };
+            last = reply;
         }
         Ok(SimOutcome::Reply(last))
     }
@@ -577,15 +586,24 @@ impl SimConnection {
         for _ in 0..=MAX_REAL_REDIRECTS {
             if asking {
                 let command = encode_command(&[b"ASKING".to_vec()]);
-                self.send(
-                    ctx,
-                    target.as_ref(),
-                    &command,
-                    &["ASKING".to_owned()],
-                )
-                .await?;
+                if self
+                    .send(
+                        ctx,
+                        target.as_ref(),
+                        &command,
+                        &["ASKING".to_owned()],
+                    )
+                    .await?
+                    .is_none()
+                {
+                    return Ok(SimOutcome::Reply(UNAVAILABLE_REPLY.to_vec()));
+                }
             }
-            let reply = self.send(ctx, target.as_ref(), bytes, argv).await?;
+            let Some(reply) =
+                self.send(ctx, target.as_ref(), bytes, argv).await?
+            else {
+                return Ok(SimOutcome::Reply(UNAVAILABLE_REPLY.to_vec()));
+            };
             match real_redirection(&reply) {
                 Some((ask, endpoint)) => {
                     asking = ask;
@@ -603,7 +621,7 @@ impl SimConnection {
         target: Option<&TcpEndpoint>,
         bytes: &[u8],
         argv: &[String],
-    ) -> AppResult<Vec<u8>> {
+    ) -> AppResult<Option<Vec<u8>>> {
         let own = ctx.own_upstream.as_tcp().map(TcpEndpoint::connect_addr);
         let Some(target) = target.filter(|t| Some(t.connect_addr()) != own)
         else {
@@ -620,13 +638,18 @@ impl SimConnection {
                 let names = parse_frame(command)
                     .map(|frame| frame.argv_lossy())
                     .unwrap_or_default();
-                exchange_reply(&mut session, command, &names, ctx.push).await?;
+                if exchange_reply(&mut session, command, &names, ctx.push)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
             }
             self.backing.insert(key.clone(), session);
         }
         let session = self.backing.get_mut(&key).expect("inserted above");
         let result = exchange_reply(session, bytes, argv, ctx.push).await;
-        if result.is_err() {
+        if !matches!(&result, Ok(Some(_))) {
             // Recreate with the prelude rather than reconnect without it.
             self.backing.remove(&key);
         }
@@ -670,10 +693,10 @@ async fn exchange_reply<W: AsyncWrite + Unpin>(
     bytes: &[u8],
     argv: &[String],
     push: &mut PushDelivery<'_, W>,
-) -> AppResult<Vec<u8>> {
+) -> AppResult<Option<Vec<u8>>> {
     match upstream.forward(bytes, argv, push).await? {
-        Exchange::Reply(reply) => Ok(reply),
-        Exchange::Unavailable(_) => Ok(UNAVAILABLE_REPLY.to_vec()),
+        Exchange::Reply(reply) => Ok(Some(reply)),
+        Exchange::Unavailable(_) => Ok(None),
         Exchange::Subscription => {
             Err(AppError::Proxy("expected ordinary reply".to_owned()))
         }
@@ -695,4 +718,87 @@ fn real_redirection(reply: &[u8]) -> Option<(bool, TcpEndpoint)> {
     parts.next()?.parse::<u16>().ok()?;
     let endpoint = parts.next()?.parse::<TcpEndpoint>().ok()?;
     Some((ask, endpoint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    use crate::evil::EvilConfig;
+    use crate::protocol_fingerprint::ProtocolFingerprints;
+    use crate::resp::read_raw_frame;
+
+    #[tokio::test]
+    async fn simulation_exchange_preserves_events_and_distinguishes_failures() {
+        const EVENT: &[u8] = b">1\r\n+notice\r\n";
+        for (upstream_fails, client_fails) in
+            [(false, false), (true, false), (false, true)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = Endpoint::Tcp(
+                listener.local_addr().unwrap().to_string().parse().unwrap(),
+            );
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
+                let mut stream = BufReader::new(stream);
+                assert_eq!(
+                    read_raw_frame(&mut stream).await.unwrap(),
+                    b"*1\r\n$4\r\nPING\r\n"
+                );
+                if !upstream_fails {
+                    stream.get_mut().write_all(EVENT).await.unwrap();
+                    stream.get_mut().write_all(b"+OK\r\n").await.unwrap();
+                }
+            });
+            let mut upstream = UpstreamConnection::new(endpoint, 0).await;
+            let (mut writer, reader) = tokio::io::duplex(1024);
+            let mut reader = Some(reader);
+            if client_fails {
+                drop(reader.take());
+            }
+            let mut fingerprints = ProtocolFingerprints::new();
+            let config = EvilConfig::default();
+            let mut index = 0;
+            let epoch = AtomicU64::new(0);
+            let result = exchange_reply(
+                &mut upstream,
+                b"*1\r\n$4\r\nPING\r\n",
+                &["PING".to_owned()],
+                &mut PushDelivery {
+                    writer: &mut writer,
+                    fingerprints: &mut fingerprints,
+                    config: &config,
+                    index: &mut index,
+                    connection_id: 0,
+                    epoch: 0,
+                    current_epoch: &epoch,
+                    repro: None,
+                },
+            )
+            .await;
+            if client_fails {
+                assert!(result.is_err());
+            } else if upstream_fails {
+                assert_eq!(result.unwrap(), None);
+                assert_eq!(index, 0);
+            } else {
+                assert_eq!(result.unwrap(), Some(b"+OK\r\n".to_vec()));
+                let mut event = vec![0; EVENT.len()];
+                reader
+                    .as_mut()
+                    .unwrap()
+                    .read_exact(&mut event)
+                    .await
+                    .unwrap();
+                assert_eq!(event, EVENT);
+                assert_eq!(index, 1);
+            }
+            server.await.unwrap();
+        }
+    }
 }

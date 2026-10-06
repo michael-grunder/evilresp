@@ -103,12 +103,35 @@ be nonzero in cluster mode. Primaries are assigned ports first, in their order
 of first appearance in the startup response, followed by replicas in the same
 order. For example, three primaries and three replicas starting at `6380` use
 `6380–6382` for primaries and `6383–6385` for replicas. Repeated nodes across
-slot ranges share a listener; node IDs and primary/replica relationships are
-preserved. Nodes are matched by node ID when available and by full upstream
+slot ranges share a listener; primary/replica relationships are preserved.
+Nodes are matched by upstream node ID when available and by full upstream
 endpoint, so different hosts using the same port get separate listeners.
 Topology rewriting can also match an alternative address by port when that
 port identifies only one mapped node. Conflicting node identities or a local
 port range exceeding `65535` stop startup with an error.
+
+In cluster mode, standard 40-character hexadecimal node IDs are replaced with
+the first 40 lowercase hex characters of
+`SHA256("evilresp:node-id:" + upstream_id)`, hashing the ID's text bytes.
+This separates proxy identities from upstream identities while preserving
+their format. IDs are stable across restarts, listener addresses, connections,
+evil seeds, and `MODE RESET`, and rewriting applies even with evil mode off.
+Two proxies over the same upstream nodes deliberately advertise the same IDs.
+Nonstandard IDs and missing-ID fallbacks retain their existing representation.
+
+The same mapping applies to `CLUSTER SLOTS`, `SHARDS`, `NODES`, `MYID`,
+`REPLICAS`, `SLAVES`, and `LINKS`, including primary references and
+importing/migrating slot annotations in `NODES`. All these topology/identity
+queries bypass faults and consume no command index. `REPLICAS`/`SLAVES`
+also remove nodes with no mapped listener and rewrite addresses like `NODES`.
+For `REPLICAS`, `SLAVES`, `FORGET`, `REPLICATE`, `COUNT-FAILURE-REPORTS`, and
+the `IMPORTING`/`MIGRATING`/`NODE` forms of `SETSLOT`, known proxy node-ID
+arguments are translated back using the startup discovery snapshot. Unknown
+IDs and upstream IDs pass through; fingerprints, monitoring, and repro records
+retain the original client command. Administrative commands still use the
+ordinary fault/index pipeline and affect the real upstream cluster.
+Identity reply rewriting covers these top-level queries, not replies nested
+inside `EXEC` or IDs in other commands. Shard IDs are unchanged.
 
 Each replica listener forwards to that actual upstream replica, including
 client `READONLY` and `READWRITE` commands. Replica connections start with
@@ -1132,6 +1155,59 @@ setup too early: `AUTH`, `HELLO`, `CLIENT`, `SELECT`, `ASKING`, `MULTI`,
 `COMMAND`, `DISCARD`, `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE`, `UNSUBSCRIBE`,
 and `QUIT`.
 
+### PUSH mutation
+
+`DEBUG EVIL PUSH OFF` (the default) leaves unsolicited events untouched.
+`PAYLOAD` and `FRAME` opt into event mutation in `MODE MUTATE` or
+`MODE OVERFLOW`; `MODE OFF` and `MODE RANDOM` leave events unchanged. The
+optional probability defaults to 100 and controls value mutation independently
+of ordinary reply probability. Selecting a PUSH target resets its probability
+to the supplied value or 100. `OFF` accepts no options.
+
+- `PAYLOAD`: mutate the key-list/null value of `invalidate`, the payload of
+  `message`/`smessage`, or the payload of `pmessage`. Preserve the outer event
+  type, kind, channel, and pattern. Subscription acknowledgements and unknown
+  event kinds pass unchanged. Explicit length faults are disabled in this
+  mode; generator violations can still produce malformed payload values.
+- `FRAME`: allow the entire event through value and framing mutation,
+  including its kind, routing fields, and subscription acknowledgements.
+  Existing `FRAMING` probability and target rules apply independently of PUSH
+  value probability; paths start at the event root.
+
+Both targets use the connection's `STRATEGY`, `MUTATIONS`, `DEPTH`, and
+`GENERATOR` settings. `STRATEGY PRESERVE` leaves an invalidation's null payload
+unchanged; `REPLACE` can replace it. Payload selection applies depth weighting
+within the payload subtree, and repro paths refer to its position in the full
+event. Command include/exclude filters, canonicalization, EXEC edits, topology
+faults, and transport fault settings do not apply to events. In particular,
+event elements are never sorted, and transport faults still target ordinary
+command replies. A failed subscription command's ordinary error reply follows
+ordinary command rules.
+
+For tracking invalidations with only payload mutation:
+
+```text
+HELLO 3
+CLIENT TRACKING ON
+DEBUG EVIL SEED 1234
+DEBUG EVIL MODE MUTATE PROBABILITY 0
+DEBUG EVIL PUSH PAYLOAD PROBABILITY 25
+```
+
+Read keys on this connection and change them from another connection to
+produce invalidations. Configure Pub/Sub event mutation before subscribing
+when the client library does not allow arbitrary commands in its subscribe
+loop.
+
+Every event consumes one per-client event index, including unmutated events
+and subscription acknowledgements, starting at zero. New clients and
+`MODE RESET` restart this index; upstream reconnects do not. Event RNG uses
+`rng_for(seed, event_index, SHA256("evilresp:push:v1"), SHA256(original_event))`.
+Connection identity, command indexes, and arrival timing are not inputs.
+Reproduce the same event order, bytes, and settings to reproduce mutations;
+real server events and their order depend on the workload. Synchronize
+configuration changes with event producers when replaying a run.
+
 ## DEBUG EVIL CLUSTER
 
 `DEBUG EVIL CLUSTER` simulates **valid, evolving** cluster topologies so
@@ -1252,59 +1328,6 @@ hostname and unknown-endpoint announcements, TLS ports, and minority-partition
 `cluster_state:fail` are not simulated. Repro records do not identify the
 simulation stage. Use `DEBUG EVIL CLUSTER STATUS` together with the command
 index instead.
-### PUSH mutation
-
-`DEBUG EVIL PUSH OFF` (the default) leaves unsolicited events untouched.
-`PAYLOAD` and `FRAME` opt into event mutation in `MODE MUTATE` or
-`MODE OVERFLOW`; `MODE OFF` and `MODE RANDOM` leave events unchanged. The
-optional probability defaults to 100 and controls value mutation independently
-of ordinary reply probability. Selecting a PUSH target resets its probability
-to the supplied value or 100. `OFF` accepts no options.
-
-- `PAYLOAD`: mutate the key-list/null value of `invalidate`, the payload of
-  `message`/`smessage`, or the payload of `pmessage`. Preserve the outer event
-  type, kind, channel, and pattern. Subscription acknowledgements and unknown
-  event kinds pass unchanged. Explicit length faults are disabled in this
-  mode; generator violations can still produce malformed payload values.
-- `FRAME`: allow the entire event through value and framing mutation,
-  including its kind, routing fields, and subscription acknowledgements.
-  Existing `FRAMING` probability and target rules apply independently of PUSH
-  value probability; paths start at the event root.
-
-Both targets use the connection's `STRATEGY`, `MUTATIONS`, `DEPTH`, and
-`GENERATOR` settings. `STRATEGY PRESERVE` leaves an invalidation's null payload
-unchanged; `REPLACE` can replace it. Payload selection applies depth weighting
-within the payload subtree, and repro paths refer to its position in the full
-event. Command include/exclude filters, canonicalization, EXEC edits, topology
-faults, and transport fault settings do not apply to events. In particular,
-event elements are never sorted, and transport faults still target ordinary
-command replies. A failed subscription command's ordinary error reply follows
-ordinary command rules.
-
-For tracking invalidations with only payload mutation:
-
-```text
-HELLO 3
-CLIENT TRACKING ON
-DEBUG EVIL SEED 1234
-DEBUG EVIL MODE MUTATE PROBABILITY 0
-DEBUG EVIL PUSH PAYLOAD PROBABILITY 25
-```
-
-Read keys on this connection and change them from another connection to
-produce invalidations. Configure Pub/Sub event mutation before subscribing
-when the client library does not allow arbitrary commands in its subscribe
-loop.
-
-Every event consumes one per-client event index, including unmutated events
-and subscription acknowledgements, starting at zero. New clients and
-`MODE RESET` restart this index; upstream reconnects do not. Event RNG uses
-`rng_for(seed, event_index, SHA256("evilresp:push:v1"), SHA256(original_event))`.
-Connection identity, command indexes, and arrival timing are not inputs.
-Reproduce the same event order, bytes, and settings to reproduce mutations;
-real server events and their order depend on the workload. Synchronize
-configuration changes with event producers when replaying a run.
-
 ## DEBUG PROTOCOL
 
 `DEBUG PROTOCOL` commands are handled by `evilresp` and are not sent upstream.

@@ -9,25 +9,148 @@
 //! local listener are removed from the reply rather
 //! than leaked as upstream addresses that would let the client bypass the
 //! proxy.
+//! Node IDs and their references share a stable proxy identity; supported
+//! node-ID command arguments are translated back before forwarding.
 
 use tracing::{debug, warn};
 
 use crate::cli::TcpEndpoint;
-use crate::cluster::ClusterRedirectionMap;
+use crate::cluster::{ClusterRedirectionMap, proxy_node_id};
 use crate::resp::Frame;
 
-pub fn is_cluster_shards(argv: &[String]) -> bool {
-    is_cluster_subcommand(argv, "SHARDS")
+pub(crate) enum ClusterQuery {
+    Shards,
+    Nodes,
+    MyId,
+    Replicas,
+    Links,
 }
 
-pub fn is_cluster_nodes(argv: &[String]) -> bool {
-    is_cluster_subcommand(argv, "NODES")
+impl ClusterQuery {
+    pub(crate) fn parse(argv: &[String]) -> Option<Self> {
+        if !argv.first()?.eq_ignore_ascii_case("CLUSTER") {
+            return None;
+        }
+        match (argv.get(1)?.to_ascii_uppercase().as_str(), argv.len()) {
+            ("SHARDS", 2) => Some(Self::Shards),
+            ("NODES", 2) => Some(Self::Nodes),
+            ("MYID", 2) => Some(Self::MyId),
+            ("REPLICAS" | "SLAVES", 3) => Some(Self::Replicas),
+            ("LINKS", 2) => Some(Self::Links),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn rewrite(
+        &self,
+        reply: &Frame,
+        map: &ClusterRedirectionMap,
+    ) -> Frame {
+        match self {
+            Self::Shards => rewrite_cluster_shards(reply, map),
+            Self::Nodes => rewrite_cluster_nodes(reply, map),
+            Self::MyId => rewrite_id_frame(reply),
+            Self::Replicas => match reply {
+                Frame::Array(Some(nodes)) => Frame::Array(Some(
+                    nodes
+                        .iter()
+                        .filter_map(|node| {
+                            let text = string_of(node)?;
+                            let mut line = rewrite_nodes_line(
+                                text.strip_suffix('\n').unwrap_or(&text),
+                                map,
+                            )?;
+                            if text.ends_with('\n') {
+                                line.push('\n');
+                            }
+                            Some(match node {
+                                Frame::VerbatimString(_) => {
+                                    Frame::VerbatimString(line.into_bytes())
+                                }
+                                Frame::SimpleString(_) => {
+                                    Frame::SimpleString(line)
+                                }
+                                _ => Frame::BulkString(Some(line.into_bytes())),
+                            })
+                        })
+                        .collect(),
+                )),
+                _ => reply.clone(),
+            },
+            Self::Links => match reply {
+                Frame::Array(Some(links)) => Frame::Array(Some(
+                    links
+                        .iter()
+                        .map(|link| {
+                            let Some(mut entries) = MapEntries::parse(link)
+                            else {
+                                return link.clone();
+                            };
+                            for (key, value) in &mut entries.pairs {
+                                if key_is(key, "node") {
+                                    *value = rewrite_id_frame(value);
+                                }
+                            }
+                            entries.into_frame()
+                        })
+                        .collect(),
+                )),
+                _ => reply.clone(),
+            },
+        }
+    }
 }
 
-fn is_cluster_subcommand(argv: &[String], subcommand: &str) -> bool {
-    argv.len() == 2
-        && argv[0].eq_ignore_ascii_case("CLUSTER")
-        && argv[1].eq_ignore_ascii_case(subcommand)
+/// Translate only known node-ID arguments, retaining original client bytes
+/// for fingerprints, monitoring, mutation seeds, and repro records.
+pub(crate) fn upstream_cluster_command(
+    command: &Frame,
+    argv: &[String],
+    map: &ClusterRedirectionMap,
+) -> Option<Vec<u8>> {
+    if !argv.first()?.eq_ignore_ascii_case("CLUSTER") {
+        return None;
+    }
+    let index = match (argv.get(1)?.to_ascii_uppercase().as_str(), argv.len()) {
+        (
+            "REPLICAS"
+            | "SLAVES"
+            | "FORGET"
+            | "REPLICATE"
+            | "COUNT-FAILURE-REPORTS",
+            3,
+        ) => 2,
+        ("SETSLOT", 5)
+            if ["IMPORTING", "MIGRATING", "NODE"]
+                .iter()
+                .any(|state| argv[3].eq_ignore_ascii_case(state)) =>
+        {
+            4
+        }
+        _ => return None,
+    };
+    let upstream = map.upstream_node_id(argv[index].as_bytes())?;
+    if upstream == argv[index].as_bytes() {
+        return None;
+    }
+    let Frame::Array(Some(mut parts)) = command.clone() else {
+        return None;
+    };
+    *parts.get_mut(index)? = Frame::BulkString(Some(upstream.to_vec()));
+    Some(Frame::Array(Some(parts)).encode())
+}
+
+fn rewrite_id_frame(frame: &Frame) -> Frame {
+    match frame {
+        Frame::BulkString(Some(id)) => {
+            Frame::BulkString(Some(proxy_node_id(id)))
+        }
+        Frame::VerbatimString(id) => Frame::VerbatimString(proxy_node_id(id)),
+        Frame::SimpleString(id) => Frame::SimpleString(
+            String::from_utf8_lossy(&proxy_node_id(id.as_bytes())).into_owned(),
+        ),
+        _ => frame.clone(),
+    }
 }
 
 /// Rewrite a `CLUSTER SHARDS` reply, in either its RESP2 (flat key/value
@@ -108,6 +231,8 @@ fn rewrite_shard_node(
             *value = Frame::BulkString(Some(local.host.clone().into_bytes()));
         } else if key_is(key, "port") {
             *value = Frame::Integer(i64::from(local.port));
+        } else if key_is(key, "id") {
+            *value = rewrite_id_frame(value);
         }
     }
 
@@ -179,6 +304,39 @@ fn rewrite_nodes_line(
         }
     }
 
+    let id =
+        String::from_utf8_lossy(&proxy_node_id(id.as_bytes())).into_owned();
+    let rest = rest
+        .split(' ')
+        .enumerate()
+        .map(|(index, field)| {
+            if index == 1 {
+                // The primary reference follows flags; "-" remains unchanged.
+                return String::from_utf8_lossy(&proxy_node_id(
+                    field.as_bytes(),
+                ))
+                .into_owned();
+            }
+            if index >= 6
+                && let Some(slot) =
+                    field.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+            {
+                for direction in ["->-", "-<-"] {
+                    if let Some((number, node)) = slot.split_once(direction)
+                        && number.parse::<u16>().is_ok_and(|n| n < 16384)
+                    {
+                        let node = proxy_node_id(node.as_bytes());
+                        return format!(
+                            "[{number}{direction}{}]",
+                            String::from_utf8_lossy(&node)
+                        );
+                    }
+                }
+            }
+            field.to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     Some(if rest.is_empty() {
         format!("{id} {rewritten}")
     } else {
@@ -311,6 +469,123 @@ mod tests {
 
     fn bulk(value: &str) -> Frame {
         Frame::BulkString(Some(value.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn identity_queries_rewrite_ids_references_and_keep_resp_shapes() {
+        const PRIMARY: &str = "004b6de33f0bada48c901e1cfe6a15a465f094a6";
+        const REPLICA: &str = "1111111111111111111111111111111111111111";
+        const LOCAL_PRIMARY: &str = "c6a4b48cd048f7c532cc8f9d10bf52faaee0e807";
+        const LOCAL_REPLICA: &str = "f0db3671f4b8edb7542e7deb3278567148051d2d";
+        let map = map();
+        for flat in [false, true] {
+            let flatten = |frame| {
+                if flat && let Frame::Map(pairs) = frame {
+                    Frame::Array(Some(
+                        pairs.into_iter().flat_map(|(k, v)| [k, v]).collect(),
+                    ))
+                } else {
+                    frame
+                }
+            };
+            let reply = Frame::Array(Some(vec![flatten(resp3_shard(vec![
+                flatten(resp3_node(PRIMARY, 7100, "master")),
+                flatten(resp3_node(REPLICA, 7101, "replica")),
+            ]))]));
+            let expected =
+                Frame::Array(Some(vec![flatten(resp3_shard(vec![
+                    flatten(resp3_node(LOCAL_PRIMARY, 7200, "master")),
+                    flatten(resp3_node(LOCAL_REPLICA, 7201, "replica")),
+                ]))]));
+            assert_eq!(ClusterQuery::Shards.rewrite(&reply, &map), expected);
+
+            let link = |id| {
+                Frame::Array(Some(vec![flatten(Frame::Map(vec![
+                    (bulk("node"), bulk(id)),
+                    (bulk("direction"), bulk("to")),
+                    (bulk("create-time"), Frame::Integer(42)),
+                ]))]))
+            };
+            assert_eq!(
+                ClusterQuery::Links.rewrite(&link(PRIMARY), &map),
+                link(LOCAL_PRIMARY)
+            );
+        }
+
+        for (reply, expected) in [
+            (bulk(PRIMARY), bulk(LOCAL_PRIMARY)),
+            (
+                Frame::SimpleString(PRIMARY.to_owned()),
+                Frame::SimpleString(LOCAL_PRIMARY.to_owned()),
+            ),
+            (
+                Frame::VerbatimString(PRIMARY.as_bytes().to_vec()),
+                Frame::VerbatimString(LOCAL_PRIMARY.as_bytes().to_vec()),
+            ),
+        ] {
+            assert_eq!(ClusterQuery::MyId.rewrite(&reply, &map), expected);
+        }
+
+        let primary = format!(
+            "{PRIMARY} 127.0.0.1:7100@17100 master - 0 0 1 connected 0-100 [42->-{REPLICA}] [43-<-{REPLICA}]\n"
+        );
+        let replica = format!(
+            "{REPLICA} 127.0.0.1:7101@17101 slave {PRIMARY} 0 0 1 connected"
+        );
+        let local_primary = format!(
+            "{LOCAL_PRIMARY} 127.0.0.1:7200@17100 master - 0 0 1 connected 0-100 [42->-{LOCAL_REPLICA}] [43-<-{LOCAL_REPLICA}]\n"
+        );
+        let local_replica = format!(
+            "{LOCAL_REPLICA} 127.0.0.1:7201@17101 slave {LOCAL_PRIMARY} 0 0 1 connected"
+        );
+        assert_eq!(
+            ClusterQuery::Nodes
+                .rewrite(&bulk(&format!("{primary}{replica}\n")), &map),
+            bulk(&format!("{local_primary}{local_replica}\n"))
+        );
+        for suffix in ["", "\n"] {
+            let reply = Frame::Array(Some(vec![
+                bulk(&format!("{replica}{suffix}")),
+                bulk(&format!(
+                    "{REPLICA} elsewhere:9999 slave {PRIMARY} 0 0 1 connected"
+                )),
+            ]));
+            assert_eq!(
+                ClusterQuery::Replicas.rewrite(&reply, &map),
+                Frame::Array(Some(vec![bulk(&format!(
+                    "{local_replica}{suffix}"
+                ))]))
+            );
+        }
+        for query in [
+            ClusterQuery::Shards,
+            ClusterQuery::Nodes,
+            ClusterQuery::MyId,
+            ClusterQuery::Replicas,
+            ClusterQuery::Links,
+        ] {
+            for reply in [
+                Frame::SimpleError("ERR unknown node".to_owned()),
+                Frame::BulkString(None),
+                Frame::SimpleString("QUEUED".to_owned()),
+            ] {
+                assert_eq!(query.rewrite(&reply, &map), reply);
+            }
+        }
+        for args in [
+            vec![],
+            vec!["CLUSTER"],
+            vec!["GET", "MYID"],
+            vec!["CLUSTER", "MYID", "extra"],
+            vec!["CLUSTER", "REPLICAS"],
+        ] {
+            assert!(
+                ClusterQuery::parse(
+                    &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
+                )
+                .is_none()
+            );
+        }
     }
 
     fn resp3_node(id: &str, port: i64, role: &str) -> Frame {

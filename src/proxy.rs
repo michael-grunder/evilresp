@@ -16,10 +16,7 @@ use crate::cli::{Cli, Endpoint};
 use crate::cluster::{
     ClusterRedirectionMap, ProxyTarget, Topology, discover_with_checks,
 };
-use crate::cluster_rewrite::{
-    is_cluster_nodes, is_cluster_shards, rewrite_cluster_nodes,
-    rewrite_cluster_shards,
-};
+use crate::cluster_rewrite::{ClusterQuery, upstream_cluster_command};
 use crate::cluster_sim::{
     ClusterSim, ExchangeContext, SimConnection, SimOutcome,
 };
@@ -507,17 +504,27 @@ async fn proxy_connection(
             continue;
         }
 
+        let translated_command = state.local_slots.as_ref().and_then(|_| {
+            upstream_cluster_command(
+                &command_frame,
+                &argv,
+                &state.redirection_map,
+            )
+        });
+        let upstream_command =
+            translated_command.as_deref().unwrap_or(&command_bytes);
+
         /* Like CLUSTER SLOTS, the other topology queries name upstream
         nodes; they are answered by the upstream and rewritten to the
         local listeners, outside the mutation pipeline so a client can
         always bootstrap. */
         if state.local_slots.is_some()
-            && (is_cluster_shards(&argv) || is_cluster_nodes(&argv))
+            && let Some(query) = ClusterQuery::parse(&argv)
         {
             publish_monitor_command(&state, connection_id, &command_frame);
             let upstream_bytes = match upstream
                 .forward(
-                    &command_bytes,
+                    upstream_command,
                     &argv,
                     &mut PushDelivery {
                         writer: &mut client_write,
@@ -546,11 +553,11 @@ async fn proxy_connection(
                 }
             };
             let upstream_frame = parse_frame(&upstream_bytes)?;
-            let response = if is_cluster_shards(&argv) {
-                rewrite_cluster_shards(&upstream_frame, &state.redirection_map)
-            } else {
-                rewrite_cluster_nodes(&upstream_frame, &state.redirection_map)
-            };
+            // ponytail: top-level identity replies only; track query kinds
+            // alongside transaction commands if EXEC rewriting is needed.
+            transaction_commands.observe(&argv, &upstream_bytes);
+            let response =
+                query.rewrite(&upstream_frame, &state.redirection_map);
             write_client_frame(&mut client_write, &mut fingerprints, &response)
                 .await?;
             continue;
@@ -677,7 +684,7 @@ async fn proxy_connection(
                         None => {
                             upstream
                                 .forward(
-                                    &command_bytes,
+                                    upstream_command,
                                     &argv,
                                     &mut PushDelivery {
                                         writer: &mut client_write,
@@ -3638,7 +3645,6 @@ mod tests {
                 command_ids: Arc::new(AtomicU64::new(0)),
                 local_slots: None,
                 cluster_sim: None,
-                cluster_sim: None,
                 redirection_map: ClusterRedirectionMap::default(),
             };
             let command_ids = state.command_ids.clone();
@@ -4440,6 +4446,10 @@ mod tests {
 
     #[tokio::test]
     async fn discovered_replica_listener_proxies_reads_and_topology() {
+        const PRIMARY: &str = "004b6de33f0bada48c901e1cfe6a15a465f094a6";
+        const REPLICA: &str = "1111111111111111111111111111111111111111";
+        const LOCAL_PRIMARY: &str = "c6a4b48cd048f7c532cc8f9d10bf52faaee0e807";
+        const LOCAL_REPLICA: &str = "f0db3671f4b8edb7542e7deb3278567148051d2d";
         let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let replica = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_replica = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4456,12 +4466,12 @@ mod tests {
             Frame::Array(Some(vec![
                 bulk_string("127.0.0.1"),
                 Frame::Integer(i64::from(primary_addr.port())),
-                bulk_string("primary"),
+                bulk_string(PRIMARY),
             ])),
             Frame::Array(Some(vec![
                 bulk_string("127.0.0.1"),
                 Frame::Integer(i64::from(replica_addr.port())),
-                bulk_string("replica"),
+                bulk_string(REPLICA),
             ])),
         ]))]));
         let probe = tokio::spawn(async move {
@@ -4487,7 +4497,7 @@ mod tests {
         assert_eq!(target.upstream.to_string(), replica_addr.to_string());
         assert_eq!(target.listen.to_string(), local_replica_addr.to_string());
 
-        let shard_reply = |port| {
+        let shard_reply = |id, port| {
             Frame::Array(Some(vec![Frame::Map(vec![
                 (
                     bulk_string("slots"),
@@ -4499,7 +4509,7 @@ mod tests {
                 (
                     bulk_string("nodes"),
                     Frame::Array(Some(vec![Frame::Map(vec![
-                        (bulk_string("id"), bulk_string("replica")),
+                        (bulk_string("id"), bulk_string(id)),
                         (bulk_string("ip"), bulk_string("127.0.0.1")),
                         (bulk_string("port"), Frame::Integer(i64::from(port))),
                         (bulk_string("role"), bulk_string("replica")),
@@ -4507,15 +4517,28 @@ mod tests {
                 ),
             ])]))
         };
-        let upstream_shards = shard_reply(replica_addr.port());
-        let local_shards = shard_reply(local_replica_addr.port());
-        let nodes_reply = |addr| {
+        let upstream_shards = shard_reply(REPLICA, replica_addr.port());
+        let local_shards =
+            shard_reply(LOCAL_REPLICA, local_replica_addr.port());
+        let nodes_reply = |id, primary, addr| {
             bulk_string(&format!(
-                "replica {addr}@16379 myself,slave primary 0 0 1 connected\n"
+                "{id} {addr}@16379 myself,slave {primary} 0 0 1 connected\n"
             ))
         };
-        let upstream_nodes = nodes_reply(replica_addr);
-        let local_nodes = nodes_reply(local_replica_addr);
+        let upstream_nodes = nodes_reply(REPLICA, PRIMARY, replica_addr);
+        let local_nodes =
+            nodes_reply(LOCAL_REPLICA, LOCAL_PRIMARY, local_replica_addr);
+        let upstream_replicas =
+            Frame::Array(Some(vec![upstream_nodes.clone()]));
+        let local_replicas = Frame::Array(Some(vec![local_nodes.clone()]));
+        let links = |id| {
+            Frame::Array(Some(vec![Frame::Map(vec![
+                (bulk_string("node"), bulk_string(id)),
+                (bulk_string("direction"), bulk_string("to")),
+            ])]))
+        };
+        let unknown = Frame::SimpleError("ERR Unknown node unknown".to_owned());
+        let upstream_unknown = unknown.clone();
         let upstream = tokio::spawn(async move {
             let (stream, _) = replica.accept().await.unwrap();
             let stream =
@@ -4524,6 +4547,19 @@ mod tests {
             for (command, response) in [
                 (vec!["CLUSTER", "SHARDS"], upstream_shards),
                 (vec!["CLUSTER", "NODES"], upstream_nodes),
+                (vec!["CLUSTER", "MYID"], bulk_string(REPLICA)),
+                (
+                    vec!["CLUSTER", "REPLICAS", PRIMARY],
+                    upstream_replicas.clone(),
+                ),
+                (vec!["cluster", "slaves", PRIMARY], upstream_replicas),
+                (vec!["CLUSTER", "LINKS"], links(PRIMARY)),
+                (vec!["CLUSTER", "REPLICAS", "unknown"], upstream_unknown),
+                (vec!["CLUSTER", "MYID"], bulk_string(REPLICA)),
+                (
+                    vec!["CLUSTER", "COUNT-FAILURE-REPORTS", PRIMARY],
+                    Frame::Integer(0),
+                ),
                 (vec!["READONLY"], Frame::SimpleString("OK".to_owned())),
                 (vec!["GET", "foo"], bulk_string("replica-value")),
                 (vec!["READWRITE"], Frame::SimpleString("OK".to_owned())),
@@ -4570,16 +4606,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
-        for (subcommand, expected) in [
-            ("SLOTS", state.local_slots.clone().unwrap()),
-            ("SHARDS", local_shards),
-            ("NODES", local_nodes),
+        let mut client_bytes =
+            resp_command(&["DEBUG", "EVIL", "MODE", "RANDOM"]);
+        for (command, expected) in [
+            (vec!["CLUSTER", "SLOTS"], state.local_slots.clone().unwrap()),
+            (vec!["CLUSTER", "SHARDS"], local_shards),
+            (vec!["CLUSTER", "NODES"], local_nodes),
+            (vec!["CLUSTER", "MYID"], bulk_string(LOCAL_REPLICA)),
+            (
+                vec!["CLUSTER", "REPLICAS", LOCAL_PRIMARY],
+                local_replicas.clone(),
+            ),
+            (vec!["cluster", "slaves", LOCAL_PRIMARY], local_replicas),
+            (vec!["CLUSTER", "LINKS"], links(LOCAL_PRIMARY)),
+            (vec!["CLUSTER", "REPLICAS", "unknown"], unknown),
         ] {
-            client
-                .get_mut()
-                .write_all(&resp_command(&["CLUSTER", subcommand]))
-                .await
-                .unwrap();
+            let bytes = resp_command(&command);
+            client_bytes.extend_from_slice(&bytes);
+            client.get_mut().write_all(&bytes).await.unwrap();
             assert_eq!(
                 read_raw_frame(&mut client).await.unwrap(),
                 expected.encode()
@@ -4588,11 +4632,25 @@ mod tests {
         assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
         client
             .get_mut()
+            .write_all(&resp_command(&["DEBUG", "PROTOCOL", "IN", "BLAKE3"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_bulk_string(&mut client).await,
+            blake3_hex(&client_bytes).into_bytes()
+        );
+        client
+            .get_mut()
             .write_all(&resp_command(&["DEBUG", "EVIL", "MODE", "OFF"]))
             .await
             .unwrap();
         assert_eq!(read_raw_frame(&mut client).await.unwrap(), b"+OK\r\n");
         for (command, expected) in [
+            (vec!["CLUSTER", "MYID"], bulk_string(LOCAL_REPLICA).encode()),
+            (
+                vec!["CLUSTER", "COUNT-FAILURE-REPORTS", LOCAL_PRIMARY],
+                b":0\r\n".to_vec(),
+            ),
             (vec!["READONLY"], b"+OK\r\n".to_vec()),
             (vec!["GET", "foo"], bulk_string("replica-value").encode()),
             (vec!["READWRITE"], b"+OK\r\n".to_vec()),
@@ -4608,7 +4666,7 @@ mod tests {
                 .unwrap();
             assert_eq!(read_raw_frame(&mut client).await.unwrap(), expected);
         }
-        assert_eq!(state.command_ids.load(Ordering::SeqCst), 4);
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 5);
         drop(client);
         upstream.await.unwrap();
         server.abort();
@@ -5490,7 +5548,6 @@ mod tests {
                 command_ids: Arc::new(AtomicU64::new(0)),
                 local_slots: None,
                 cluster_sim: None,
-                cluster_sim: None,
                 redirection_map: ClusterRedirectionMap::default(),
             };
             let command_ids = state.command_ids.clone();
@@ -5737,6 +5794,7 @@ mod tests {
 
     fn sim_state(sim: crate::cluster_sim::ClusterSim) -> SharedState {
         SharedState {
+            shutdown: Arc::new(Notify::new()),
             stats: Arc::new(Stats::default()),
             repro: None,
             monitor: monitor_sender(),

@@ -222,6 +222,15 @@ All notable changes to this project will be documented in this file.
   connections. While active, bootstrap topology queries return the simulated
   topology instead of the startup snapshot; they still bypass mutation and do
   not consume a command index.
+- Cluster mode now advertises stable proxy node IDs: the first 40 lowercase
+  hex characters of `SHA256("evilresp:node-id:" + upstream_id)`. Standard
+  node IDs and their references agree across `SLOTS`, `SHARDS`, `NODES`,
+  `MYID`, `REPLICAS`/`SLAVES`, and `LINKS`; nonstandard IDs stay unchanged.
+  These top-level queries bypass faults and command indexes. Known proxy-ID
+  arguments are translated back for replica queries and node-ID-taking
+  `FORGET`, `REPLICATE`, `COUNT-FAILURE-REPORTS`, and `SETSLOT` commands.
+  Client command fingerprints, mutation seeds, and repro bytes stay original.
+
 - Use compact Unix timestamps with six microsecond digits in human and JSON
   logs for stderr, files, and syslog, replacing fully qualified date strings.
   JSON timestamps remain strings.

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, info};
@@ -102,6 +103,7 @@ pub struct ClusterRedirectionMap {
     local_by_upstream: BTreeMap<String, String>,
     local_by_unique_upstream_port: BTreeMap<u16, String>,
     local_by_node_id: BTreeMap<Vec<u8>, String>,
+    upstream_by_proxy_id: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl ClusterRedirectionMap {
@@ -116,6 +118,8 @@ impl ClusterRedirectionMap {
         let mut map = Self::from_mappings(mappings);
         for node in nodes() {
             if let Some(id) = &node.node_id {
+                map.upstream_by_proxy_id
+                    .insert(proxy_node_id(id), id.clone());
                 map.local_by_node_id.insert(
                     id.clone(),
                     socket_addr_to_endpoint(node.local).connect_addr(),
@@ -152,7 +156,12 @@ impl ClusterRedirectionMap {
             local_by_upstream,
             local_by_unique_upstream_port,
             local_by_node_id: BTreeMap::new(),
+            upstream_by_proxy_id: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn upstream_node_id(&self, id: &[u8]) -> Option<&[u8]> {
+        self.upstream_by_proxy_id.get(id).map(Vec::as_slice)
     }
 
     pub fn rewrite_node(
@@ -198,15 +207,31 @@ impl LocalSlotRange {
 
 impl LocalNode {
     fn to_resp_frame(&self) -> Frame {
-        let node_id = self.node_id.clone().unwrap_or_else(|| {
-            format!("evilresp-{}", self.local.port()).into_bytes()
-        });
+        let node_id = self
+            .node_id
+            .as_deref()
+            .map(proxy_node_id)
+            .unwrap_or_else(|| {
+                format!("evilresp-{}", self.local.port()).into_bytes()
+            });
         Frame::Array(Some(vec![
             Frame::BulkString(Some(self.local.ip().to_string().into_bytes())),
             Frame::Integer(i64::from(self.local.port())),
             Frame::BulkString(Some(node_id)),
         ]))
     }
+}
+
+/// Stable client-facing identity, independent of listeners and evil settings.
+/// Leave nonstandard IDs untouched instead of silently changing their format.
+pub(crate) fn proxy_node_id(id: &[u8]) -> Vec<u8> {
+    if id.len() != 40 || !id.iter().all(u8::is_ascii_hexdigit) {
+        return id.to_vec();
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"evilresp:node-id:");
+    hash.update(id);
+    hex::encode(&hash.finalize()[..20]).into_bytes()
 }
 
 pub async fn discover(
@@ -524,6 +549,133 @@ mod tests {
 
     fn bulk(value: &str) -> Frame {
         Frame::BulkString(Some(value.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn node_ids_are_stable_hex_and_nonstandard_ids_are_unchanged() {
+        let original = b"004b6de33f0bada48c901e1cfe6a15a465f094a6";
+        let expected = b"c6a4b48cd048f7c532cc8f9d10bf52faaee0e807";
+        assert_eq!(proxy_node_id(original), expected);
+        assert_ne!(proxy_node_id(original), original);
+        for id in [
+            b"".as_slice(),
+            b"-",
+            b"node",
+            &[b'g'; 40],
+            &[b'a'; 39],
+            &[b'a'; 41],
+            &[0xff; 40],
+        ] {
+            assert_eq!(proxy_node_id(id), id);
+        }
+
+        let original_text = std::str::from_utf8(original).unwrap();
+        let expected_text = std::str::from_utf8(expected).unwrap();
+        for port in [6380, 9000] {
+            let slots = parse_cluster_slots(
+                vec![range(
+                    0,
+                    16383,
+                    vec![node("upstream", 6379, original_text)],
+                )],
+                &"upstream:6379".parse().unwrap(),
+            )
+            .unwrap();
+            let topology = map_cluster_slots(
+                slots,
+                format!("127.0.0.1:{port}").parse().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                topology.local_slots_response(),
+                Some(Frame::Array(Some(vec![range(
+                    0,
+                    16383,
+                    vec![node("127.0.0.1", port, expected_text)],
+                )])))
+            );
+            let map = topology.local_redirection_map();
+            assert_eq!(
+                map.upstream_node_id(expected),
+                Some(original.as_slice())
+            );
+            assert_eq!(map.upstream_node_id(b"unknown"), None);
+            // Endpoint matching must still use the upstream identity.
+            assert_eq!(
+                map.rewrite_node(Some(original), "unknown:1"),
+                Some(format!("127.0.0.1:{port}"))
+            );
+
+            for (args, index) in [
+                (vec!["CLUSTER", "REPLICAS", expected_text], 2),
+                (vec!["cluster", "slaves", expected_text], 2),
+                (vec!["CLUSTER", "FORGET", expected_text], 2),
+                (vec!["CLUSTER", "REPLICATE", expected_text], 2),
+                (vec!["CLUSTER", "COUNT-FAILURE-REPORTS", expected_text], 2),
+                (
+                    vec![
+                        "CLUSTER",
+                        "SETSLOT",
+                        "42",
+                        "IMPORTING",
+                        expected_text,
+                    ],
+                    4,
+                ),
+                (
+                    vec![
+                        "CLUSTER",
+                        "SETSLOT",
+                        "42",
+                        "MIGRATING",
+                        expected_text,
+                    ],
+                    4,
+                ),
+                (vec!["CLUSTER", "SETSLOT", "42", "node", expected_text], 4),
+            ] {
+                let command = Frame::Array(Some(
+                    args.iter().map(|arg| bulk(arg)).collect(),
+                ));
+                let translated =
+                    crate::cluster_rewrite::upstream_cluster_command(
+                        &command,
+                        &command.argv_lossy(),
+                        &map,
+                    )
+                    .unwrap();
+                let mut forwarded = args;
+                forwarded[index] = original_text;
+                assert_eq!(
+                    translated,
+                    Frame::Array(Some(
+                        forwarded.iter().map(|arg| bulk(arg)).collect()
+                    ))
+                    .encode()
+                );
+                assert_eq!(command.argv_lossy()[index].as_bytes(), expected);
+            }
+            for args in [
+                vec!["CLUSTER", "REPLICAS"],
+                vec!["CLUSTER", "REPLICAS", "unknown"],
+                vec!["CLUSTER", "REPLICAS", original_text],
+                vec!["CLUSTER", "REPLICAS", expected_text, "extra"],
+                vec!["CLUSTER", "SETSLOT", "42", "STABLE", expected_text],
+                vec!["GET", expected_text],
+            ] {
+                let command = Frame::Array(Some(
+                    args.iter().map(|arg| bulk(arg)).collect(),
+                ));
+                assert!(
+                    crate::cluster_rewrite::upstream_cluster_command(
+                        &command,
+                        &command.argv_lossy(),
+                        &map
+                    )
+                    .is_none()
+                );
+            }
+        }
     }
 
     #[tokio::test]

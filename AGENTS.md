@@ -57,14 +57,14 @@ logging and Tokio before calling `proxy::run`. Keep `main.rs` that thin.
 | `framing.rs`              | Framing configuration, length-header selection, and corruption metadata; `resp.rs` encodes the selected header override.       |
 | `topology_evil.rs`        | Fake/altered `MOVED`/`ASK` redirections, independent of RESP mutation.                                                        |
 | `topology_config.rs`      | Validated focused redirection options and status formatting. |
-| `cluster.rs`              | Startup `CLUSTER SLOTS` probe, `Topology`, mapping upstream nodes to local listeners.                                          |
+| `cluster.rs`              | Startup `CLUSTER SLOTS` probe, `Topology`, listener mapping, and deterministic proxy node IDs. |
+| `cluster_rewrite.rs`      | Rewriting cluster topology/identity replies and translating supported node-ID command arguments. |
 | `cluster_sim.rs`          | Process-wide `DEBUG EVIL CLUSTER` runtime, per-connection simulated session state, routing accepted commands to real slot owners. |
 | `cluster_sim_model.rs`    | Pure simulated cluster snapshot: nodes, roles, health, slot ranges, migrations, invariants. |
 | `cluster_sim_timeline.rs` | Scenario options and deterministic timelines of authoritative states and per-node (stale) views. |
 | `cluster_sim_render.rs`   | Synthesized `CLUSTER SLOTS`/`SHARDS`/`NODES`/`INFO`/`MYID`/`MYSHARDID` from one node's view. |
 | `cluster_sim_route.rs`    | Pure `getNodeByQuery()`-style routing: MOVED/ASK/TRYAGAIN/CROSSSLOT/CLUSTERDOWN/LOADING/close. |
 | `command_keys.rs`         | Key positions and write/loading flags from the upstream `COMMAND` table. |
-| `cluster_rewrite.rs`      | Rewriting `CLUSTER SLOTS`/`SHARDS`/`NODES` replies and redirections to local listeners.                                        |
 | `protocol_fingerprint.rs` | Per-connection BLAKE3/TLSH fingerprints of client-in and client-out bytes.                                                     |
 | `repro.rs`                | `--repro-file` JSONL writer and `ReproRecord` schema.                                                                         |
 | `transaction.rs`          | Tracking upstream-acknowledged transaction commands for `EXEC` reply canonicalization.                                      |
@@ -108,13 +108,18 @@ them need a test proving they still hold.
   Track subscription completion from original acknowledgements, never mutated
   bytes. RESP3 ordinary arrays remain replies even while subscribed. PUSH
   mutation is opt-in and independent of command filters and transport faults.
-- **Clients can always bootstrap.** `CLUSTER SLOTS`, `CLUSTER SHARDS`, and
-  `CLUSTER NODES` bypass reply mutation and do not consume a command index
-  in cluster mode. While a cluster simulation is active they (and
-  `CLUSTER INFO`/`MYID`/`MYSHARDID`) return the simulated view instead of the
-  startup snapshot, still without mutation or index consumption. The default exclude list in
+- **Clients can always bootstrap.** `CLUSTER SLOTS`, `SHARDS`, `NODES`,
+  `MYID`, `REPLICAS`/`SLAVES`, and `LINKS` bypass faults and do not consume a
+  command index in cluster mode. While a cluster simulation is active,
+  `SLOTS`/`SHARDS`/`NODES`/`INFO`/`MYID`/`MYSHARDID` return its view
+  without mutation or index consumption. The default exclude list in
   `evil.rs::DEFAULT_EXCLUDED_COMMANDS` exists for the same reason; extend it
   deliberately, not casually.
+- **Proxy node IDs are stable.** Standard IDs map to the first 40 lowercase
+  hex characters of `SHA256("evilresp:node-id:" + upstream_id)` across all
+  supported topology/identity replies. Keep upstream IDs for internal matching;
+  translate supported command arguments only at forwarding, preserving original
+  client bytes for fingerprints, mutation seeds, monitoring, and repro records.
 - **Evil config is per client connection.** New connections start non-evil.
   Shared state is limited to what must be global (command index, reset epoch,
   monitor fan-out, repro writer, aggregate monitoring counters, shutdown signal, and the

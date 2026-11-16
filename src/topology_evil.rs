@@ -507,7 +507,7 @@ fn frame_string(frame: &Frame) -> Option<String> {
     }
 }
 
-fn redis_slot(key: &[u8]) -> i32 {
+pub(crate) fn redis_slot(key: &[u8]) -> i32 {
     i32::from(crc16_xmodem(key_tag(key)) % CLUSTER_SLOT_COUNT as u16)
 }
 

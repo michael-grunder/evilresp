@@ -6,6 +6,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info};
 
 use crate::cli::{Endpoint, TcpEndpoint};
+use crate::cluster_sim::{ClusterSim, RealRange};
 use crate::error::{AppError, AppResult};
 use crate::resp::{Frame, parse_frame, read_raw_frame};
 use crate::upstream_identity::UpstreamIdentity;
@@ -36,6 +37,33 @@ impl Topology {
                 slots.iter().map(LocalSlotRange::to_resp_frame).collect(),
             ))),
         }
+    }
+
+    /// Simulation runtime for this topology; `None` in standalone mode.
+    pub(crate) fn cluster_sim(&self) -> Option<ClusterSim> {
+        let Topology::Cluster { targets, slots } = self else {
+            return None;
+        };
+        let addresses = targets
+            .iter()
+            .filter_map(|target| {
+                target.listen.as_tcp()?.connect_addr().parse().ok()
+            })
+            .collect::<Vec<SocketAddr>>();
+        let primaries = slots
+            .iter()
+            .map(|slot| slot.primary.local)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let ranges = slots
+            .iter()
+            .map(|slot| RealRange {
+                start: slot.start,
+                end: slot.end,
+                primary: slot.primary.upstream.clone(),
+            })
+            .collect();
+        Some(ClusterSim::new(addresses, primaries, ranges))
     }
 
     pub fn local_redirection_map(&self) -> ClusterRedirectionMap {

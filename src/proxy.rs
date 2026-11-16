@@ -18,6 +18,9 @@ use crate::cluster_rewrite::{
     is_cluster_nodes, is_cluster_shards, rewrite_cluster_nodes,
     rewrite_cluster_shards,
 };
+use crate::cluster_sim::{
+    ClusterSim, ExchangeContext, SimConnection, SimOutcome,
+};
 use crate::connection::{ProxyStream, finish_fault};
 use crate::error::{AppError, AppResult};
 use crate::evil::{
@@ -109,6 +112,7 @@ struct SharedState {
     command_ids: Arc<AtomicU64>,
     local_slots: Option<Frame>,
     redirection_map: ClusterRedirectionMap,
+    cluster_sim: Option<Arc<ClusterSim>>,
 }
 
 pub async fn run(cli: Cli) -> AppResult<()> {
@@ -127,6 +131,7 @@ pub async fn run(cli: Cli) -> AppResult<()> {
         connection_ids: Arc::new(AtomicU64::new(0)),
         command_ids: Arc::new(AtomicU64::new(0)),
         local_slots: topology.local_slots_response(),
+        cluster_sim: topology.cluster_sim().map(Arc::new),
         redirection_map: topology.local_redirection_map(),
     };
 
@@ -231,6 +236,11 @@ async fn proxy_connection(
     let mut fingerprints = ProtocolFingerprints::new();
     let mut transaction_commands = TransactionCommands::default();
     let mut config = EvilConfig::default();
+    let mut simulation = SimConnection::new(
+        state.cluster_sim.as_deref(),
+        &target.listen,
+        connection_id,
+    );
 
     loop {
         let command_bytes = match read_raw_frame(&mut client_read).await {
@@ -298,6 +308,20 @@ async fn proxy_connection(
             return Ok(());
         }
 
+        if is_debug_evil(&argv)
+            && argv
+                .get(2)
+                .is_some_and(|sub| sub.eq_ignore_ascii_case("CLUSTER"))
+        {
+            publish_monitor_command(&state, connection_id, &command_frame);
+            let response =
+                apply_debug_cluster(&state, &argv, config.seed, &mut upstream)
+                    .await;
+            write_client_frame(&mut client_write, &mut fingerprints, &response)
+                .await?;
+            continue;
+        }
+
         if is_debug_evil(&argv) {
             publish_monitor_command(&state, connection_id, &command_frame);
             let result = apply_debug_evil(
@@ -320,6 +344,28 @@ async fn proxy_connection(
                 .await?;
             }
             continue;
+        }
+
+        if let Some(sim) = &state.cluster_sim
+            && let Some(outcome) = simulation.topology_reply(
+                sim,
+                &argv,
+                state.command_ids.load(Ordering::SeqCst),
+            )
+        {
+            publish_monitor_command(&state, connection_id, &command_frame);
+            match outcome {
+                SimOutcome::Reply(bytes) => {
+                    write_client_bytes(
+                        &mut client_write,
+                        &mut fingerprints,
+                        &bytes,
+                    )
+                    .await?;
+                    continue;
+                }
+                SimOutcome::Close => return Ok(()),
+            }
         }
 
         if is_cluster_slots(&argv)
@@ -447,25 +493,53 @@ async fn proxy_connection(
                 if let Some(topology) = pre_topology {
                     (None, None, Vec::new(), Some(topology))
                 } else {
-                    let upstream_bytes =
-                        match upstream.exchange(&command_bytes, &argv).await {
-                            Ok(bytes) => bytes,
-                            Err(_) => {
-                                transaction_commands =
-                                    TransactionCommands::default();
-                                write_client_bytes(
-                                    &mut client_write,
-                                    &mut fingerprints,
-                                    UNAVAILABLE_REPLY,
+                    let simulated = match &state.cluster_sim {
+                        Some(sim) => {
+                            simulation
+                                .exchange(
+                                    ExchangeContext {
+                                        sim,
+                                        own_upstream: &target.upstream,
+                                        upstream: &mut upstream,
+                                        command_index: command_id,
+                                    },
+                                    &command_frame,
+                                    &command_bytes,
+                                    &argv,
                                 )
-                                .await?;
-                                continue;
-                            }
-                        };
+                                .await
+                        }
+                        None => None,
+                    };
+                    let is_simulated = simulated.is_some();
+                    let exchanged = match simulated {
+                        Some(Ok(SimOutcome::Reply(bytes))) => Ok(bytes),
+                        Some(Ok(SimOutcome::Close)) => return Ok(()),
+                        Some(Err(error)) => Err(error),
+                        None => upstream.exchange(&command_bytes, &argv).await,
+                    };
+                    let upstream_bytes = match exchanged {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            transaction_commands =
+                                TransactionCommands::default();
+                            write_client_bytes(
+                                &mut client_write,
+                                &mut fingerprints,
+                                UNAVAILABLE_REPLY,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
                     let exec_commands =
                         transaction_commands.observe(&argv, &upstream_bytes);
-                    let relay_bytes =
-                        normalize_cluster_redirection(&upstream_bytes, &state)?;
+                    // Simulated redirections already name local listeners.
+                    let relay_bytes = if is_simulated {
+                        upstream_bytes.clone()
+                    } else {
+                        normalize_cluster_redirection(&upstream_bytes, &state)?
+                    };
                     let topology = if should_mutate
                         && let Some(local_slots) = &state.local_slots
                     {
@@ -669,6 +743,47 @@ fn apply_debug_evil(
                 frame: Frame::SimpleError(format!("ERR {error}")),
                 action: DebugAction::None,
             }
+        }
+    }
+}
+
+async fn apply_debug_cluster(
+    state: &SharedState,
+    argv: &[String],
+    seed: u64,
+    upstream: &mut UpstreamConnection,
+) -> Frame {
+    let result = match &state.cluster_sim {
+        Some(sim) => {
+            sim.apply_debug(
+                argv,
+                seed,
+                state.command_ids.load(Ordering::SeqCst),
+                upstream,
+            )
+            .await
+        }
+        None => Err(AppError::EvilConfig(
+            "CLUSTER requires cluster proxy mode".to_owned(),
+        )),
+    };
+    match result {
+        Ok(frame) => {
+            if argv
+                .get(3)
+                .is_some_and(|sub| sub.eq_ignore_ascii_case("STATUS"))
+            {
+                state.stats.status_read();
+            } else {
+                state.stats.configuration_updated();
+                info!(command = %argv[3..].join(" "), "updated cluster simulation");
+            }
+            frame
+        }
+        Err(error) => {
+            state.stats.command_rejected();
+            warn!(%error, "rejected DEBUG EVIL CLUSTER command");
+            Frame::SimpleError(format!("ERR {error}"))
         }
     }
 }
@@ -975,6 +1090,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(2)),
             command_ids: Arc::new(AtomicU64::new(23)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let buffer = LogBuffer::default();
@@ -1221,6 +1337,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let command_ids = Arc::clone(&state.command_ids);
@@ -1323,6 +1440,7 @@ mod tests {
                 connection_ids: Arc::new(AtomicU64::new(0)),
                 command_ids: Arc::new(AtomicU64::new(0)),
                 local_slots: cluster.then(|| Frame::Array(Some(Vec::new()))),
+                cluster_sim: None,
                 redirection_map: ClusterRedirectionMap::default(),
             };
             let command_ids = state.command_ids.clone();
@@ -1442,6 +1560,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
 
@@ -1742,6 +1861,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let proxy = tokio::spawn(proxy_connection(
@@ -1828,6 +1948,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(17)),
             command_ids: Arc::new(AtomicU64::new(23)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
 
@@ -1945,6 +2066,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
 
@@ -2073,6 +2195,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let command_ids = state.command_ids.clone();
@@ -2327,6 +2450,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         }
     }
@@ -2608,6 +2732,7 @@ mod tests {
                 connection_ids: Arc::new(AtomicU64::new(0)),
                 command_ids: Arc::new(AtomicU64::new(0)),
                 local_slots: None,
+                cluster_sim: None,
                 redirection_map: ClusterRedirectionMap::default(),
             };
             let command_ids = state.command_ids.clone();
@@ -2722,6 +2847,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: Some(cluster_slots_frame()),
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let mut client = spawn_proxy_client(target, state, 0);
@@ -3213,6 +3339,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: Some(slots.clone()),
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let mut listeners = JoinSet::new();
@@ -3365,6 +3492,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: Some(cluster_slots_frame()),
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::from_mappings([(
                 TcpEndpoint {
                     host: "127.0.0.1".to_owned(),
@@ -3515,6 +3643,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: topology.local_slots_response(),
+            cluster_sim: None,
             redirection_map: topology.local_redirection_map(),
         };
         let server = tokio::spawn(serve_listener(
@@ -3626,6 +3755,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: Some(cluster_slots_frame()),
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::from_mappings([(
                 TcpEndpoint {
                     host: "127.0.0.1".to_owned(),
@@ -3734,6 +3864,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(2)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
 
@@ -3806,6 +3937,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
 
@@ -3894,6 +4026,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let proxy = tokio::spawn(proxy_connection(
@@ -4024,6 +4157,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(0)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
 
@@ -4116,6 +4250,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let mut client = spawn_proxy_client(target, state, 0);
@@ -4192,6 +4327,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let mut client = spawn_proxy_client(target, state, 0);
@@ -4434,6 +4570,7 @@ mod tests {
                 connection_ids: Arc::new(AtomicU64::new(0)),
                 command_ids: Arc::new(AtomicU64::new(0)),
                 local_slots: None,
+                cluster_sim: None,
                 redirection_map: ClusterRedirectionMap::default(),
             };
             let command_ids = state.command_ids.clone();
@@ -4544,6 +4681,7 @@ mod tests {
             connection_ids: Arc::new(AtomicU64::new(initial_connection_id + 1)),
             command_ids: Arc::new(AtomicU64::new(0)),
             local_slots: None,
+            cluster_sim: None,
             redirection_map: ClusterRedirectionMap::default(),
         };
         let proxy = tokio::spawn(proxy_connection(
@@ -4609,6 +4747,423 @@ mod tests {
         }
 
         response
+    }
+
+    async fn spawn_fake_primary(
+        name: &'static str,
+    ) -> (TcpEndpoint, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen, requests) = tokio::sync::mpsc::unbounded_channel();
+        let table = Frame::Array(Some(
+            [
+                ("get", "readonly", 1),
+                ("set", "write", 1),
+                ("ping", "loading", 0),
+            ]
+            .into_iter()
+            .map(|(command, flag, key)| {
+                Frame::Array(Some(vec![
+                    bulk_string(command),
+                    Frame::Integer(-1),
+                    Frame::Array(Some(vec![Frame::SimpleString(
+                        flag.to_owned(),
+                    )])),
+                    Frame::Integer(key),
+                    Frame::Integer(key),
+                    Frame::Integer(key),
+                ]))
+            })
+            .collect(),
+        ))
+        .encode();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream =
+                    crate::upstream_identity::accept_identity(stream).await;
+                let seen = seen.clone();
+                let table = table.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = tokio::io::split(stream);
+                    let mut read = BufReader::new(read);
+                    while let Ok(bytes) = read_raw_frame(&mut read).await {
+                        let reply = if bytes == resp_command(&["COMMAND"]) {
+                            table.clone()
+                        } else {
+                            bulk_string(name).encode()
+                        };
+                        let _ = seen.send(bytes);
+                        if write.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (
+            TcpEndpoint {
+                host: address.ip().to_string(),
+                port: address.port(),
+            },
+            requests,
+        )
+    }
+
+    fn sim_state(sim: crate::cluster_sim::ClusterSim) -> SharedState {
+        SharedState {
+            stats: Arc::new(Stats::default()),
+            repro: None,
+            monitor: monitor_sender(),
+            reset_barrier: Arc::new(RwLock::new(())),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
+            connection_ids: Arc::new(AtomicU64::new(0)),
+            command_ids: Arc::new(AtomicU64::new(0)),
+            local_slots: Some(cluster_slots_frame()),
+            cluster_sim: Some(Arc::new(sim)),
+            redirection_map: ClusterRedirectionMap::default(),
+        }
+    }
+
+    fn key_where(predicate: impl Fn(u16) -> bool) -> String {
+        (0..)
+            .map(|index| format!("key:{index}"))
+            .find(|key| {
+                predicate(
+                    crate::topology_evil::redis_slot(key.as_bytes()) as u16
+                )
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cluster_simulation_serves_partial_topology_from_real_owners() {
+        use crate::cluster_sim::{ClusterSim, RealRange};
+        use crate::cluster_sim_render::{RenderContext, cluster_slots};
+        use crate::cluster_sim_timeline::{SimConfig, Timeline};
+
+        let (a, mut a_seen) = spawn_fake_primary("A").await;
+        let (b, mut b_seen) = spawn_fake_primary("B").await;
+        let listeners: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:7100".parse().unwrap(),
+            "127.0.0.1:7101".parse().unwrap(),
+        ];
+        let state = sim_state(ClusterSim::new(
+            listeners.clone(),
+            2,
+            vec![
+                RealRange {
+                    start: 0,
+                    end: 8191,
+                    primary: a.clone(),
+                },
+                RealRange {
+                    start: 8192,
+                    end: 16383,
+                    primary: b.clone(),
+                },
+            ],
+        ));
+        let target = |node: usize, upstream: &TcpEndpoint| ProxyTarget {
+            upstream: Endpoint::Tcp(upstream.clone()),
+            listen: Endpoint::Tcp(listeners[node].to_string().parse().unwrap()),
+        };
+        let mut primary = spawn_proxy_client(target(0, &a), state.clone(), 0);
+        let scenario = ["PARTIAL", "SEED", "1", "SHARDS", "1", "EVERY", "1000"];
+        let mut command = vec!["DEBUG", "EVIL", "CLUSTER", "SCENARIO"];
+        command.extend(scenario);
+        assert_eq!(topology_request(&mut primary, &command).await, b"+OK\r\n");
+        assert_eq!(a_seen.recv().await.unwrap(), resp_command(&["COMMAND"]));
+
+        let args = scenario.map(str::to_owned);
+        let timeline =
+            Timeline::build(SimConfig::parse(&args, 0).unwrap(), 2, 2).unwrap();
+        let view = timeline.view(0, 0);
+        let expected = cluster_slots(
+            &view,
+            &RenderContext {
+                timeline: &timeline,
+                addresses: &listeners,
+                resp3: false,
+                stage: 0,
+                node: 0,
+            },
+        );
+        assert_eq!(
+            topology_request(&mut primary, &["CLUSTER", "SLOTS"]).await,
+            expected.encode()
+        );
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 0);
+
+        // An unassigned slot is not served by any node, and is not forwarded.
+        let hole = key_where(|slot| view.owner(slot).is_none());
+        assert_eq!(
+            topology_request(&mut primary, &["GET", &hole]).await,
+            b"-CLUSTERDOWN Hash slot not served\r\n"
+        );
+        // Simulated node 0 owns every assigned slot; the command executes
+        // on the real owner of the slot, which is B.
+        let key = key_where(|slot| slot >= 8192 && view.owner(slot) == Some(0));
+        assert_eq!(
+            topology_request(&mut primary, &["SET", &key, "v"]).await,
+            b"$1\r\nB\r\n"
+        );
+        assert_eq!(
+            b_seen.recv().await.unwrap(),
+            resp_command(&["SET", &key, "v"])
+        );
+        assert!(a_seen.try_recv().is_err());
+
+        // Node 1 is a simulated replica: it redirects unless READONLY.
+        let mut replica = spawn_proxy_client(target(1, &b), state.clone(), 1);
+        let slot = crate::topology_evil::redis_slot(key.as_bytes());
+        assert_eq!(
+            topology_request(&mut replica, &["GET", &key]).await,
+            format!("-MOVED {slot} 127.0.0.1:7100\r\n").as_bytes()
+        );
+        assert_eq!(
+            topology_request(&mut replica, &["READONLY"]).await,
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            topology_request(&mut replica, &["GET", &key]).await,
+            b"$1\r\nB\r\n"
+        );
+        assert_eq!(
+            topology_request(&mut replica, &["SET", &key, "v"]).await,
+            format!("-MOVED {slot} 127.0.0.1:7100\r\n").as_bytes()
+        );
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 6);
+
+        let status = topology_request(
+            &mut primary,
+            &["DEBUG", "EVIL", "CLUSTER", "STATUS"],
+        )
+        .await;
+        let status = String::from_utf8(status).unwrap();
+        assert!(
+            status.contains("cluster=PARTIAL cluster_seed=1"),
+            "{status}"
+        );
+        assert!(status.contains("cluster_stage=0 "), "{status}");
+        assert_eq!(
+            topology_request(
+                &mut primary,
+                &["DEBUG", "EVIL", "CLUSTER", "OFF"]
+            )
+            .await,
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            topology_request(&mut primary, &["CLUSTER", "SLOTS"]).await,
+            cluster_slots_frame().encode()
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_simulation_stages_advance_with_command_index_and_reset() {
+        use crate::cluster_sim::{ClusterSim, RealRange};
+
+        let (a, _a_seen) = spawn_fake_primary("A").await;
+        let listeners: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:7200".parse().unwrap(),
+            "127.0.0.1:7201".parse().unwrap(),
+        ];
+        let state = sim_state(ClusterSim::new(
+            listeners.clone(),
+            1,
+            vec![RealRange {
+                start: 0,
+                end: 16383,
+                primary: a.clone(),
+            }],
+        ));
+        // Node 1 is the replica that is promoted; node 0 goes down.
+        let target = ProxyTarget {
+            upstream: Endpoint::Tcp(a.clone()),
+            listen: Endpoint::Tcp(listeners[1].to_string().parse().unwrap()),
+        };
+        let run = |state: SharedState| {
+            let target = target.clone();
+            async move {
+                let mut client = spawn_proxy_client(target, state.clone(), 0);
+                let mut transcript = Vec::new();
+                for _ in 0..12 {
+                    transcript.extend(
+                        topology_request(&mut client, &["CLUSTER", "SHARDS"])
+                            .await,
+                    );
+                    transcript.extend(
+                        topology_request(&mut client, &["GET", "{a}x"]).await,
+                    );
+                }
+                (client, transcript)
+            }
+        };
+        let (mut client, _) = run(state.clone()).await;
+        assert_eq!(
+            topology_request(
+                &mut client,
+                &[
+                    "DEBUG", "EVIL", "CLUSTER", "SCENARIO", "FAILOVER",
+                    "SHARDS", "1", "REPLICAS", "1", "EVERY", "2", "SEED", "4",
+                ],
+            )
+            .await,
+            b"+OK\r\n"
+        );
+        assert_eq!(
+            topology_request(&mut client, &["DEBUG", "EVIL", "MODE", "RESET"])
+                .await,
+            b"+OK\r\n"
+        );
+        let (_, first) = run(state.clone()).await;
+        assert_eq!(state.command_ids.load(Ordering::SeqCst), 12);
+        let first = String::from_utf8_lossy(&first).into_owned();
+        // The failed primary is reported by SHARDS and the stage advanced.
+        assert!(first.contains("$4\r\nfail\r\n"), "{first}");
+        // Redirected to the old primary first, then served after promotion.
+        let slot = crate::topology_evil::redis_slot(b"a");
+        let moved = first
+            .find(&format!("-MOVED {slot} 127.0.0.1:7200\r\n"))
+            .unwrap_or_else(|| panic!("{first}"));
+        let served = first.find("$1\r\nA\r\n").unwrap();
+        assert!(moved < served, "{first}");
+        // The old primary rejoins as a loading replica.
+        assert!(first.contains("$7\r\nloading\r\n"), "{first}");
+
+        let mut reset = spawn_proxy_client(target.clone(), state.clone(), 2);
+        assert_eq!(
+            topology_request(&mut reset, &["DEBUG", "EVIL", "MODE", "RESET"])
+                .await,
+            b"+OK\r\n"
+        );
+        let (_, second) = run(state.clone()).await;
+        assert_eq!(first.as_bytes(), second, "reset replays the same timeline");
+    }
+
+    #[tokio::test]
+    async fn cluster_simulation_runs_transactions_on_the_real_owner() {
+        use crate::cluster_sim::{ClusterSim, RealRange};
+
+        let (a, mut a_seen) = spawn_fake_primary("A").await;
+        let (b, mut b_seen) = spawn_fake_primary("B").await;
+        let listeners: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:7300".parse().unwrap(),
+            "127.0.0.1:7301".parse().unwrap(),
+        ];
+        let state = sim_state(ClusterSim::new(
+            listeners.clone(),
+            2,
+            vec![
+                RealRange {
+                    start: 0,
+                    end: 8191,
+                    primary: a.clone(),
+                },
+                RealRange {
+                    start: 8192,
+                    end: 16383,
+                    primary: b.clone(),
+                },
+            ],
+        ));
+        let target = ProxyTarget {
+            upstream: Endpoint::Tcp(a.clone()),
+            listen: Endpoint::Tcp(listeners[0].to_string().parse().unwrap()),
+        };
+        let mut client = spawn_proxy_client(target, state.clone(), 0);
+        assert_eq!(
+            topology_request(
+                &mut client,
+                &[
+                    "DEBUG", "EVIL", "CLUSTER", "SCENARIO", "STABLE", "SHARDS",
+                    "1"
+                ],
+            )
+            .await,
+            b"+OK\r\n"
+        );
+        a_seen.recv().await.unwrap();
+        let key = key_where(|slot| slot >= 8192);
+        let other = key_where(|slot| slot < 8192);
+        assert_eq!(topology_request(&mut client, &["MULTI"]).await, b"+OK\r\n");
+        assert_eq!(
+            topology_request(&mut client, &["SET", &key, "v"]).await,
+            b"+QUEUED\r\n"
+        );
+        assert_eq!(
+            topology_request(&mut client, &["EXEC"]).await,
+            b"$1\r\nB\r\n"
+        );
+        for expected in [
+            resp_command(&["MULTI"]),
+            resp_command(&["SET", &key, "v"]),
+            resp_command(&["EXEC"]),
+        ] {
+            assert_eq!(b_seen.recv().await.unwrap(), expected);
+        }
+        // Keys in different slots are rejected at EXEC, as Redis does.
+        assert_eq!(topology_request(&mut client, &["MULTI"]).await, b"+OK\r\n");
+        topology_request(&mut client, &["SET", &key, "v"]).await;
+        topology_request(&mut client, &["SET", &other, "v"]).await;
+        assert_eq!(
+            topology_request(&mut client, &["EXEC"]).await,
+            b"-CROSSSLOT Keys in request don't hash to the same slot\r\n"
+        );
+        assert!(b_seen.try_recv().is_err() && a_seen.try_recv().is_err());
+        assert_eq!(
+            topology_request(&mut client, &["MULTI", "x"]).await.first(),
+            Some(&b'+')
+        );
+        assert_eq!(
+            topology_request(&mut client, &["MULTI"]).await,
+            b"-ERR MULTI calls can not be nested\r\n"
+        );
+        assert_eq!(
+            topology_request(&mut client, &["DISCARD"]).await,
+            b"+OK\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_simulation_requires_cluster_mode_and_valid_options() {
+        let path = unique_socket_path("cluster-sim-standalone");
+        let listener = UnixListener::bind(&path).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Hold the identified session open; nothing must be forwarded.
+            let mut stream =
+                crate::upstream_identity::accept_identity(stream).await;
+            let mut rest = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut rest)
+                .await
+                .unwrap();
+            rest
+        });
+        let mut state = sim_state(crate::cluster_sim::ClusterSim::new(
+            vec!["127.0.0.1:7400".parse().unwrap()],
+            1,
+            Vec::new(),
+        ));
+        state.cluster_sim = None;
+        let target = ProxyTarget {
+            upstream: Endpoint::Unix(path.clone()),
+            listen: Endpoint::Unix(path.clone()),
+        };
+        let mut client = spawn_proxy_client(target, state, 0);
+        let reply = topology_request(
+            &mut client,
+            &["DEBUG", "EVIL", "CLUSTER", "SCENARIO", "STABLE"],
+        )
+        .await;
+        assert_eq!(
+            reply,
+            b"-ERR invalid evil configuration: CLUSTER requires cluster proxy mode\r\n"
+        );
+        drop(client);
+        assert!(upstream.await.unwrap().is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 
     fn upstream_response_for<'a>(

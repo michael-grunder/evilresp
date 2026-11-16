@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `DEBUG EVIL CLUSTER SCENARIO <STABLE|PARTIAL|FAILOVER|MANUAL_FAILOVER|REPLICAS|RESHARD|RANDOM>`,
+  a deterministic, evolving cluster topology simulation for testing cluster
+  clients against valid Redis/Valkey topologies rather than malicious replies.
+  In cluster mode, every listener acts as a simulated node. `CLUSTER SLOTS`,
+  `SHARDS`, `NODES`, `INFO`, `MYID`, and `MYSHARDID` are synthesized from each
+  node's (possibly stale) view, and keyed commands are routed like
+  `getNodeByQuery()`: `CLUSTERDOWN Hash slot not served` for unassigned slots,
+  `CLUSTERDOWN The cluster is down` (optionally read-only) with
+  `FULL_COVERAGE YES`, `MOVED`, `ASK`/`ASKING`/`TRYAGAIN` for open migrations,
+  `READONLY` replica reads, `LOADING` for syncing replicas, and closed
+  connections for down nodes. Scenarios cover partial coverage that fills in,
+  automatic failover listing failed and promoted primaries, manual failover
+  with briefly dual primaries, replica removal/addition with loading, and slot
+  migration; `RANDOM` chains seeded operations and always settles to a fully
+  covered, converged cluster. Stages advance every `EVERY` shared command
+  indexes, so `MODE RESET` replays the same timeline. Accepted commands run
+  on the real upstream owner of the slot, with key positions from the upstream
+  `COMMAND` table and `COMMAND GETKEYS`. `DEBUG EVIL CLUSTER STATUS` reports
+  the current stage; `DEBUG EVIL CLUSTER OFF` restores normal proxying.
+
 - Added `DEBUG EVIL DEPTH <ANY|INNER>` to control how nesting depth weights
   mutation targets. `INNER` (the new default) weights each frame by `2^depth`:
   `MUTATIONS ONE` selects proportionally, `MUTATIONS MANY` keeps the full value
@@ -151,6 +171,12 @@ All notable changes to this project will be documented in this file.
   replies, and optional repro JSONL output.
 
 ### Changed
+
+- The cluster simulation is process-wide: unlike other `DEBUG EVIL` settings
+  it is configured from any connection and applies to all listeners and
+  connections. While active, bootstrap topology queries return the simulated
+  topology instead of the startup snapshot; they still bypass mutation and do
+  not consume a command index.
 
 - The new `DEPTH INNER` default changes seeded `MUTATE` and `OVERFLOW` output
   relative to earlier versions, including replies with a single scalar. Set

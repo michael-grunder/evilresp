@@ -84,7 +84,8 @@ In cluster mode, a redirection to a target with no mapped local listener
 returns `ERR evilresp has no local listener for redirection target`. Restart
 the proxy to discover changed topology, including changed slot ownership or
 primary/replica roles after failover; the synthesized `CLUSTER SLOTS` reply
-remains a startup snapshot. Rewriting also happens before RESP
+remains a startup snapshot. To test clients against changing topologies, see
+[`DEBUG EVIL CLUSTER`](#debug-evil-cluster). Rewriting also happens before RESP
 mutation, including when its probability is zero.
 
 Every upstream connection, including the startup discovery probe and Unix
@@ -976,6 +977,127 @@ The default exclude list avoids mutating commands that commonly break client
 setup too early: `AUTH`, `HELLO`, `CLIENT`, `SELECT`, `ASKING`, `MULTI`,
 `COMMAND`, `DISCARD`, `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE`, `UNSUBSCRIBE`,
 and `QUIT`.
+
+## DEBUG EVIL CLUSTER
+
+`DEBUG EVIL CLUSTER` simulates **valid, evolving** cluster topologies so
+cluster clients can be tested against shapes Redis and Valkey really return:
+partial slot coverage, failovers in progress, loading replicas, and open slot
+migrations. It is a correctness harness, not a malicious-reply generator, and
+it can be the only fault enabled.
+
+```text
+DEBUG EVIL CLUSTER SCENARIO <name> [SEED <u64>] [EVERY <commands>] [START <index>]
+    [SHARDS <n>] [REPLICAS <n>] [STEPS <0..256>]
+    [FULL_COVERAGE <YES|NO>] [READS_WHEN_DOWN <YES|NO>] [FLAVOR <REDIS|VALKEY>]
+DEBUG EVIL CLUSTER STATUS
+DEBUG EVIL CLUSTER OFF
+```
+
+It requires cluster proxy mode. **Unlike every other `DEBUG EVIL` setting, the
+scenario is process-wide**: it may be configured from any connection and
+applies to every listener and connection, including ones opened later and ones
+with evil mode off. A cluster client opens its own connections to each node,
+and they must agree on one topology. Per-connection settings (RESP mutation,
+transport, topology redirects) still apply on top and stay per connection.
+Use `MODE OFF`, `TOPOLOGY OFF`, and `TRANSPORT OFF` to isolate the simulation.
+
+### Simulated nodes and data
+
+Each local listener is one simulated node, in listener order (startup
+primaries first, then replicas). The simulated layout is independent of the
+real one: `SHARDS` defaults to the number of real primaries and `REPLICAS` to
+the most that fit, and leftover listeners are spare nodes outside the
+cluster. Simulated node IDs and Valkey shard IDs are 40-hex strings derived
+from the seed.
+
+A command that a simulated node accepts runs on the **real upstream primary
+that owns the key's slot** (startup topology), whichever listener received it.
+Real `MOVED`/`ASK` replies are followed internally, at most twice. Successful
+`AUTH` and `HELLO` are replayed on those extra upstream sessions, and a
+successful `RESET` clears them.
+Keyless commands, and pub/sub commands (whose routing is not simulated), go to
+the listener's own upstream.
+
+Key positions and `write`/`loading` flags come from the upstream `COMMAND`
+reply, loaded once when a scenario is first configured. Movable-key commands
+and commands missing from that table use `COMMAND GETKEYS`; an error reply
+there means the command is keyless.
+
+### Routing
+
+Each node routes with **its own view**, as `getNodeByQuery()` and
+`processCommand()` do:
+
+| Condition | Reply |
+| --- | --- |
+| Node is down | Connection closed without a reply (topology queries too). |
+| Keys in different slots, including across a transaction | `CROSSSLOT Keys in request don't hash to the same slot` |
+| Slot unassigned in this node's view | `CLUSTERDOWN Hash slot not served` |
+| `FULL_COVERAGE YES` and a slot is unassigned or owned by a failed primary | `CLUSTERDOWN The cluster is down`; with `READS_WHEN_DOWN YES`, reads proceed and writes get `CLUSTERDOWN The cluster is down and only accepts read commands` |
+| Owner is migrating the slot and every key already moved | `ASK <slot> <target>` |
+| Some keys moved, some not | `TRYAGAIN Multiple keys request during rehashing of slot` |
+| Node imports the slot and the client sent `ASKING` | Served (multi-key with unmoved keys: `TRYAGAIN`) |
+| Node owns the slot, or is its owner's replica after `READONLY` for a non-write | Served |
+| Otherwise | `MOVED <slot> <owner>` |
+| Served on a replica whose offset is zero (loading), command lacks the `loading` flag | `LOADING Redis is loading the dataset in memory` |
+
+Whether a key has moved during a migration is a seeded function of the key,
+since the real data never moves. `READONLY`, `READWRITE`, and `ASKING` are
+answered locally. `ASKING` applies only to the next command.
+`MULTI`/`EXEC` are simulated: queued commands are checked as they arrive (a
+rejected one makes `EXEC` return `EXECABORT`). `EXEC` is checked again as a
+whole and then sent as `MULTI ... EXEC` to the real owner.
+
+`CLUSTER SLOTS`, `SHARDS`, `NODES`, `INFO`, `MYID`, and `MYSHARDID` are
+synthesized from the answering node's view. RESP3 maps and verbatim strings
+are used after a successful `HELLO 3`. `SLOTS` omits failed replicas and
+includes a trailing metadata map per node. `SHARDS` lists members in
+membership order, so a failed old primary can precede the new one; health is
+`online`, `fail`, or `loading`, as emitted by the servers (the documentation
+says `failed`). `FLAVOR VALKEY` appends the shard `id`. `NODES` reports `fail?`,
+`fail`, `disconnected`, epochs, and the node's own `[slot->-id]`/`[slot-<-id]`
+migration entries. These queries still bypass mutation and do not consume a
+command index.
+
+### Scenarios and evolution
+
+Stages advance every `EVERY` (default `100`) **shared command indexes**,
+starting at absolute index `START` (default `0`). The last stage persists.
+Bootstrap queries do not advance the clock, so a client that only polls
+topology never sees it change. Within a stage, nodes involved in an event see
+its result, and a seeded subset of the other nodes may still report the
+previous state for that stage.
+
+| Scenario | Timeline |
+| --- | --- |
+| `STABLE` | One fully covered, converged topology. |
+| `PARTIAL` | Starts with seeded holes at slot `0`, an interior range, and/or slot `16383`, then assigns them one at a time (lagging observers keep reporting a hole), ending fully covered. |
+| `FAILOVER` | A primary becomes unreachable (`fail?`), is marked `fail`, then a replica is promoted while the failed primary is still listed in its shard. The old primary later rejoins as a loading replica and syncs. |
+| `MANUAL_FAILOVER` | A replica replaces its primary. Lagging observers briefly see either the old roles or two online primaries in one shard. |
+| `REPLICAS` | A replica is forgotten and re-added (or a spare joins) as a loading replica that then syncs. |
+| `RESHARD` | A seeded slot range migrates between shards (`ASK`, then `MOVED`). |
+| `RANDOM` | Optional initial holes, then `STEPS` (default `8`) seeded valid operations from the list above. Always settles to a fully covered, converged cluster. |
+
+Defaults are `FULL_COVERAGE NO` and `READS_WHEN_DOWN NO`, so partial maps can
+serve covered slots. Use `FULL_COVERAGE YES` for the server default. A
+scripted scenario that cannot run on the layout is rejected, for example
+`FAILOVER` without a replica. `SEED` defaults to the configuring
+connection's seed.
+
+The timeline is a pure function of the scenario options, seed, and listener
+count. Given the same command indexes and command bytes, every connection sees
+the same topology and redirections. `MODE RESET` resets the command index and
+so replays the timeline from the start; the scenario itself survives reset.
+`DEBUG EVIL CLUSTER STATUS` reports options, the current stage, the next
+stage's command index, and its label. Stage changes are logged at INFO.
+`DEBUG EVIL CLUSTER OFF` restores normal proxying immediately.
+
+Limitations: pub/sub routing, `CLUSTER` subcommands other than the six above,
+hostname and unknown-endpoint announcements, TLS ports, and minority-partition
+`cluster_state:fail` are not simulated. Repro records do not identify the
+simulation stage. Use `DEBUG EVIL CLUSTER STATUS` together with the command
+index instead.
 
 ## DEBUG PROTOCOL
 
